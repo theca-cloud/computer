@@ -58,13 +58,13 @@ async fn both_changed_forks_the_version_tree() {
         .unwrap();
     let versions = w.admin.versions(file.node).await.unwrap();
     assert_eq!(versions.len(), 3, "one, a's, and b's on one");
-    assert!(
+    // Noticed as its round ends, after the server already shows the merge.
+    eventually("the merge reported", || async {
         b.notices()
             .iter()
-            .any(|n| n.contains("also changed elsewhere")),
-        "{:?}",
-        b.notices()
-    );
+            .any(|n| n.contains("also changed elsewhere"))
+    })
+    .await;
 }
 
 /// Deleted on one side, modified on the other: the modification wins, both
@@ -116,6 +116,11 @@ async fn deletes_can_be_undone() {
     w.converge(&[&a]).await;
     let trash = w.admin.library_trash(w.library.id).await.unwrap();
     assert_eq!(trash.len(), 1, "the folder, its files with it");
+    // Written once the round ends, after the server already shows the trash.
+    eventually("an undo notice", || async {
+        a.state().latest_undo().unwrap().is_some()
+    })
+    .await;
     let notice = a.state().latest_undo().unwrap().expect("an undo notice");
     assert!(
         notice.message.contains("moved to the trash"),
@@ -575,6 +580,17 @@ async fn a_move_across_libraries() {
     a.write("stays.txt", "s");
     w.converge(&[&a]).await;
     w.converge_on(&other, &[&b]).await;
+    // Their entries, written just after the server took them.
+    eventually("x.txt and d synced", || async {
+        a.state()
+            .entries(a.pair().id)
+            .unwrap()
+            .iter()
+            .filter(|e| e.name == "x.txt" || e.name == "d")
+            .count()
+            == 2
+    })
+    .await;
     let nodes: Vec<_> = a
         .state()
         .entries(a.pair().id)
