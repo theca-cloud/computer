@@ -18,8 +18,10 @@ server outside the pipeline, running the `core` that `computer` pins (`scripts/c
 fails saying so when it lags). They share its admin: each test creates an organization of
 its own, and they run one at a time.
 
-**The Mac's workflows wait while the Mac is away** (pending, not failed), and run when its
-agents connect again.
+**The Mac's and Windows' workflows wait until their agents run** (pending, not failed):
+both are started by hand while working on this repo, the Mac's with `ci/mac.sh`, the
+Windows VM on the CI server (step 2). It takes 8 GB of RAM: it doesn't start with every
+CI run.
 
 Versions: Woodpecker **3.20.1** (the server's: agents must match it), `dockurr/windows`
 **6.06**, Rust as in `rust-toolchain.toml`.
@@ -38,7 +40,15 @@ scripts/ci-image.sh                # amd64 and arm64, pushed
 ## 2. The CI server: the Windows VM and the test server
 
 They live in the server's infrastructure repository (`perso/infrastructure`,
-`on-demand/ci.yml`), in the CI's Sablier group: started with the CI, stopped with it.
+`manual/ci-theca.yml`), on the on-demand CI's network but not in its Sablier group:
+started by hand, on the server (`source act` gives `dm`):
+
+```sh
+dm up -d ci-windows                                # its test server with it
+dm stop ci-windows ci-theca-server ci-theca-db     # done
+```
+
+Windows boots in a minute or two; the agent then takes the waiting workflows.
 
 - `ci-windows`: `dockurr/windows`, on the `CI` network (it reaches `ci-server:9000` and the
   test server) and `WAN` (internet). Its password in `/data/docker/env/ci-windows` (the
@@ -61,8 +71,8 @@ docker run --rm --network on-demand_CI curlimages/curl:8.11.1 -fsS \
     "storages": [{"name": "local", "implementation": "filesystem", "path": "/files"}]}'
 ```
 
-**When `computer` pins a new `core`**: the image tag in `on-demand/ci.yml`, then
-`docker compose … up -d --no-deps ci-theca-server` (it migrates at startup).
+**When `computer` pins a new `core`**: the image tag in `manual/ci-theca.yml`, then
+`dm up -d --no-deps ci-theca-server` (it migrates at startup).
 
 ## 3. Windows, once
 
