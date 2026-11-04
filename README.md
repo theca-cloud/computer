@@ -15,6 +15,6 @@ scripts/ci.sh [lint|test|app|deny]   # every CI check, or one step (app: Linux o
 cargo fmt && npm --prefix ui run format   # fix formatting
 ```
 
-CI runs on Linux, macOS and Windows, one Woodpecker workflow each: how its agents and the shared test server are set up is in [ci/README.md](ci/README.md).
+CI runs on Linux, macOS and Windows, one Woodpecker workflow each. The macOS and Windows agents are started by hand while working on the client (the commands at the top of [ci/README.md](ci/README.md), with how they and the shared test server are set up).
 
 License: AGPL-3.0.

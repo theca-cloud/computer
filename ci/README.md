@@ -23,6 +23,14 @@ both are started by hand while working on this repo, the Mac's with `ci/mac.sh`,
 Windows VM on the CI server (step 2). It takes 8 GB of RAM: it doesn't start with every
 CI run.
 
+```sh
+# The Mac's two agents, in `screen` on the Mac; Ctrl-C stops them (step 6).
+ci/mac.sh <ssh host>
+# The Windows VM and its test server, on the CI server, after `source act` (step 2).
+dm up -d ci-windows
+dm stop ci-windows ci-theca-server ci-theca-db
+```
+
 Versions: Woodpecker **3.20.1** (the server's: agents must match it), `dockurr/windows`
 **6.06**, Rust as in `rust-toolchain.toml`.
 
