@@ -2,6 +2,11 @@
 # when something built or tested changed; manual runs always. Each step is a
 # part of scripts/ci.sh, so a red step says what failed. The other platforms
 # have their own workflows: a workflow runs on one agent.
+# Labelled like them: without it, any agent may take it, the Windows VM's
+# `local` one included (no services there).
+labels:
+  platform: linux/amd64
+
 when:
   - event: push
     # Nothing built or tested changed: docs, repo housekeeping.
