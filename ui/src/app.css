@@ -97,4 +97,10 @@
 	label:has(> input:is([type='checkbox'], [type='radio'])) {
 		cursor: pointer;
 	}
+	/* A grid's one column is as wide as its grid, like a block: an auto column
+	   grows to a truncated line's full width (a long path), and the page with it.
+	   A grid-cols-* utility still wins. */
+	.grid {
+		grid-template-columns: minmax(0, 1fr);
+	}
 }
