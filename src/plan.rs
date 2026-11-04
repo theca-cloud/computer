@@ -290,8 +290,13 @@ impl<'a> Planner<'a> {
                 in_place.insert(node);
             }
         }
-        // Moves: an unclaimed item whose file ID a base node elsewhere had;
-        // then its content matched by name within it, again.
+        // Moves: an unclaimed item whose file ID a base node elsewhere had,
+        // a file with its size and mtime too (a rename keeps them; ext4 gives
+        // a deleted file's inode to the next new one at once); then its content
+        // matched by name within it, again. ponytail: a move and an edit
+        // between two scans is a delete and a new file (its history lost, the
+        // old one in the trash); a reused inode with the same size and mtime
+        // on a coarse clock (FAT) still passes for a move.
         let by_id: HashMap<&str, Uuid> = self
             .input
             .base
@@ -314,7 +319,12 @@ impl<'a> Planner<'a> {
                 .file_id
                 .as_deref()
                 .and_then(|id| by_id.get(id).copied())
-                .filter(|n| self.base[n].is_file == item.is_file && !taken.contains(n));
+                .filter(|n| {
+                    let e = self.base[n];
+                    e.is_file == item.is_file
+                        && (!e.is_file || (e.size == item.size && e.mtime == item.mtime))
+                        && !taken.contains(n)
+                });
             if let Some(node) = by_name.or(by_file) {
                 self.claimed.insert(i, node);
                 taken.insert(node);
@@ -1073,6 +1083,28 @@ mod tests {
                     name: "A.TXT".into()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_reused_inode_is_no_move() {
+        let (base, mut items) = synced();
+        // a.txt deleted, and ext4 gives its inode to a new file at once.
+        items[1].path = vec!["b.txt".into()];
+        items[1].mtime = 9;
+        let plan = run(&base, items, &[]);
+        assert!(
+            matches!(
+                plan.actions[..],
+                [
+                    Action::Upload {
+                        to: UploadTo::New { .. },
+                        ..
+                    },
+                    Action::RemoteTrash { node }
+                ] if node == id(2)
+            ),
+            "{plan:?}"
         );
     }
 
