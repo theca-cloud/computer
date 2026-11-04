@@ -21,6 +21,8 @@ use theca::state::{Account, Pair, State};
 use theca_client::{Cancel, Client, DownloadOptions, MemorySink, download};
 use theca_common::api;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tracing::Instrument;
 use uuid::Uuid;
 
 pub const ADMIN: &str = "admin@test.theca";
@@ -225,7 +227,10 @@ pub struct Device {
     pub account: Account,
     /// Its engine's handle (what it offers, a wake-up), kept across restarts.
     pub handle: Handle,
+    /// Its name, on its engine's log lines (every device's pair is 1).
+    name: String,
     stop: watch::Sender<bool>,
+    engine: Option<JoinHandle<()>>,
     _dir: tempfile::TempDir,
 }
 
@@ -397,13 +402,15 @@ impl World {
         .await
         .unwrap();
         let (stop, stopped) = watch::channel(false);
-        let device = Device {
+        let mut device = Device {
             app_password: None,
             folder: pair.path.clone(),
             state_path,
             account,
             handle: Handle::default(),
+            name: name.into(),
             stop,
+            engine: None,
             _dir: dir,
         };
         if start {
@@ -508,8 +515,13 @@ impl Device {
     /// Stops its engine (offline, or the app quit).
     pub async fn stop(&mut self) {
         let _ = self.stop.send(true);
-        // Its account thread notices within a second.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // Gone once it returns: what the test changes next, it changes offline.
+        if let Some(engine) = self.engine.take() {
+            tokio::time::timeout(Duration::from_secs(10), engine)
+                .await
+                .expect("the engine stops")
+                .unwrap();
+        }
     }
 
     /// Starts its engine again.
@@ -528,12 +540,17 @@ impl Device {
             .collect()
     }
 
-    fn start(&self, stopped: watch::Receiver<bool>) {
+    fn start(&mut self, stopped: watch::Receiver<bool>) {
         let path = self.state_path.clone();
         let handle = self.handle.clone();
-        tokio::spawn(async move {
-            engine::run(path, handle, stopped).await.unwrap();
-        });
+        // The engine's target: `RUST_LOG=theca=debug` shows it.
+        let span = tracing::info_span!(target: "theca", "device", name = self.name);
+        self.engine = Some(tokio::spawn(
+            async move {
+                engine::run(path, handle, stopped).await.unwrap();
+            }
+            .instrument(span),
+        ));
     }
 
     pub fn state(&self) -> State {

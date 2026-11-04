@@ -51,6 +51,9 @@ fi
 if [ "$step" = all ] || [ "$step" = test ]; then
     # The end-to-end tests run the real server: built from ../core unless
     # THECA_SERVER names one.
+    # The engines' debug lines, each device's named: printed for a failed test
+    # only (captured), so a failure seen once on CI says what happened.
+    export RUST_LOG="${RUST_LOG:-theca=debug}"
     if [ -n "${THECA_TEST_SERVER_URL:-}" ]; then
         # A shared server (the Windows step's, running on Linux): it must run
         # the core this repo pins, and its tests run one at a time (each

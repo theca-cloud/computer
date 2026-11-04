@@ -12,6 +12,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use theca_client::{Client, Error, FeedMessage};
 use theca_common::api;
 use tokio::sync::{broadcast, mpsc, watch};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::exec::{Executor, remote_state};
@@ -102,11 +103,18 @@ pub async fn run(
             let shutdown = shutdown.clone();
             running.insert(
                 account.id,
-                tokio::spawn(async move {
-                    if let Err(e) = follow(&path, account.id, handle, shutdown).await {
-                        tracing::error!(account = account.id, "the account's engine stopped: {e}");
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = follow(&path, account.id, handle, shutdown).await {
+                            tracing::error!(
+                                account = account.id,
+                                "the account's engine stopped: {e}"
+                            );
+                        }
                     }
-                }),
+                    // The caller's span on its lines too (the tests name each device).
+                    .in_current_span(),
+                ),
             );
         }
         tokio::select! {
