@@ -45,6 +45,23 @@ impl Drop for Server {
             let _ = child.kill();
             let _ = child.wait();
         }
+        // Its database too: a few dozen MB each, they filled the dev Postgres.
+        // On a thread of its own: this runs inside the test's runtime.
+        if let (Some(database), Ok(admin)) = (&self.database, std::env::var("DATABASE_URL")) {
+            let name = database.rsplit_once('/').unwrap().1.to_owned();
+            let _ = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let mut admin = sqlx::PgConnection::connect(&admin).await?;
+                    let drop = format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)");
+                    admin.execute(sqlx::AssertSqlSafe(drop)).await.map(|_| ())
+                })
+            })
+            .join();
+        }
     }
 }
 
