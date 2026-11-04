@@ -132,6 +132,21 @@ It shows in Woodpecker's agents with `platform=windows/amd64`.
 - `theca_test_admin_email`: `ci@test.theca`
 - `theca_test_admin_password`: the password of step 2
 
+**Settings → Agents** (the server's), once each agent has connected: a filter on each of
+ours, so it takes only the workflows labelled for it.
+
+| Agent | Filter |
+|---|---|
+| the Windows VM's | `!platform=windows/amd64` |
+| the Mac's `local` one | `!platform=darwin/arm64` |
+| the Mac's Docker one | `!platform=linux/arm64` |
+
+They join with the server's shared secret, so they serve every repo, and a workflow without
+labels runs on any agent: on a `local` one its `image:` is ignored and its commands run on
+that machine (the Mac, as you). The `!` makes the label required; the server applies it,
+whatever the agent reports. An agent keeps its ID across restarts (its config file), and its
+filter with it.
+
 ## 6. The Mac
 
 Prerequisites: Rust, Node, OrbStack (as for development), and Git LFS (`brew install
