@@ -1,0 +1,60 @@
+# The checks on Linux (amd64, the server's agents), on every push to any branch
+# when something built or tested changed; manual runs always. Each step is a
+# part of scripts/ci.sh, so a red step says what failed. The other platforms
+# have their own workflows: a workflow runs on one agent.
+when:
+  - event: push
+    # Nothing built or tested changed: docs, repo housekeeping.
+    path:
+      exclude: ["**/*.md", "LICENSE", ".gitignore", "cliff.toml"]
+    # Not a version commit (scripts/release.sh, `1.2.3`): it only bumps the
+    # version on code dev already tested, on prod and coming back into dev.
+    evaluate: 'not (trim(CI_COMMIT_MESSAGE) matches "^[0-9]+[.][0-9]+[.][0-9]+$")'
+  - event: manual
+
+services:
+  # The end-to-end tests' databases: one per test, on this server.
+  - name: postgres
+    image: postgres:18
+    environment:
+      POSTGRES_USER: theca
+      POSTGRES_PASSWORD: theca
+      POSTGRES_DB: theca
+      # The server refuses other collations.
+      POSTGRES_INITDB_ARGS: --locale-provider=builtin --builtin-locale=C.UTF-8
+
+# Built and pushed by scripts/ci-image.sh; tag = the Rust version in
+# rust-toolchain.toml. Rust, Node, WebKitGTK and the app's test tools.
+variables:
+  - &image
+    image: git.pband.ch/theca/ci-computer:1.98.0
+    pull: true
+    environment:
+      DATABASE_URL: postgres://theca:theca@postgres:5432/theca
+
+steps:
+  # Licenses and advisories: no build, so it runs alongside the others.
+  - name: deny
+    <<: *image
+    depends_on: []
+    commands:
+      - scripts/ci.sh deny
+
+  - name: lint
+    <<: *image
+    depends_on: []
+    commands:
+      - scripts/ci.sh lint
+
+  - name: test
+    <<: *image
+    depends_on: [lint]
+    commands:
+      - scripts/ci.sh test
+
+  # The app driven through its window (tauri-driver; Linux only).
+  - name: app
+    <<: *image
+    depends_on: [lint]
+    commands:
+      - scripts/ci.sh app

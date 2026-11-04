@@ -1,0 +1,474 @@
+//! What a user does, for the CLI and the GUI alike: log in, add and remove
+//! sync pairs and accounts, undo a delete.
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use theca_client::{Client, Error};
+use theca_common::api;
+use uuid::Uuid;
+
+use crate::local;
+use crate::state::{Account, Pair, State, StateError};
+
+#[derive(Debug, thiserror::Error)]
+pub enum OpError {
+    #[error(transparent)]
+    State(#[from] StateError),
+    #[error(transparent)]
+    Client(#[from] Error),
+    #[error("{0}")]
+    Refused(String),
+    /// A first sync into a folder holding files: a merge, asked first.
+    #[error(
+        "{path} holds {}: they would be merged with {library} (identical files kept, different ones become new versions); confirm the merge",
+        crate::engine::plural(*files, "file"),
+        path = path.display()
+    )]
+    Holds {
+        path: PathBuf,
+        library: String,
+        files: usize,
+    },
+}
+
+pub type Result<T> = std::result::Result<T, OpError>;
+
+fn refused<T>(why: impl Into<String>) -> Result<T> {
+    Err(OpError::Refused(why.into()))
+}
+
+/// Libraries up to this size are synced when they appear, by default.
+pub const AUTO_SYNC_LIMIT: i64 = 500 * 1024 * 1024;
+
+/// This device's name, as proposed: its host name.
+pub fn device_name() -> String {
+    gethostname::gethostname()
+        .to_string_lossy()
+        .trim_end_matches(".local")
+        .to_owned()
+}
+
+/// The default folder proposed for a new account: `~/theca` for the first,
+/// `~/theca-<instance host>` once that one is taken.
+pub fn proposed_folder(state: &State, instance: &str) -> Result<PathBuf> {
+    let home = directories::UserDirs::new()
+        .map(|d| d.home_dir().to_owned())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let taken: Vec<PathBuf> = state
+        .accounts()?
+        .into_iter()
+        .map(|a| a.default_folder)
+        .collect();
+    let first = home.join("theca");
+    if !taken.contains(&first) {
+        return Ok(first);
+    }
+    let host = instance
+        .split("://")
+        .last()
+        .unwrap_or(instance)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("instance");
+    Ok(home.join(format!("theca-{host}")))
+}
+
+/// Logs a device in through the browser: `show` gets the flow (its URL to
+/// open, its code to show); this waits for the approval, then saves the
+/// account. With `token` (an app password made in the web app, for
+/// scripts), no flow.
+pub async fn login(
+    state: &State,
+    instance: &str,
+    device: &str,
+    folder: Option<PathBuf>,
+    token: Option<String>,
+    show: impl FnOnce(&api::LoginFlow),
+) -> Result<Account> {
+    let instance = instance.trim_end_matches('/').to_owned();
+    let client = Client::new(&instance)?;
+    client.check_version().await?;
+    let password = match token {
+        Some(token) => token,
+        None => {
+            let flow = client.start_login_flow(device).await?;
+            show(&flow);
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                match client.poll_login_flow(&flow.poll).await {
+                    Ok(Some(created)) => break created.password,
+                    Ok(None) => {}
+                    Err(Error::Api { status: 404, .. }) => {
+                        return refused("the login expired (15 minutes): start again");
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+    };
+    let client = client.with_token(password.clone());
+    let me = client.me().await?;
+    let known = state
+        .accounts()?
+        .into_iter()
+        .find(|a| a.instance == instance && a.uuid == me.account);
+    let default_folder = match (folder, &known) {
+        (Some(folder), _) => folder,
+        (None, Some(known)) => known.default_folder.clone(),
+        (None, None) => proposed_folder(state, &instance)?,
+    };
+    let mut account = Account {
+        id: 0,
+        instance,
+        uuid: me.account,
+        email: me.email,
+        device: device.to_owned(),
+        password,
+        default_folder,
+        auto_sync_limit: known
+            .as_ref()
+            .map_or(Some(AUTO_SYNC_LIMIT), |k| k.auto_sync_limit),
+        signed_out: false,
+    };
+    account.id = state.save_account(&account)?;
+    Ok(account)
+}
+
+pub fn client(account: &Account) -> Result<Client> {
+    Ok(Client::new(&account.instance)?.with_token(account.password.clone()))
+}
+
+/// A library as the user sees it: synced where, or offered.
+#[derive(Debug, Clone)]
+pub struct Library {
+    pub library: api::Library,
+    pub size: Option<i64>,
+    pub files: Option<i64>,
+    pub pair: Option<Pair>,
+}
+
+/// The account's libraries, each with its size and its pair if synced.
+pub async fn libraries(state: &State, account: &Account) -> Result<Vec<Library>> {
+    let client = client(account)?;
+    let pairs = state.pairs()?;
+    let mut out = Vec::new();
+    for library in client.libraries().await? {
+        let info = client.library(library.id).await.ok();
+        out.push(Library {
+            pair: pairs
+                .iter()
+                .find(|p| p.account == account.id && p.library == library.id)
+                .cloned(),
+            size: info.as_ref().map(|i| i.size),
+            files: info.as_ref().map(|i| i.files),
+            library,
+        });
+    }
+    Ok(out)
+}
+
+/// Starts syncing a library into `path` (default: the account's default
+/// folder). A folder already holding files needs `merge`.
+pub async fn add(
+    state: &State,
+    account: &Account,
+    library: &str,
+    path: Option<PathBuf>,
+    merge: bool,
+) -> Result<Pair> {
+    let client = client(account)?;
+    let all = client.libraries().await?;
+    let wanted = local::key(library);
+    let Some(found) = all
+        .iter()
+        .find(|l| l.id.to_string() == library || local::key(&l.name) == wanted)
+        .cloned()
+    else {
+        return refused(format!("no library {library:?} in {}", account.email));
+    };
+    let pairs = state.pairs()?;
+    if pairs
+        .iter()
+        .any(|p| p.account == account.id && p.library == found.id)
+    {
+        return refused(format!("{} is already synced", found.name));
+    }
+    let path = match path {
+        Some(path) => path,
+        None => {
+            let others: Vec<(Uuid, String)> = all.iter().map(|l| (l.id, l.name.clone())).collect();
+            let taken: Vec<PathBuf> = pairs.iter().map(|p| p.path.clone()).collect();
+            let library = (found.id, found.name.as_str(), found.organization);
+            default_path(&client, &account.default_folder, library, &others, &taken).await
+        }
+    };
+    if pairs.iter().any(|p| p.path == path) {
+        return refused(format!("{} is already a synced folder", path.display()));
+    }
+    let holds = std::fs::read_dir(&path).is_ok_and(|mut d| d.next().is_some());
+    if holds && !merge {
+        let files = local::scan(&path).map_or(0, |s| s.items.iter().filter(|i| i.is_file).count());
+        return Err(OpError::Holds {
+            path,
+            library: found.name.clone(),
+            files,
+        });
+    }
+    std::fs::create_dir_all(&path)
+        .map_err(|e| OpError::Refused(format!("{}: {e}", path.display())))?;
+    let mut pair = Pair {
+        id: 0,
+        account: account.id,
+        library: found.id,
+        root: found.root,
+        library_name: found.name,
+        path,
+        root_file_id: None,
+        position: None,
+        paused: false,
+        stopped: None,
+        writable: found.writable,
+        activity: "waiting".into(),
+        synced_at: None,
+    };
+    pair.id = state.add_pair(&pair)?;
+    state.set_pair_path(pair.id, &pair.path, local::file_id(&pair.path).as_deref())?;
+    Ok(pair)
+}
+
+/// Where a library goes by default: `<folder>/<library>`, or
+/// `<folder>/<library> (<organization>)` when another library the account
+/// sees has the same name, or a synced folder already takes the plain path
+/// (the personal organization is "My files").
+pub async fn default_path(
+    client: &Client,
+    folder: &Path,
+    (id, name, organization): (Uuid, &str, Uuid),
+    others: &[(Uuid, String)],
+    taken: &[PathBuf],
+) -> PathBuf {
+    let plain = folder.join(name);
+    let clash = others
+        .iter()
+        .any(|(other, n)| *other != id && local::key(n) == local::key(name))
+        || taken.contains(&plain);
+    if !clash {
+        return plain;
+    }
+    let membership = client.me().await.ok().and_then(|me| {
+        me.organizations
+            .into_iter()
+            .find(|o| o.organization == organization)
+    });
+    let organization = match membership {
+        Some(o) if o.personal => "My files".to_owned(),
+        Some(o) => o.name,
+        None => organization.to_string()[..8].to_owned(),
+    };
+    folder.join(format!("{name} ({organization})"))
+}
+
+/// Whether the disk holding `path` (or its nearest existing folder) has room
+/// for `size` bytes, with a tenth of it to spare.
+pub fn has_room(path: &Path, size: i64) -> bool {
+    let existing = path.ancestors().find(|p| p.exists()).unwrap_or(path);
+    let needed = u64::try_from(size)
+        .unwrap_or(0)
+        .saturating_add(u64::try_from(size / 10).unwrap_or(0));
+    fs4::available_space(existing).is_ok_and(|free| free > needed)
+}
+
+/// Deletes the pair's files that are still exactly what was synced, then the
+/// folders left empty; anything modified or never uploaded stays. How many
+/// were kept.
+pub fn delete_synced_files(state: &State, pair: &Pair) -> Result<usize> {
+    let entries = state.entries(pair.id)?;
+    let by_node: std::collections::HashMap<Uuid, &crate::state::Entry> =
+        entries.iter().map(|e| (e.node, e)).collect();
+    let names = |mut node: Uuid| {
+        let mut names = Vec::new();
+        while node != pair.root {
+            let e = by_node.get(&node)?;
+            names.push(e.name.clone());
+            node = e.parent;
+        }
+        names.reverse();
+        Some(names)
+    };
+    for e in entries.iter().filter(|e| e.is_file) {
+        let Some(names) = names(e.node) else { continue };
+        let path = local::resolve(&pair.path, &names);
+        if let Ok(meta) = std::fs::symlink_metadata(&path)
+            && meta.len() as i64 == e.size
+            && local::mtime(&meta) == e.mtime
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    // Folders, deepest first, if empty.
+    let mut folders: Vec<Vec<String>> = entries
+        .iter()
+        .filter(|e| !e.is_file)
+        .filter_map(|e| names(e.node))
+        .collect();
+    folders.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    for folder in folders {
+        let _ = std::fs::remove_dir(local::resolve(&pair.path, &folder));
+    }
+    let _ = std::fs::remove_dir(&pair.path);
+    let kept = if pair.path.exists() {
+        local::scan(&pair.path).map_or(0, |s| s.items.iter().filter(|i| i.is_file).count())
+    } else {
+        0
+    };
+    Ok(kept)
+}
+
+/// Stops syncing: the pair's state goes; its files stay, or only those
+/// identical to what was synced are deleted. How many were kept.
+pub fn remove(state: &State, pair: &Pair, delete_files: bool) -> Result<usize> {
+    let kept = if delete_files {
+        delete_synced_files(state, pair)?
+    } else {
+        0
+    };
+    state.remove_pair(pair)?;
+    Ok(kept)
+}
+
+/// Removes an account: its pairs (files kept or deleted as `remove`), then
+/// the app password, revoked on the server when possible.
+pub async fn remove_account(state: &State, account: &Account, delete_files: bool) -> Result<usize> {
+    let mut kept = 0;
+    for pair in state
+        .pairs()?
+        .into_iter()
+        .filter(|p| p.account == account.id)
+    {
+        kept += remove(state, &pair, delete_files)?;
+    }
+    // Best effort (offline: it stays listed in the web app, to revoke there).
+    if let Ok(client) = client(account) {
+        let _ = client.logout().await;
+    }
+    state.remove_account(account.id)?;
+    Ok(kept)
+}
+
+/// Pauses or resumes a pair. Resuming also lifts a stop about its folder:
+/// the engine checks the folder again, and stops it again if it's still
+/// missing.
+pub fn set_paused(state: &State, pair: &Pair, paused: bool) -> Result<()> {
+    state.set_paused(pair.id, paused)?;
+    if !paused && pair.stopped_for_its_folder() {
+        state.set_stopped(pair.id, None)?;
+    }
+    Ok(())
+}
+
+/// What `locate` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Located {
+    /// The synced folder, moved or renamed: it syncs on from there.
+    Moved,
+    /// Another folder (another file ID): not taken without `confirm`.
+    Different,
+}
+
+/// Points a pair at its folder again (moved while the app was off, or on
+/// another disk). The same folder (its file ID) resumes as it was. Another
+/// one, confirmed, starts over as a first sync into it (a merge): compared
+/// with the old base, every file it lacks would look deleted, and be trashed
+/// on the server.
+pub fn locate(state: &State, pair: &Pair, path: &Path, confirm: bool) -> Result<Located> {
+    if !path.is_dir() {
+        return refused(format!("{} isn't a folder", path.display()));
+    }
+    let id = local::file_id(path);
+    let same = id.is_some() && id == pair.root_file_id;
+    if !same && !confirm {
+        return Ok(Located::Different);
+    }
+    if !same {
+        state.forget_base(pair.id)?;
+    }
+    state.set_pair_path(pair.id, path, id.as_deref())?;
+    state.set_stopped(pair.id, None)?;
+    Ok(Located::Moved)
+}
+
+/// Restores what the latest delete moved to the trash (`notice`'s Undo).
+pub async fn undo(state: &State, notice: i64) -> Result<usize> {
+    let Some(n) = state.notices()?.into_iter().find(|n| n.id == notice) else {
+        return refused("nothing to undo");
+    };
+    let (Some(pair), Some(undo)) = (n.pair, n.undo.as_deref()) else {
+        return refused("nothing to undo");
+    };
+    let Some(pair) = state.pair(pair)? else {
+        return refused("that folder isn't synced anymore");
+    };
+    let Some(account) = state.account(pair.account)? else {
+        return refused("that account was removed");
+    };
+    let nodes: Vec<Uuid> = undo.split(' ').filter_map(|n| n.parse().ok()).collect();
+    let results = client(&account)?.restore_nodes(&nodes).await?;
+    state.dismiss(notice)?;
+    Ok(results.iter().filter(|r| r.is_ok()).count())
+}
+
+/// Finds a pair by its library's name, its folder, or its ID.
+pub fn find_pair(state: &State, which: &str) -> Result<Pair> {
+    let pairs = state.pairs()?;
+    let path = Path::new(which).canonicalize().ok();
+    let found: Vec<Pair> = pairs
+        .into_iter()
+        .filter(|p| {
+            p.id.to_string() == which
+                || local::key(&p.library_name) == local::key(which)
+                || path
+                    .as_deref()
+                    .is_some_and(|w| p.path.canonicalize().ok().as_deref() == Some(w))
+        })
+        .collect();
+    match found.len() {
+        1 => Ok(found.into_iter().next().expect("one")),
+        0 => refused(format!("no synced folder {which:?}")),
+        _ => refused(format!(
+            "several synced folders match {which:?}: use its path or ID"
+        )),
+    }
+}
+
+/// Finds an account by email, instance or ID; the only one when not given.
+pub fn find_account(state: &State, which: Option<&str>) -> Result<Account> {
+    let accounts = state.accounts()?;
+    let found: Vec<Account> = match which {
+        None => accounts,
+        Some(w) => accounts
+            .into_iter()
+            .filter(|a| {
+                a.id.to_string() == w || a.email.eq_ignore_ascii_case(w) || a.instance.contains(w)
+            })
+            .collect(),
+    };
+    match found.len() {
+        1 => Ok(found.into_iter().next().expect("one")),
+        0 => refused("no such account: theca login <instance>"),
+        _ => refused("several accounts: choose one with --account"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn room_on_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(has_room(&dir.path().join("not/yet/created"), 1));
+        assert!(!has_room(dir.path(), i64::MAX / 2));
+    }
+}

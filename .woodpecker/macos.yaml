@@ -1,0 +1,41 @@
+# The checks on macOS: the `local` agent on the developer's Mac (macOS runs
+# only on Apple hardware), as the developer (ci/README.md); until there's
+# rented Mac hardware. While the Mac is away, it waits. The local backend has
+# no services: scripts/dev.sh starts the test database with the Mac's Docker,
+# in a compose project of its own (the developer's is `theca-computer`), taken
+# down at the end.
+labels:
+  platform: darwin/arm64
+
+when:
+  - event: push
+    path:
+      exclude: ["**/*.md", "LICENSE", ".gitignore", "cliff.toml"]
+    evaluate: 'not (trim(CI_COMMIT_MESSAGE) matches "^[0-9]+[.][0-9]+[.][0-9]+$")'
+  - event: manual
+
+steps:
+  # The local backend runs the commands with this shell.
+  - name: lint
+    image: sh
+    commands:
+      - scripts/ci.sh lint
+
+  - name: test
+    image: sh
+    depends_on: [lint]
+    environment:
+      COMPOSE_PROJECT_NAME: theca-computer-ci
+    commands:
+      - scripts/dev.sh
+      - scripts/ci.sh test
+
+  - name: down
+    image: sh
+    depends_on: [test]
+    environment:
+      COMPOSE_PROJECT_NAME: theca-computer-ci
+    commands:
+      - docker compose down
+    when:
+      - status: [success, failure]

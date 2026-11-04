@@ -1,0 +1,13 @@
+._*
+.DS_Store
+claude*.sh
+target/
+dist/
+build/
+node_modules/
+data/
+TODOs.md
+.env
+.tags
+# Tauri writes its permission schemas here at build.
+/gen/

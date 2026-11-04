@@ -1,0 +1,23 @@
+name: theca-computer
+
+# The test server's database. Run scripts/dev.sh rather than `docker compose
+# up` directly: it writes the .env this file reads, the host port included
+# (a free one, chosen on its first run).
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: theca
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: theca
+      # The server refuses other collations.
+      POSTGRES_INITDB_ARGS: --locale-provider=builtin --builtin-locale=C.UTF-8
+    ports:
+      - 127.0.0.1:${POSTGRES_PORT:-5432}:5432
+    volumes:
+      - ./data/postgres:/var/lib/postgresql
+    healthcheck:
+      test: pg_isready -U theca -d theca
+      interval: 2s
+      timeout: 2s
+      retries: 15
