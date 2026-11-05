@@ -17,4 +17,6 @@ cargo fmt && npm --prefix ui run format   # fix formatting
 
 CI runs on Linux, macOS and Windows, one Woodpecker workflow each. The macOS and Windows agents are started by hand while working on the client (the commands at the top of [ci/README.md](ci/README.md), with how they and the shared test server are set up).
 
+Questions, need help, or running Theca and want to say so? Come to [Discord](https://discord.gg/JBTfacSm4G).
+
 License: AGPL-3.0.
