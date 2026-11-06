@@ -140,5 +140,14 @@ async fn sign_in_sync_and_an_error() {
     settle(&folder.join("Docs").join("bad:name.txt"));
     shown(&client, "not synced").await;
 
+    // C19: launched again on its state, it hands over to the running app
+    // (whose window comes forward) and exits, instead of failing on the lock.
+    let again = Command::new(env!("CARGO_BIN_EXE_theca"))
+        .arg("--state")
+        .arg(dir.path().join("state.sqlite"))
+        .status()
+        .unwrap();
+    assert!(again.success(), "{again:?}");
+
     client.close().await.unwrap();
 }

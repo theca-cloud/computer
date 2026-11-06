@@ -129,6 +129,8 @@ pub struct State {
     /// Where each change the user sees is published (the GUI); none in a
     /// process nobody watches (the CLI).
     updates: Option<broadcast::Sender<Update>>,
+    /// Its file (none in memory): no pair's folder may hold it.
+    path: Option<PathBuf>,
 }
 
 /// A change the user sees, published as it's written: the GUI's window
@@ -188,7 +190,13 @@ impl State {
         Ok(Self {
             connection: Mutex::new(db),
             updates: None,
+            path: Some(path.to_owned()),
         })
+    }
+
+    /// Its file, when it has one.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// An in-memory database (tests).
@@ -199,6 +207,7 @@ impl State {
         Ok(Self {
             connection: Mutex::new(db),
             updates: None,
+            path: None,
         })
     }
 
@@ -531,10 +540,14 @@ impl State {
     /// Forgets what was synced: the next round is a first sync into the
     /// folder (a merge), never a comparison with a base it doesn't match.
     pub fn forget_base(&self, pair: i64) -> Result<()> {
-        let db = self.db();
-        db.execute("DELETE FROM entry WHERE pair = ?1", [pair])?;
-        db.execute("DELETE FROM remote WHERE pair = ?1", [pair])?;
-        db.execute("UPDATE pair SET position = NULL WHERE id = ?1", [pair])?;
+        // One transaction, the position first: a round's `synced` meanwhile
+        // finds it NULL and writes nothing back.
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        tx.execute("UPDATE pair SET position = NULL WHERE id = ?1", [pair])?;
+        tx.execute("DELETE FROM entry WHERE pair = ?1", [pair])?;
+        tx.execute("DELETE FROM remote WHERE pair = ?1", [pair])?;
+        tx.commit()?;
         drop(db);
         self.publish(Update::Pairs);
         Ok(())
@@ -627,8 +640,9 @@ impl State {
         Ok(())
     }
 
-    /// Records remote states and the new position, in one transaction: a
-    /// position is never ahead of what was recorded.
+    /// A listing of the library (a resync), its whole remote truth: what was
+    /// pending before goes, `states` and the position replace it, in one
+    /// transaction (a position is never ahead of what was recorded).
     pub fn record_remote(
         &self,
         pair: i64,
@@ -637,6 +651,39 @@ impl State {
     ) -> Result<()> {
         let mut db = self.db();
         let tx = db.transaction()?;
+        tx.execute("DELETE FROM remote WHERE pair = ?1", [pair])?;
+        for (node, state) in states {
+            put_remote(&tx, pair, *node, state.as_ref())?;
+        }
+        if let Some(position) = position {
+            tx.execute(
+                "UPDATE pair SET position = ?2 WHERE id = ?1",
+                params![pair, position],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Changes from the feed, added to what is pending, and its new position;
+    /// nothing at all for a pair whose base was forgotten meanwhile (`locate`
+    /// during the feed's await): its resync must still come.
+    pub fn record_feed(
+        &self,
+        pair: i64,
+        states: &[(Uuid, Option<RemoteState>)],
+        position: Option<i64>,
+    ) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let followed: bool = tx.query_row(
+            "SELECT position IS NOT NULL FROM pair WHERE id = ?1",
+            [pair],
+            |r| r.get(0),
+        )?;
+        if !followed {
+            return Ok(());
+        }
         for (node, state) in states {
             put_remote(&tx, pair, *node, state.as_ref())?;
         }
@@ -867,6 +914,81 @@ mod tests {
         state.forget_base(pair).unwrap();
         state.synced(pair, &e, None, &[]).unwrap();
         assert!(state.entries(pair).unwrap().is_empty());
+    }
+
+    fn state_of(name: &str) -> RemoteState {
+        RemoteState {
+            parent: Uuid::from_u128(3),
+            name: name.into(),
+            is_file: true,
+            version: Some(Uuid::from_u128(5)),
+            size: 1,
+            modified: None,
+        }
+    }
+
+    /// C13: the feed never gives a position back to a pair whose base was
+    /// just forgotten: its resync would never come.
+    #[test]
+    fn the_feed_never_follows_a_forgotten_base() {
+        let state = State::memory().unwrap();
+        let pair = pair(&state);
+        state.record_remote(pair, &[], Some(1)).unwrap();
+        state.forget_base(pair).unwrap();
+        let x = Uuid::from_u128(8);
+        state
+            .record_feed(pair, &[(x, Some(state_of("x")))], Some(5))
+            .unwrap();
+        assert_eq!(state.pair(pair).unwrap().unwrap().position, None);
+        assert!(state.remote(pair).unwrap().is_empty());
+    }
+
+    /// C15: a listing (a resync) is the whole remote truth: what the feed
+    /// left pending before it no longer applies.
+    #[test]
+    fn a_listing_replaces_what_was_pending() {
+        let state = State::memory().unwrap();
+        let pair = pair(&state);
+        let (x, y) = (Uuid::from_u128(8), Uuid::from_u128(9));
+        state
+            .record_remote(pair, &[(x, Some(state_of("x")))], Some(1))
+            .unwrap();
+        state
+            .record_remote(pair, &[(y, Some(state_of("y")))], Some(2))
+            .unwrap();
+        let pending: Vec<Uuid> = state
+            .remote(pair)
+            .unwrap()
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(pending, [y]);
+    }
+
+    /// B15: forgetting the base is all or nothing: a failure part way (the
+    /// database busy) never leaves the base gone and the position kept (no
+    /// resync would follow).
+    #[test]
+    fn forgetting_the_base_is_all_or_nothing() {
+        let state = State::memory().unwrap();
+        let pair = pair(&state);
+        state.record_remote(pair, &[], Some(1)).unwrap();
+        state.synced(pair, &entry(), None, &[]).unwrap();
+        let x = Uuid::from_u128(8);
+        state
+            .record_feed(pair, &[(x, Some(state_of("x")))], None)
+            .unwrap();
+        // Its last statement fails: the ones before it are undone too.
+        state
+            .db()
+            .execute_batch(
+                "CREATE TRIGGER fail BEFORE DELETE ON remote
+                 BEGIN SELECT RAISE(ABORT, 'busy'); END",
+            )
+            .unwrap();
+        assert!(state.forget_base(pair).is_err());
+        assert_eq!(state.entries(pair).unwrap().len(), 1);
+        assert_eq!(state.pair(pair).unwrap().unwrap().position, Some(1));
     }
 
     /// A state opened with a channel publishes what the user would see change,

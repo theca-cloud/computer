@@ -41,7 +41,7 @@ server() {
 
 if [ "$step" = all ] || [ "$step" = lint ]; then
     cargo fmt --check
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --features crash-points --all-targets -- -D warnings
     # The app: its page (formatting, lint, types), built, then embedded in the
     # `gui` build, linted too (needs WebKitGTK on Linux).
     [ -d ui/node_modules ] || npm --prefix ui ci
@@ -57,7 +57,9 @@ if [ "$step" = all ] || [ "$step" = test ]; then
     # only (captured), so a failure seen once on CI says what happened.
     export RUST_LOG="${RUST_LOG:-theca=debug}"
     server
-    cargo test
+    # The crash tests' named points (tests/crash.rs) built in: inert unless
+    # THECA_CRASH_AT names one.
+    cargo test --features crash-points
 fi
 # Only Linux has a WebDriver for WebKit: elsewhere, `all` skips it, and the app
 # is checked by hand (the sprint's checklist).

@@ -5,10 +5,13 @@
 #![allow(dead_code)] // each test uses part of it
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -35,6 +38,14 @@ pub struct Server {
     /// Its own database's URL (a test reads it, as the app's tests do).
     pub database: String,
     _dir: tempfile::TempDir,
+}
+
+impl Server {
+    /// Gone, as a server down or unreachable.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for Server {
@@ -85,9 +96,54 @@ pub fn free_port() -> u16 {
     }
 }
 
+/// Bytes a connection carries either way before the proxy cuts it, once told
+/// to: API calls pass, a chunk of a bigger file never does.
+const CUT_AFTER: usize = 256 * 1024;
+
+/// A TCP proxy on `listen` to the server on `upstream`; `cut` set, every
+/// connection is cut after `CUT_AFTER` bytes either way (a transfer cut mid-
+/// stream, as a network would).
+fn proxy(listen: u16, upstream: u16, cut: Arc<AtomicBool>) {
+    let listener = TcpListener::bind(("127.0.0.1", listen)).unwrap();
+    std::thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            let Ok(server) = TcpStream::connect(("127.0.0.1", upstream)) else {
+                continue;
+            };
+            let pumps = [
+                (client.try_clone().unwrap(), server.try_clone().unwrap()),
+                (server, client),
+            ];
+            for (mut from, mut to) in pumps {
+                let cut = cut.clone();
+                std::thread::spawn(move || {
+                    let mut buffer = [0u8; 16 * 1024];
+                    let mut carried = 0;
+                    while let Ok(n) = from.read(&mut buffer) {
+                        carried += n;
+                        if n == 0 || (cut.load(Ordering::SeqCst) && carried > CUT_AFTER) {
+                            break;
+                        }
+                        if to.write_all(&buffer[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = from.shutdown(Shutdown::Both);
+                    let _ = to.shutdown(Shutdown::Both);
+                });
+            }
+        }
+    });
+}
+
 /// A fresh database on `DATABASE_URL`'s Postgres (scripts/dev.sh's, CI's),
 /// and the server on it.
 pub async fn server() -> Server {
+    server_with(None).await
+}
+
+/// The server, behind a proxy that `cut` breaks connections with when set.
+pub async fn server_with(cut: Option<Arc<AtomicBool>>) -> Server {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -106,7 +162,16 @@ pub async fn server() -> Server {
         path
     };
     let port = free_port();
-    let url = format!("http://127.0.0.1:{port}");
+    // Behind the proxy, its public address (presigned URLs too) is the proxy's.
+    let public = match cut {
+        Some(cut) => {
+            let listen = free_port();
+            proxy(listen, port, cut);
+            listen
+        }
+        None => port,
+    };
+    let url = format!("http://127.0.0.1:{public}");
     let binary = server_binary();
     assert!(
         binary.exists(),
@@ -160,7 +225,16 @@ pub struct World {
 }
 
 pub async fn world() -> World {
-    let server = server().await;
+    world_on(server().await).await
+}
+
+/// A world whose every connection goes through a proxy `cut` breaks.
+pub async fn world_cut() -> (World, Arc<AtomicBool>) {
+    let cut = Arc::new(AtomicBool::new(false));
+    (world_on(server_with(Some(cut.clone())).await).await, cut)
+}
+
+async fn world_on(server: Server) -> World {
     let storage = tempfile::tempdir().unwrap();
     let mut admin = Client::new(&server.url).unwrap();
     let setup: api::Setup = serde_json::from_value(json!({

@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use theca_common::name::Name;
 use uuid::Uuid;
 
-use crate::local::{Item, Scan, key};
+use crate::local::{self, Item, Scan, key};
 use crate::state::{Entry, RemoteState};
 
 /// A folder on the server: one already there, or one this plan creates (by
@@ -75,7 +75,8 @@ pub enum Action {
         path: Vec<String>,
         state: RemoteState,
     },
-    /// A folder on both sides without a base: adopted.
+    /// A folder on both sides without a base, or a read-only library's file
+    /// as it was downloaded: adopted, nothing uploaded.
     Adopt {
         node: Uuid,
         path: Vec<String>,
@@ -89,8 +90,6 @@ pub enum Action {
     /// A read-only library's file changed on both sides: the local copy kept
     /// aside as `<name> (local)` before the download.
     KeepAside { node: Uuid },
-    /// The base follows a remote change that needs nothing locally.
-    Accept { node: Uuid, state: RemoteState },
     /// Forget a node (gone on both sides).
     Forget { node: Uuid },
 }
@@ -154,6 +153,9 @@ struct Node {
 #[derive(Debug, Clone, PartialEq)]
 enum Local {
     Deleted,
+    /// Where the scan couldn't look (a folder it couldn't read, a symbolic
+    /// link, another disk): neither deleted nor changed, nothing done to it.
+    Unseen,
     Present {
         item: usize,
         /// Its new place, when moved or renamed.
@@ -176,8 +178,22 @@ struct Planner<'a> {
     /// Local item index → the base node it is.
     claimed: HashMap<usize, Uuid>,
     local: HashMap<Uuid, Local>,
+    /// What the scan couldn't look into, by key path.
+    unseen: Vec<Vec<String>>,
     plan: Plan,
 }
+
+/// A name as the server keeps them (valid, NFC): anything else came from a
+/// server that shouldn't have sent it, and never reaches the disk (`..`, a
+/// path, an absolute one would leave the folder).
+fn sound(name: &str) -> bool {
+    Name::new(name).is_ok_and(|n| n.as_str() == name)
+}
+
+/// Steps up a parent chain before it counts as a cycle: a guard a real tree
+/// never reaches (so `>` or `>=` there, or a count that doesn't grow, changes
+/// nothing a test can see).
+const MAX_DEPTH: usize = 10_000;
 
 fn nfc(name: &str) -> String {
     Name::new(name).map_or_else(|_| name.to_owned(), |n| n.as_str().to_owned())
@@ -228,6 +244,15 @@ impl<'a> Planner<'a> {
             .copied()
             .collect();
         remote.retain(|n, _| reachable.contains(n));
+        let scan = input.scan;
+        let unseen = scan
+            .unreadable
+            .iter()
+            .map(|(path, _)| path)
+            .chain(&scan.links)
+            .chain(&scan.elsewhere)
+            .map(|path| path.split('/').map(key).collect())
+            .collect();
         Planner {
             input,
             base,
@@ -235,6 +260,7 @@ impl<'a> Planner<'a> {
             pending,
             claimed: HashMap::new(),
             local: HashMap::new(),
+            unseen,
             plan: Plan::default(),
         }
     }
@@ -276,18 +302,36 @@ impl<'a> Planner<'a> {
                     .and_then(|i| claimed.get(i).copied()),
             }
         };
-        // Base nodes found where the base had them, by path from the root.
+        // Base nodes found where the base had them, by path from the root:
+        // the synced file first, so that a variant beside it (`A.txt` by
+        // `a.txt`, NFD by NFC, on a disk telling them apart) is the clash, never
+        // the synced file. Parents come first, so one pass per depth.
         let mut in_place: HashSet<Uuid> = HashSet::new();
-        for (i, item) in items.iter().enumerate() {
-            let Some(parent) = parent_node(&self.claimed, item) else {
-                continue;
-            };
-            if let Some(&node) = children.get(&(parent, key(item.name())))
-                && self.base[&node].is_file == item.is_file
-                && !in_place.contains(&node)
-            {
-                self.claimed.insert(i, node);
-                in_place.insert(node);
+        let depths = items.iter().map(|i| i.path.len()).max().unwrap_or(0);
+        for depth in 1..=depths {
+            // The base's file ID first (the synced file whatever its spelling
+            // now), then the spelling, then the key.
+            for pass in 0..3 {
+                for (i, item) in items.iter().enumerate() {
+                    if item.path.len() != depth || self.claimed.contains_key(&i) {
+                        continue;
+                    }
+                    let Some(parent) = parent_node(&self.claimed, item) else {
+                        continue;
+                    };
+                    if let Some(&node) = children.get(&(parent, key(item.name())))
+                        && self.base[&node].is_file == item.is_file
+                        && !in_place.contains(&node)
+                        && match pass {
+                            0 => item.file_id.is_some() && item.file_id == self.base[&node].file_id,
+                            1 => item.name() == self.base[&node].name,
+                            _ => true,
+                        }
+                    {
+                        self.claimed.insert(i, node);
+                        in_place.insert(node);
+                    }
+                }
             }
         }
         // Moves: an unclaimed item whose file ID a base node elsewhere had,
@@ -330,8 +374,21 @@ impl<'a> Planner<'a> {
                 taken.insert(node);
             }
         }
+        let claimed_at: HashMap<Uuid, usize> = self.claimed.iter().map(|(i, n)| (*n, *i)).collect();
         for e in self.input.base {
-            self.local.insert(e.node, Local::Deleted);
+            // A name the scan skips is never seen either (an ignored file
+            // downloaded before: never trashed for being absent).
+            let unseen = local::skipped(&e.name)
+                || self.base_keys(e.node).is_some_and(|k| self.is_unseen(&k))
+                || self
+                    .local_keys(&claimed_at, e.node)
+                    .is_some_and(|k| self.is_unseen(&k));
+            let local = if unseen {
+                Local::Unseen
+            } else {
+                Local::Deleted
+            };
+            self.local.insert(e.node, local);
         }
         for (&i, &node) in &self.claimed {
             let item = &items[i];
@@ -384,17 +441,12 @@ impl<'a> Planner<'a> {
         self.plan.settled.sort();
     }
 
-    fn remote_changed(&self, node: Uuid) -> bool {
-        self.pending.contains_key(&node) && !self.plan.settled.contains(&node)
-    }
-
     /// Nodes under `folder` in the remote view that are new or whose content
-    /// changed remotely: they keep a locally deleted folder alive.
+    /// changed remotely: they keep a locally deleted folder alive. (Where
+    /// nothing is pending, the remote view is the base: nothing to compare.)
     fn remote_news_below(&self, folder: Uuid) -> bool {
         self.remote.iter().any(|(&n, r)| {
-            self.remote_changed(n)
-                && (!self.base.contains_key(&n)
-                    || (r.is_file && self.base[&n].version != r.version))
+            (!self.base.contains_key(&n) || (r.is_file && self.base[&n].version != r.version))
                 && self.is_below(n, folder)
         })
     }
@@ -407,7 +459,7 @@ impl<'a> Planner<'a> {
             }
             node = r.parent;
             steps += 1;
-            if steps > 10_000 {
+            if steps > MAX_DEPTH {
                 return false;
             }
         }
@@ -422,14 +474,19 @@ impl<'a> Planner<'a> {
             return false;
         };
         let prefix = &items[*item].path;
+        // The folder itself too: renamed locally, it's a modification (it wins
+        // over the remote delete).
         items.iter().enumerate().any(|(i, it)| {
-            it.path.len() > prefix.len()
+            it.path.len() >= prefix.len()
                 && it.path.starts_with(prefix)
                 && match self.claimed.get(&i) {
                     None => true,
+                    // Modified, or moved in from elsewhere (it would have
+                    // nowhere to go on the server).
                     Some(n) => matches!(
                         self.local.get(n),
                         Some(Local::Present { modified: true, .. })
+                            | Some(Local::Present { moved: Some(_), .. })
                     ),
                 }
         })
@@ -449,10 +506,22 @@ impl<'a> Planner<'a> {
         nodes.sort();
         for node in nodes {
             let e = self.base[&node];
+            if let Some(Some(s)) = self.pending.get(&node)
+                && !sound(&s.name)
+            {
+                let path = self.base_path(node).join("/");
+                self.report(
+                    path,
+                    format!("not synced: the server sent the name {:?}", s.name),
+                    Level::Error,
+                );
+                continue;
+            }
             let local = self.local[&node].clone();
             let remote = self.remote.get(&node).cloned();
-            let changed = self.remote_changed(node);
             match (local, remote) {
+                // Out of the scan's sight: what changed remotely waits.
+                (Local::Unseen, _) => {}
                 // Gone on both sides.
                 (Local::Deleted, None) => {
                     self.plan.actions.push(Action::Forget { node });
@@ -465,13 +534,16 @@ impl<'a> Planner<'a> {
                         self.restore_locally(node, &r);
                     } else if !writable {
                         // Neither uploaded nor reverted: listed, once for a
-                        // folder deleted with its content.
+                        // folder deleted with its content. Out of the base, so
+                        // that a role made writable later trashes nothing; it
+                        // comes back if it changes on the server.
                         let parent_deleted =
                             matches!(self.local.get(&e.parent), Some(Local::Deleted));
                         if !parent_deleted {
                             let path = self.remote_path(node).unwrap_or_default().join("/");
                             self.report(path, "not uploaded: read-only library", Level::Error);
                         }
+                        self.plan.actions.push(Action::Forget { node });
                     } else {
                         self.plan.actions.push(Action::RemoteTrash { node });
                     }
@@ -523,7 +595,8 @@ impl<'a> Planner<'a> {
                     Some(r),
                 ) => {
                     let place = r.parent != e.parent || r.name != e.name;
-                    let content = changed && r.is_file && r.version != e.version;
+                    // The remote view is the base where nothing changed.
+                    let content = r.is_file && r.version != e.version;
                     let path = self.items()[item].path.clone();
                     // The place: a local move goes up (it wins over a remote
                     // one), a remote one comes down.
@@ -552,7 +625,13 @@ impl<'a> Planner<'a> {
                                 Level::Error,
                             );
                         }
-                        (None, _) if changed && place => {
+                        // Never into what the scan can't see (through a link).
+                        (None, _)
+                            if place
+                                && self.remote_path(node).is_some_and(|p| {
+                                    self.is_unseen(&p.iter().map(|n| key(n)).collect::<Vec<_>>())
+                                }) => {}
+                        (None, _) if place => {
                             self.plan.actions.push(Action::LocalMove {
                                 node,
                                 parent: r.parent,
@@ -593,13 +672,8 @@ impl<'a> Planner<'a> {
                             name: r.name.clone(),
                             state,
                         }),
-                        (false, false, _) if changed && moved.is_none() => {
-                            // A remote place change, already in LocalMove; or a
-                            // touch: the base follows.
-                            if !place {
-                                self.plan.actions.push(Action::Accept { node, state });
-                            }
-                        }
+                        // A remote place change is in LocalMove; a remote
+                        // touch (only its time) was settled.
                         (false, false, _) => {}
                     }
                 }
@@ -684,9 +758,45 @@ impl<'a> Planner<'a> {
             let Some(path) = self.remote_path(node) else {
                 continue;
             };
+            if let Some(bad) = path.iter().find(|n| !sound(n)) {
+                if !sound(&r.name) {
+                    self.report(
+                        format!("{bad:?}"),
+                        "not synced: the server sent this name",
+                        Level::Error,
+                    );
+                }
+                continue;
+            }
             let keys: Vec<String> = path.iter().map(|n| key(n)).collect();
+            // Never through a link, nor into what the scan couldn't read; and
+            // never a name the scan would skip (it would look deleted next).
+            if self.is_unseen(&keys) || local::skipped(&r.name) {
+                continue;
+            }
             let state = self.state(node, &r);
             match local_paths.get(&keys).copied() {
+                // Read-only: nothing can go up. What this client downloaded
+                // (the version's size and time, set by the download) is
+                // adopted; anything else stays, listed, never replaced.
+                // ponytail: different bytes with the same size and time to the
+                // nanosecond pass for the same.
+                Some(i) if r.is_file && items[i].is_file && !self.input.writable => {
+                    self.claimed.insert(i, node);
+                    let item = &items[i];
+                    let same = item.size == state.size
+                        && state.modified.and_then(|m| m.timestamp_nanos_opt()) == Some(item.mtime);
+                    if same {
+                        let path = item.path.clone();
+                        self.plan.actions.push(Action::Adopt { node, path, state });
+                    } else {
+                        self.report(
+                            item.display(),
+                            "not synced: another file has this name (read-only library)",
+                            Level::Error,
+                        );
+                    }
+                }
                 Some(i) if items[i].is_file == r.is_file => {
                     self.claimed.insert(i, node);
                     let path = items[i].path.clone();
@@ -726,11 +836,66 @@ impl<'a> Planner<'a> {
         while let Some(r) = self.remote.get(&node) {
             node = r.parent;
             depth += 1;
-            if depth > 10_000 {
+            if depth > MAX_DEPTH {
                 break;
             }
         }
         depth
+    }
+
+    /// A base node's names from the root.
+    fn base_path(&self, mut node: Uuid) -> Vec<String> {
+        let mut names = Vec::new();
+        while let Some(e) = self.base.get(&node) {
+            names.push(e.name.clone());
+            node = e.parent;
+            if names.len() > MAX_DEPTH {
+                break;
+            }
+        }
+        names.reverse();
+        names
+    }
+
+    /// A base node's path from the root, by key.
+    fn base_keys(&self, mut node: Uuid) -> Option<Vec<String>> {
+        let mut keys = Vec::new();
+        while node != self.input.root {
+            let e = self.base.get(&node)?;
+            keys.push(key(&e.name));
+            node = e.parent;
+            if keys.len() > MAX_DEPTH {
+                return None;
+            }
+        }
+        keys.reverse();
+        Some(keys)
+    }
+
+    /// Where a base node is locally now, by key: below the nearest ancestor
+    /// claimed by a local item (moved or renamed there), else as in the base.
+    fn local_keys(&self, claimed_at: &HashMap<Uuid, usize>, mut node: Uuid) -> Option<Vec<String>> {
+        let mut below = Vec::new();
+        while node != self.input.root {
+            if let Some(&i) = claimed_at.get(&node) {
+                let mut keys: Vec<String> = self.items()[i].path.iter().map(|n| key(n)).collect();
+                keys.extend(below.into_iter().rev());
+                return Some(keys);
+            }
+            let e = self.base.get(&node)?;
+            below.push(key(&e.name));
+            node = e.parent;
+            if below.len() > MAX_DEPTH {
+                return None;
+            }
+        }
+        below.reverse();
+        Some(below)
+    }
+
+    /// At or below a path the scan couldn't look into.
+    fn is_unseen(&self, keys: &[String]) -> bool {
+        self.unseen.iter().any(|u| keys.starts_with(u))
     }
 
     /// A node's names from the root, in the remote view.
@@ -740,7 +905,7 @@ impl<'a> Planner<'a> {
             let r = self.remote.get(&node)?;
             names.push(r.name.clone());
             node = r.parent;
-            if names.len() > 10_000 {
+            if names.len() > MAX_DEPTH {
                 return None;
             }
         }
@@ -828,18 +993,20 @@ impl<'a> Planner<'a> {
             Action::RemoteMkdir { path, .. } => (1, path.len()),
             Action::RemoteMove { .. } => (2, 0),
             Action::Upload { .. } | Action::Merge { .. } => (3, 0),
-            Action::LocalMove { .. } => (4, 0),
-            Action::LocalMkdir { .. } => (5, 0),
+            // One rank, by depth: a folder created before what moves into it.
+            Action::LocalMove { .. } | Action::LocalMkdir { .. } => (4, 0),
             Action::KeepAside { .. } => (6, 0),
             Action::Download { .. } => (7, 0),
             Action::RemoteTrash { .. } => (8, 0),
             Action::LocalDelete { .. } => (9, 0),
-            Action::Accept { .. } | Action::Forget { .. } => (10, 0),
+            Action::Forget { .. } => (10, 0),
         };
         // Stable: within a rank, the order they were planned in (parents
         // first where it matters); LocalMkdir and LocalMove sorted by depth.
         let depth = |this: &Self, a: &Action| match a {
             Action::LocalMkdir { node, .. } | Action::LocalMove { node, .. } => this.depth(*node),
+            // Deepest first (`/` would order them the same: any decreasing
+            // function of the depth does).
             Action::LocalDelete { node } => usize::MAX - this.base_depth(*node),
             _ => 0,
         };
@@ -854,7 +1021,7 @@ impl<'a> Planner<'a> {
         while let Some(e) = self.base.get(&node) {
             node = e.parent;
             depth += 1;
-            if depth > 10_000 {
+            if depth > MAX_DEPTH {
                 break;
             }
         }
@@ -863,7 +1030,7 @@ impl<'a> Planner<'a> {
 }
 
 fn reaches_root(mut node: Uuid, root: Uuid, remote: &HashMap<Uuid, Node>) -> bool {
-    for _ in 0..10_000 {
+    for _ in 0..MAX_DEPTH {
         match remote.get(&node) {
             Some(r) if r.parent == root => return true,
             Some(r) => node = r.parent,
@@ -952,6 +1119,430 @@ mod tests {
         let a = entry(2, id(1), "a.txt", v(1));
         let items = vec![item("d", Some(&d), false), item("d/a.txt", Some(&a), true)];
         (vec![d, a], items)
+    }
+
+    fn plan_scan(base: &[Entry], scan: Scan, pending: &[(Uuid, Option<RemoteState>)]) -> Plan {
+        plan(&Input {
+            root: ROOT,
+            base,
+            scan: &scan,
+            remote: pending,
+            writable: true,
+        })
+    }
+
+    /// B1: a folder the scan couldn't read, or a file it couldn't stat, is
+    /// not deleted: nothing goes to the trash, nothing is forgotten.
+    #[test]
+    fn what_the_scan_could_not_read_is_not_deleted() {
+        let (base, items) = synced();
+        for unreadable in ["d", "d/a.txt"] {
+            let scan = Scan {
+                items: items[..1].to_vec(),
+                unreadable: vec![(unreadable.into(), "Permission denied".into())],
+                ..Default::default()
+            };
+            let plan = plan_scan(&base, scan, &[]);
+            assert_eq!(plan.actions, [], "{unreadable}");
+        }
+    }
+
+    /// B16: a synced folder replaced by a symbolic link is not deleted, and
+    /// nothing new is written through the link.
+    #[test]
+    fn a_folder_replaced_by_a_link_is_not_deleted() {
+        let (base, _) = synced();
+        let scan = Scan {
+            links: vec!["d".into()],
+            ..Default::default()
+        };
+        let new = remote(id(1), "b.txt", v(9));
+        let plan = plan_scan(&base, scan, &[(id(3), new)]);
+        assert_eq!(plan.actions, []);
+    }
+
+    /// B11: names the scan skips (what operating systems leave, a part file)
+    /// are never downloaded from the server, nor trashed for being absent.
+    #[test]
+    fn ignored_names_on_the_server_are_left_alone() {
+        let base = [entry(1, ROOT, ".DS_Store", v(1))];
+        let pending = [
+            (id(2), remote(ROOT, "desktop.ini", v(2))),
+            (id(3), remote(ROOT, ".x.txt.0123abcd.theca-part", v(3))),
+        ];
+        let plan = run(&base, vec![], &pending);
+        assert_eq!(plan.actions, []);
+    }
+
+    /// B12: beside a synced `a.txt`, a new `A.txt` (or an NFD spelling) on a
+    /// case-sensitive disk is the clash, never the synced file.
+    #[test]
+    fn a_case_variant_never_takes_over_the_synced_file() {
+        for (synced, variant) in [("a.txt", "A.txt"), ("caf\u{e9}.txt", "cafe\u{301}.txt")] {
+            let e = entry(2, ROOT, synced, v(1));
+            let items = vec![item(variant, None, true), item(synced, Some(&e), true)];
+            let plan = run(std::slice::from_ref(&e), items, &[]);
+            assert_eq!(plan.actions, [], "{variant}");
+            assert!(
+                plan.reports.iter().any(|r| r.path == variant),
+                "{:?}",
+                plan.reports
+            );
+        }
+    }
+
+    /// B17: a file deleted locally in a read-only library leaves the base
+    /// (still listed): if the role becomes writable, it isn't trashed.
+    #[test]
+    fn a_read_only_delete_leaves_the_base() {
+        let (base, items) = synced();
+        let plan = run_on(&base, items[..1].to_vec(), &[], false);
+        assert_eq!(plan.actions, [Action::Forget { node: id(2) }]);
+        assert_eq!(plan.reports.len(), 1);
+    }
+
+    /// C5: a name the server should never have sent (`..`, a path, an
+    /// absolute one) never reaches the disk, nor reads as a deletion.
+    #[test]
+    fn names_that_leave_the_folder_are_refused() {
+        let (base, items) = synced();
+        for bad in [
+            "..",
+            "../escape.txt",
+            "/tmp/abs.txt",
+            "a/b.txt",
+            "C:\\x",
+            "con.txt",
+        ] {
+            let pending = [
+                (id(9), remote(ROOT, bad, v(9))),
+                (id(2), remote(id(1), bad, v(1))),
+            ];
+            let plan = run(&base, items.clone(), &pending);
+            assert_eq!(plan.actions, [], "{bad}");
+            let paths: Vec<&str> = plan.reports.iter().map(|r| r.path.as_str()).collect();
+            assert_eq!(paths.len(), 2, "{bad}: {paths:?}");
+            assert!(paths.contains(&"d/a.txt"), "{paths:?}");
+        }
+    }
+
+    /// C8: a file moved locally into a folder the server deleted keeps the
+    /// folder: both go up, the folder new.
+    #[test]
+    fn a_file_moved_into_a_folder_deleted_remotely_keeps_it() {
+        let e = entry(1, ROOT, "e", None);
+        let x = entry(2, ROOT, "x", v(1));
+        let items = vec![item("e", Some(&e), false), item("e/x", Some(&x), true)];
+        let plan = run(&[e, x], items, &[(id(1), None)]);
+        assert!(
+            !plan.actions.contains(&Action::LocalDelete { node: id(1) }),
+            "{:?}",
+            plan.actions
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| matches!(a, Action::RemoteMkdir { name, .. } if name == "e"))
+        );
+        assert!(plan.actions.contains(&Action::RemoteMove {
+            node: id(2),
+            parent: Parent::New(vec!["e".into()]),
+            name: "x".into()
+        }));
+    }
+
+    /// C11: a read-only library's first sync (or a lost state) never plans
+    /// an upload the server refuses: a local file with the server version's
+    /// size and time is adopted, another one is listed and kept.
+    #[test]
+    fn a_read_only_first_sync_uploads_nothing() {
+        let at = chrono::DateTime::from_timestamp_nanos(7);
+        let state = |size| RemoteState {
+            parent: ROOT,
+            name: "a.txt".into(),
+            is_file: true,
+            version: v(1),
+            size,
+            modified: Some(at),
+        };
+        let same = run_on(
+            &[],
+            vec![item("a.txt", None, true)],
+            &[(id(1), Some(state(3)))],
+            false,
+        );
+        assert!(
+            matches!(same.actions[..], [Action::Adopt { .. }]),
+            "{:?}",
+            same.actions
+        );
+        let other = run_on(
+            &[],
+            vec![item("a.txt", None, true)],
+            &[(id(1), Some(state(4)))],
+            false,
+        );
+        assert_eq!(other.actions, []);
+        assert_eq!(other.reports.len(), 1);
+    }
+
+    /// An atomic save (a new file, renamed over the old one) at the root is
+    /// an edit of it, not a delete and a new file.
+    #[test]
+    fn an_atomic_save_at_the_root_is_an_edit() {
+        let a = entry(2, ROOT, "a.txt", v(1));
+        let mut saved = item("a.txt", Some(&a), true);
+        saved.file_id = Some("new".into());
+        saved.size = 77;
+        let plan = run(std::slice::from_ref(&a), vec![saved], &[]);
+        assert!(
+            matches!(
+                plan.actions[..],
+                [Action::Upload {
+                    to: UploadTo::Version { .. },
+                    ..
+                }]
+            ),
+            "{:?}",
+            plan.actions
+        );
+    }
+
+    /// A name the disk spells otherwise (NFD on an older Mac disk) is the
+    /// synced file.
+    #[test]
+    fn another_spelling_on_disk_is_the_synced_file() {
+        let e = entry(2, ROOT, "caf\u{e9}.txt", v(1));
+        let plan = run(
+            std::slice::from_ref(&e),
+            vec![item("cafe\u{301}.txt", Some(&e), true)],
+            &[],
+        );
+        assert_eq!(plan.actions, []);
+    }
+
+    /// In a folder renamed locally, a file saved atomically is still an edit.
+    #[test]
+    fn an_atomic_save_in_a_renamed_folder_is_an_edit() {
+        let (base, _) = synced();
+        let mut saved = item("e/a.txt", Some(&base[1]), true);
+        saved.file_id = Some("new".into());
+        saved.size = 77;
+        let plan = run(&base, vec![item("e", Some(&base[0]), false), saved], &[]);
+        assert!(plan.actions.contains(&Action::RemoteMove {
+            node: id(1),
+            parent: Parent::Node(ROOT),
+            name: "e".into()
+        }));
+        assert!(plan.actions.iter().any(|a| matches!(a, Action::Upload { to: UploadTo::Version { node, .. }, .. } if *node == id(2))), "{:?}", plan.actions);
+    }
+
+    /// Gone remotely, never known locally: nothing to do, settled.
+    #[test]
+    fn a_node_gone_that_nobody_knew_is_settled() {
+        let plan = run(&[], vec![], &[(id(9), None)]);
+        assert_eq!(plan.settled, [id(9)]);
+    }
+
+    /// A folder deleted locally stays deleted (trashed) unless something
+    /// inside it changed remotely: a new file or a new version, not a rename,
+    /// and not a change elsewhere.
+    #[test]
+    fn only_news_inside_keep_a_deleted_folder() {
+        let (mut base, _) = synced();
+        base.push(entry(3, ROOT, "b.txt", v(3)));
+        let b = item("b.txt", Some(&base[2]), true);
+        let trashed = |pending: &[(Uuid, Option<RemoteState>)]| {
+            run(&base, vec![b.clone()], pending)
+                .actions
+                .contains(&Action::RemoteTrash { node: id(1) })
+        };
+        assert!(
+            trashed(&[(id(3), remote(ROOT, "b.txt", v(4)))]),
+            "a change elsewhere"
+        );
+        assert!(
+            trashed(&[(id(2), remote(id(1), "renamed.txt", v(1)))]),
+            "a rename inside"
+        );
+        assert!(
+            !trashed(&[(id(2), remote(id(1), "a.txt", v(2)))]),
+            "a new version inside"
+        );
+        assert!(
+            !trashed(&[(id(5), remote(id(1), "new.txt", v(5)))]),
+            "a new file inside"
+        );
+    }
+
+    /// A remote rename within its folder comes down.
+    #[test]
+    fn a_remote_rename_comes_down() {
+        let (base, items) = synced();
+        let plan = run(&base, items, &[(id(2), remote(id(1), "b.txt", v(1)))]);
+        assert_eq!(
+            plan.actions,
+            [Action::LocalMove {
+                node: id(2),
+                parent: id(1),
+                name: "b.txt".into()
+            }]
+        );
+    }
+
+    /// A local file where the server has a new folder of that name: listed,
+    /// neither merged nor adopted.
+    #[test]
+    fn a_file_and_a_folder_of_one_name_are_listed() {
+        let plan = run(
+            &[],
+            vec![item("x", None, true)],
+            &[(id(5), remote(ROOT, "x", None))],
+        );
+        assert_eq!(plan.actions, []);
+        assert!(
+            plan.reports
+                .iter()
+                .any(|r| r.message.contains("a folder and a file"))
+        );
+    }
+
+    /// Folders come before what moves into them, and deletes go deepest
+    /// first.
+    #[test]
+    fn folders_first_deletes_deepest_first() {
+        let (base, items) = synced();
+        let pending = [
+            (id(5), remote(ROOT, "n", None)),
+            (id(2), remote(id(5), "a.txt", v(1))),
+        ];
+        let plan = run(&base, items.clone(), &pending);
+        let mkdir = plan
+            .actions
+            .iter()
+            .position(|a| matches!(a, Action::LocalMkdir { node, .. } if *node == id(5)));
+        let moved = plan
+            .actions
+            .iter()
+            .position(|a| matches!(a, Action::LocalMove { node, .. } if *node == id(2)));
+        assert!(mkdir.unwrap() < moved.unwrap(), "{:?}", plan.actions);
+        let plan = run(&base, items, &[(id(1), None), (id(2), None)]);
+        assert_eq!(
+            plan.actions,
+            [
+                Action::LocalDelete { node: id(2) },
+                Action::LocalDelete { node: id(1) }
+            ]
+        );
+    }
+
+    /// A folder renamed locally while the server deleted it: the rename is a
+    /// change, it wins (the folder goes up again, new).
+    #[test]
+    fn a_folder_renamed_locally_survives_a_remote_delete() {
+        let (base, _) = synced();
+        let items = vec![
+            item("e", Some(&base[0]), false),
+            item("e/a.txt", Some(&base[1]), true),
+        ];
+        let plan = run(&base, items, &[(id(1), None), (id(2), None)]);
+        // Its unchanged content follows the delete (in the server's trash).
+        assert!(
+            !plan.actions.contains(&Action::LocalDelete { node: id(1) }),
+            "{:?}",
+            plan.actions
+        );
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| matches!(a, Action::RemoteMkdir { name, .. } if name == "e"))
+        );
+    }
+
+    /// The exact spelling claims first at every depth, under a folder whose
+    /// own spelling changed too.
+    #[test]
+    fn a_case_variant_deeper_down_is_the_clash() {
+        let (base, _) = synced();
+        let items = vec![
+            item("D", Some(&base[0]), false),
+            item("D/A.txt", None, true),
+            item("D/a.txt", Some(&base[1]), true),
+        ];
+        let plan = run(&base, items, &[]);
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::Upload { .. })),
+            "{:?}",
+            plan.actions
+        );
+        assert!(
+            plan.reports.iter().any(|r| r.path == "D/A.txt"),
+            "{:?}",
+            plan.reports
+        );
+    }
+
+    /// A remote move into a folder that is now a link is not followed: the
+    /// file would leave the pair's folder through it.
+    #[test]
+    fn a_remote_move_never_goes_through_a_link() {
+        let d = entry(1, ROOT, "d", None);
+        let x = entry(2, ROOT, "x", v(1));
+        let scan = Scan {
+            items: vec![item("x", Some(&x), true)],
+            links: vec!["d".into()],
+            ..Default::default()
+        };
+        let plan = plan_scan(&[d, x], scan, &[(id(2), remote(id(1), "x", v(1)))]);
+        assert_eq!(plan.actions, []);
+    }
+
+    /// Unseen where the folder is now: renamed locally, its unreadable
+    /// subfolder is still not a deletion.
+    #[test]
+    fn unseen_below_a_folder_renamed_locally() {
+        let d = entry(1, ROOT, "d", None);
+        let sub = entry(3, id(1), "sub", None);
+        let f = entry(4, id(3), "f", v(4));
+        let scan = Scan {
+            items: vec![item("e", Some(&d), false), item("e/sub", Some(&sub), false)],
+            unreadable: vec![("e/sub".into(), "Permission denied".into())],
+            ..Default::default()
+        };
+        let plan = plan_scan(&[d, sub, f], scan, &[]);
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::RemoteTrash { .. })),
+            "{:?}",
+            plan.actions
+        );
+    }
+
+    /// B12: the synced file renamed locally by case (`A.txt` to `a.txt`, its
+    /// file ID kept) beside a new `A.txt`: the file ID says which is which.
+    #[test]
+    fn the_file_id_claims_before_the_spelling() {
+        let e = entry(2, ROOT, "A.txt", v(1));
+        let items = vec![item("A.txt", None, true), item("a.txt", Some(&e), true)];
+        let plan = run(std::slice::from_ref(&e), items, &[]);
+        assert_eq!(
+            plan.actions,
+            [Action::RemoteMove {
+                node: id(2),
+                parent: Parent::Node(ROOT),
+                name: "a.txt".into()
+            }]
+        );
+        assert!(
+            plan.reports.iter().any(|r| r.path == "A.txt"),
+            "{:?}",
+            plan.reports
+        );
     }
 
     #[test]
@@ -1302,14 +1893,14 @@ mod tests {
             plan.actions[..],
             [Action::KeepAside { .. }, Action::Download { .. }]
         ));
-        // Deleted locally: neither trashed nor back, listed.
+        // Deleted locally: neither trashed nor back, listed, out of the base.
         let (base, items) = synced();
         let plan = run_on(&base, items[..1].to_vec(), &[], false);
-        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert_eq!(plan.actions, [Action::Forget { node: id(2) }]);
         assert_eq!(plan.reports[0].path, "d/a.txt");
         // The folder with it: listed once.
         let plan = run_on(&base, vec![], &[], false);
-        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert_eq!(plan.actions.len(), 2, "{:?}", plan.actions);
         assert_eq!(plan.reports.len(), 1);
         // Changed on the server meanwhile: it comes down.
         let plan = run_on(

@@ -209,13 +209,11 @@ async fn command(cli: Cli) -> Result<()> {
             let account = ops::find_account(&state, account.as_deref())?;
             for l in ops::libraries(&state, &account).await? {
                 let size = l.size.map_or_else(|| "?".into(), size);
+                let organization = l.organization.as_deref().unwrap_or("?");
+                let name = format!("{} ({organization}, {})", l.library.name, l.library.id);
                 match &l.pair {
-                    Some(p) => println!(
-                        "{}  {size}  synced into {}",
-                        l.library.name,
-                        p.path.display()
-                    ),
-                    None => println!("{}  {size}  not synced", l.library.name),
+                    Some(p) => println!("{name}  {size}  synced into {}", p.path.display()),
+                    None => println!("{name}  {size}  not synced"),
                 }
             }
         }
@@ -277,7 +275,7 @@ async fn command(cli: Cli) -> Result<()> {
             println!("Restored {}.", plural(restored, "item"));
         }
         Command::Run => {
-            let _lock = lock(&path)?;
+            let _lock = theca::lock(&path)?;
             let (stop, stopped) = tokio::sync::watch::channel(false);
             tokio::spawn(async move {
                 let _ = tokio::signal::ctrl_c().await;
@@ -289,22 +287,11 @@ async fn command(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// The engine runs alone on a state: the app and `theca run` both take this
-/// lock, for as long as they run.
-fn lock(path: &std::path::Path) -> Result<std::fs::File> {
-    let lock = std::fs::File::create(path.with_extension("lock"))?;
-    if lock.try_lock().is_err() {
-        return refused("theca is already running on this state (the app, or `theca run`)");
-    }
-    Ok(lock)
-}
-
 #[cfg(feature = "gui")]
 fn app(state: Option<PathBuf>, background: bool) -> Result<()> {
     let path = state_path(state)?;
     State::open(&path)?;
-    let lock = lock(&path)?;
-    theca::gui::run(path, lock, background)?;
+    theca::gui::run(path, background)?;
     Ok(())
 }
 

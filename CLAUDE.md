@@ -9,6 +9,9 @@ Theca on computers (desktops, laptops, servers): one crate and binary, `theca` (
 - `src/state.rs` is the only SQL: one SQLite file, the schema rewritten in place until the client's 1.0.
 - The scenarios run in parallel in one process, each against a server of its own, on every platform (a port from `common::free_port`, never `bind(0)` alone). `converge` means the server matches the folders, not that the engines' rounds ended: the engine's state (notices, entries) is read with `eventually`.
 - `scripts/ci.sh` runs on Windows too (Git Bash, on GitHub's runner): paths from Cargo come as `C:\\…`, Git Bash's `pwd` gives `/d/…` (`pwd -W` for a Windows one), binaries end in `.exe`.
+- **A test run alone needs the test server** at `target/debug/theca-server` (a `cargo clean` removes it): `scripts/ci.sh test` builds it, or `SQLX_OFFLINE=true cargo build --manifest-path <core's sources> --target-dir target -p theca-core` (the path as `scripts/ci.sh` finds it), or `THECA_SERVER`. `tests/crash.rs` runs only with `--features crash-points`.
+- A new test of a guard is checked failing with the guard removed, before it counts: sprint 11 had three that passed without theirs.
+- `cargo mutants` copies the tree to `$TMPDIR` and builds it there (a second `target/`, GBs): delete `$TMPDIR/cargo-mutants-*` and its output once read. A day of test runs grows `target/` past 10 GB: `cargo clean` past ~5 GB.
 - `tauri build` (`ci/package.sh`) rewrites `tauri-build`'s line in `Cargo.toml` (`features = []`): harmless, not committed.
 
 ## Workflow differences

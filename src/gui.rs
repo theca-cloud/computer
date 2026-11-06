@@ -28,13 +28,16 @@ struct App {
     /// The tray and the menu items it updates, when the desktop has one
     /// (stock GNOME doesn't).
     tray: Mutex<Option<Tray>>,
-    /// Kept for the app's life: the engine runs alone on this state.
-    _lock: std::fs::File,
 }
+
+/// Kept for the app's life: the engine runs alone on this state.
+struct Lock(
+    #[expect(dead_code, reason = "held, never read: its drop releases the lock")] std::fs::File,
+);
 
 /// Runs the app until it quits. `background`: started at login, the window
 /// stays closed.
-pub fn run(state_path: PathBuf, lock: std::fs::File, background: bool) -> Result<(), tauri::Error> {
+pub fn run(state_path: PathBuf, background: bool) -> Result<(), tauri::Error> {
     let engine = Handle::default();
     let (stop, stopped) = watch::channel(false);
     let app = tauri::Builder::default()
@@ -53,7 +56,6 @@ pub fn run(state_path: PathBuf, lock: std::fs::File, background: bool) -> Result
             engine: engine.clone(),
             stop,
             tray: Mutex::new(None),
-            _lock: lock,
         })
         .invoke_handler(tauri::generate_handler![
             status,
@@ -71,6 +73,10 @@ pub fn run(state_path: PathBuf, lock: std::fs::File, background: bool) -> Result
             quit,
         ])
         .setup(move |app| {
+            // Taken here, once the single-instance plugin had its turn: a
+            // second launch hands over to the running app (its window comes
+            // forward) instead of failing on the lock.
+            app.manage(Lock(crate::lock(&state_path)?));
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = engine::run(state_path, engine, stopped).await {

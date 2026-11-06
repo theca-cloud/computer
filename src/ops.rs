@@ -143,19 +143,37 @@ pub fn client(account: &Account) -> Result<Client> {
 #[derive(Debug, Clone)]
 pub struct Library {
     pub library: api::Library,
+    pub organization: Option<String>,
     pub size: Option<i64>,
     pub files: Option<i64>,
     pub pair: Option<Pair>,
 }
 
-/// The account's libraries, each with its size and its pair if synced.
+/// The account's libraries, each with its organization's name, its size and
+/// its pair if synced.
 pub async fn libraries(state: &State, account: &Account) -> Result<Vec<Library>> {
     let client = client(account)?;
     let pairs = state.pairs()?;
+    let organizations = client
+        .me()
+        .await
+        .map(|me| me.organizations)
+        .unwrap_or_default();
     let mut out = Vec::new();
     for library in client.libraries().await? {
         let info = client.library(library.id).await.ok();
+        let organization = organizations
+            .iter()
+            .find(|o| o.organization == library.organization)
+            .map(|o| {
+                if o.personal {
+                    "My files".to_owned()
+                } else {
+                    o.name.clone()
+                }
+            });
         out.push(Library {
+            organization,
             pair: pairs
                 .iter()
                 .find(|p| p.account == account.id && p.library == library.id)
@@ -180,12 +198,23 @@ pub async fn add(
     let client = client(account)?;
     let all = client.libraries().await?;
     let wanted = local::key(library);
-    let Some(found) = all
+    let by_name: Vec<&api::Library> = all
         .iter()
-        .find(|l| l.id.to_string() == library || local::key(&l.name) == wanted)
-        .cloned()
-    else {
-        return refused(format!("no library {library:?} in {}", account.email));
+        .filter(|l| local::key(&l.name) == wanted)
+        .collect();
+    let found = match all.iter().find(|l| l.id.to_string() == library) {
+        Some(l) => l.clone(),
+        // One name in two organizations: never a guess (a merge could send
+        // the files into the other one).
+        None if by_name.len() > 1 => {
+            return refused(format!(
+                "several libraries are named {library:?}: use its ID (theca libraries)"
+            ));
+        }
+        None => match by_name.first() {
+            Some(l) => (*l).clone(),
+            None => return refused(format!("no library {library:?} in {}", account.email)),
+        },
     };
     let pairs = state.pairs()?;
     if pairs
@@ -203,9 +232,7 @@ pub async fn add(
             default_path(&client, &account.default_folder, library, &others, &taken).await
         }
     };
-    if pairs.iter().any(|p| p.path == path) {
-        return refused(format!("{} is already a synced folder", path.display()));
-    }
+    check_path(state, &path, None)?;
     let holds = std::fs::read_dir(&path).is_ok_and(|mut d| d.next().is_some());
     if holds && !merge {
         let files = local::scan(&path).map_or(0, |s| s.items.iter().filter(|i| i.is_file).count());
@@ -269,6 +296,60 @@ pub async fn default_path(
     folder.join(format!("{name} ({organization})"))
 }
 
+/// Refused as a pair's folder (`except`: the pair being moved): inside or
+/// around another pair's (one library's files would land in the other, and
+/// deletions cross), the home folder or `/`, or around the state's folder (it
+/// holds the app passwords, and would be uploaded).
+pub fn check_path(state: &State, path: &Path, except: Option<i64>) -> Result<()> {
+    let real = real(path);
+    let home = directories::BaseDirs::new().map(|d| self::real(d.home_dir()));
+    if real.parent().is_none() || home.as_ref() == Some(&real) {
+        return refused(format!(
+            "{} is too wide to sync: choose a folder inside it",
+            path.display()
+        ));
+    }
+    if let Some(dir) = state.path().and_then(Path::parent)
+        && self::real(dir).starts_with(&real)
+    {
+        return refused(format!(
+            "{} holds this app's own data: choose another folder",
+            path.display()
+        ));
+    }
+    for p in state.pairs()?.iter().filter(|p| Some(p.id) != except) {
+        let other = self::real(&p.path);
+        if real.starts_with(&other) || other.starts_with(&real) {
+            return refused(format!(
+                "{} is inside or around {}, already synced",
+                path.display(),
+                p.path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `path` as the disk resolves it (symlinks, `..`), even where it doesn't
+/// exist yet: its nearest existing folder resolved, the rest appended.
+fn real(path: &Path) -> PathBuf {
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_owned());
+    let mut rest = Vec::new();
+    let mut at = path.as_path();
+    loop {
+        if let Ok(found) = at.canonicalize() {
+            return rest.iter().rev().fold(found, |p, n| p.join(n));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(up), Some(name)) => {
+                rest.push(name.to_owned());
+                at = up;
+            }
+            _ => return path,
+        }
+    }
+}
+
 /// Whether the disk holding `path` (or its nearest existing folder) has room
 /// for `size` bytes, with a tenth of it to spare.
 pub fn has_room(path: &Path, size: i64) -> bool {
@@ -279,11 +360,15 @@ pub fn has_room(path: &Path, size: i64) -> bool {
     fs4::available_space(existing).is_ok_and(|free| free > needed)
 }
 
-/// Deletes the pair's files that are still exactly what was synced, then the
-/// folders left empty; anything modified or never uploaded stays. How many
-/// were kept.
-pub fn delete_synced_files(state: &State, pair: &Pair) -> Result<usize> {
-    let entries = state.entries(pair.id)?;
+/// Deletes the pair's files that are still exactly what was synced (its
+/// `entries`, read before the pair left the state), then the folders left
+/// empty; anything modified or never uploaded stays. How many were kept.
+pub fn delete_synced_files(pair: &Pair, entries: &[crate::state::Entry]) -> usize {
+    // Not the pair's folder any more (replaced, a disk unmounted): what is
+    // there now was never synced.
+    if local::file_id(&pair.path) != pair.root_file_id {
+        return entries.iter().filter(|e| e.is_file).count();
+    }
     let by_node: std::collections::HashMap<Uuid, &crate::state::Entry> =
         entries.iter().map(|e| (e.node, e)).collect();
     let names = |mut node: Uuid| {
@@ -299,9 +384,12 @@ pub fn delete_synced_files(state: &State, pair: &Pair) -> Result<usize> {
     for e in entries.iter().filter(|e| e.is_file) {
         let Some(names) = names(e.node) else { continue };
         let path = local::resolve(&pair.path, &names);
+        // The engine's whole fingerprint: another file with the same size
+        // and mtime (a copy restoring times, an atomic save) was never synced.
         if let Ok(meta) = std::fs::symlink_metadata(&path)
             && meta.len() as i64 == e.size
             && local::mtime(&meta) == e.mtime
+            && local::file_id(&path) == e.file_id
         {
             let _ = std::fs::remove_file(&path);
         }
@@ -317,23 +405,26 @@ pub fn delete_synced_files(state: &State, pair: &Pair) -> Result<usize> {
         let _ = std::fs::remove_dir(local::resolve(&pair.path, &folder));
     }
     let _ = std::fs::remove_dir(&pair.path);
-    let kept = if pair.path.exists() {
+    if pair.path.exists() {
         local::scan(&pair.path).map_or(0, |s| s.items.iter().filter(|i| i.is_file).count())
     } else {
         0
-    };
-    Ok(kept)
+    }
 }
 
 /// Stops syncing: the pair's state goes; its files stay, or only those
 /// identical to what was synced are deleted. How many were kept.
 pub fn remove(state: &State, pair: &Pair, delete_files: bool) -> Result<usize> {
+    // The pair out of the state first: an engine running meanwhile, or the
+    // next start after a crash, would take the deletions for the user's.
+    let entries = state.entries(pair.id)?;
+    state.remove_pair(pair)?;
     let kept = if delete_files {
-        delete_synced_files(state, pair)?
+        delete_synced_files(pair, &entries)
     } else {
         0
     };
-    state.remove_pair(pair)?;
+    crate::crash_point("removal-deleted");
     Ok(kept)
 }
 
@@ -386,6 +477,7 @@ pub fn locate(state: &State, pair: &Pair, path: &Path, confirm: bool) -> Result<
     if !path.is_dir() {
         return refused(format!("{} isn't a folder", path.display()));
     }
+    check_path(state, path, Some(pair.id))?;
     let id = local::file_id(path);
     let same = id.is_some() && id == pair.root_file_id;
     if !same && !confirm {
@@ -464,6 +556,107 @@ pub fn find_account(state: &State, which: Option<&str>) -> Result<Account> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pair on a real folder holding `a.txt`, synced (its base entry).
+    fn synced_pair(dir: &Path) -> (State, Pair) {
+        let state = State::memory().unwrap();
+        let account = state
+            .save_account(&crate::state::Account {
+                id: 0,
+                instance: "https://x".into(),
+                uuid: Uuid::now_v7(),
+                email: "a@x".into(),
+                device: "d".into(),
+                password: "p".into(),
+                default_folder: dir.to_owned(),
+                auto_sync_limit: None,
+                signed_out: false,
+            })
+            .unwrap();
+        let root = Uuid::now_v7();
+        let mut pair = Pair {
+            id: 0,
+            account,
+            library: Uuid::now_v7(),
+            root,
+            library_name: "Docs".into(),
+            path: dir.to_owned(),
+            root_file_id: local::file_id(dir),
+            position: Some(1),
+            paused: false,
+            stopped: None,
+            writable: true,
+            activity: String::new(),
+            synced_at: None,
+        };
+        pair.id = state.add_pair(&pair).unwrap();
+        state
+            .set_pair_path(pair.id, dir, pair.root_file_id.as_deref())
+            .unwrap();
+        state.record_remote(pair.id, &[], Some(1)).unwrap();
+        std::fs::write(dir.join("a.txt"), "synced").unwrap();
+        let meta = std::fs::metadata(dir.join("a.txt")).unwrap();
+        let entry = crate::state::Entry {
+            node: Uuid::now_v7(),
+            parent: root,
+            name: "a.txt".into(),
+            is_file: true,
+            version: Some(Uuid::now_v7()),
+            size: meta.len() as i64,
+            mtime: local::mtime(&meta),
+            file_id: local::file_id(&dir.join("a.txt")),
+        };
+        state.synced(pair.id, &entry, Some("a.txt"), &[]).unwrap();
+        (state, pair)
+    }
+
+    /// A5: another file at the path, same size and mtime (a copy restoring
+    /// times, an atomic save), was never synced: it stays.
+    #[test]
+    fn removal_keeps_another_file_with_the_same_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, pair) = synced_pair(dir.path());
+        let a = dir.path().join("a.txt");
+        let mtime = std::fs::metadata(&a).unwrap().modified().unwrap();
+        let other = dir.path().join("other");
+        std::fs::write(&other, "edited").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&other)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        std::fs::rename(&other, &a).unwrap();
+        delete_synced_files(&pair, &state.entries(pair.id).unwrap());
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "edited");
+    }
+
+    /// A5: a pair whose folder isn't its own any more (replaced, a disk
+    /// unmounted) deletes nothing in what is there now.
+    #[test]
+    fn removal_deletes_nothing_in_a_replaced_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut pair) = synced_pair(dir.path());
+        pair.root_file_id = Some("another:folder".into());
+        delete_synced_files(&pair, &state.entries(pair.id).unwrap());
+        assert!(dir.path().join("a.txt").exists());
+    }
+
+    /// B6: never `/`, the home folder, nor a folder holding the state.
+    #[test]
+    fn too_wide_folders_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open(&dir.path().join("data/state.sqlite")).unwrap();
+        let home = directories::BaseDirs::new().unwrap().home_dir().to_owned();
+        for path in [Path::new("/"), &home, dir.path(), &dir.path().join("data")] {
+            assert!(
+                check_path(&state, path, None).is_err(),
+                "{}",
+                path.display()
+            );
+        }
+        assert!(check_path(&state, &dir.path().join("Docs"), None).is_ok());
+    }
 
     #[test]
     fn room_on_the_disk() {

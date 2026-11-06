@@ -32,8 +32,8 @@ tauri-plugin-opener = { version = "2", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
 # core's release, from its public mirror (as CE builds it): no credentials
 # anywhere. Working against an unreleased core: CLAUDE.md.
-theca-client = { git = "https://github.com/theca-cloud/core", tag = "1.3.0" }
-theca-common = { git = "https://github.com/theca-cloud/core", tag = "1.3.0" }
+theca-client = { git = "https://github.com/theca-cloud/core", tag = "1.3.3" }
+theca-common = { git = "https://github.com/theca-cloud/core", tag = "1.3.3" }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "fs", "time", "signal", "sync"] }
 tracing = "0.1.44"
@@ -56,6 +56,7 @@ tempfile = "3.27.0"
 reqwest = { version = "0.13", default-features = false }
 fantoccini = { version = "0.22", default-features = false }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+proptest = "1.12.0"
 
 [features]
 # The app: the window, the tray (ADR 0004). Without it, the CLI and daemon,
@@ -71,6 +72,8 @@ gui = [
 # The page embedded in the binary (a build); without it, the app loads Vite's
 # dev server (tauri dev). The Tauri CLI turns it on for builds, by this name.
 custom-protocol = ["tauri/custom-protocol"]
+# Named points where the crash tests abort the process (tests/crash.rs).
+crash-points = []
 
 [build-dependencies]
 tauri-build = { version = "2", optional = true }

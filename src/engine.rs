@@ -110,6 +110,7 @@ pub async fn run(
                                 account = account.id,
                                 "the account's engine stopped: {e}"
                             );
+                            let _ = stopped(&path, account.id, &e);
                         }
                     }
                     // The caller's span on its lines too (the tests name each device).
@@ -126,6 +127,19 @@ pub async fn run(
     for (_, task) in running {
         task.abort();
         let _ = task.await;
+    }
+    Ok(())
+}
+
+/// The account's engine stopped on an error (started again within 30 s):
+/// said, so that pairs don't look up to date while nothing syncs (an error
+/// coming back every time would otherwise never show).
+fn stopped(state_path: &Path, account: i64, e: &EngineError) -> Result<(), StateError> {
+    let state = State::open(state_path)?;
+    let message = format!("syncing stopped, tried again every 30 s: {e}");
+    state.notify(Some(account), None, "error", None, &message, None)?;
+    for p in state.pairs()?.iter().filter(|p| p.account == account) {
+        state.set_activity(p.id, &format!("error: {e}"), false)?;
     }
     Ok(())
 }
@@ -147,8 +161,10 @@ struct Follower {
     dirty: HashSet<i64>,
     retry_at: Option<Instant>,
     full_at: HashMap<i64, Instant>,
-    /// The last watcher event, per pair.
-    heard_at: HashMap<i64, Instant>,
+    /// The last watcher event, per pair: stamped by the watcher itself, so a
+    /// round deciding whether to trash sees the events that came during it
+    /// (an `rm -rf` started mid-scan), not only those before it.
+    heard_at: Heard,
     /// Pairs whose deletions wait for their folder to be quiet, since when.
     deletions_held: HashMap<i64, Instant>,
     /// Nodes this client changed lately, per pair.
@@ -186,7 +202,7 @@ async fn follow(
         dirty: HashSet::new(),
         retry_at: None,
         full_at: HashMap::new(),
-        heard_at: HashMap::new(),
+        heard_at: Heard::default(),
         deletions_held: HashMap::new(),
         recent: HashMap::new(),
         roots: HashMap::new(),
@@ -245,12 +261,13 @@ async fn follow(
 impl Follower {
     fn heard(&mut self, pair: i64) {
         self.dirty.insert(pair);
-        self.heard_at.insert(pair, Instant::now());
     }
 
     /// Whether the pair's local deletions may go to the trash now.
     fn may_trash(&self, pair: i64) -> bool {
         self.heard_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&pair)
             .is_none_or(|at| at.elapsed() >= QUIET)
             || self
@@ -271,8 +288,13 @@ impl Follower {
         // Access given back: the stream doesn't replay what happened
         // meanwhile (a library gained follows from its last event), so the
         // pair would wait forever to catch up: it lists the library again. A
-        // trashed library stayed in the feed: nothing missed.
-        if p.stopped.as_deref() == Some(crate::state::ACCESS_REMOVED) {
+        // trashed library stayed in the feed, but a folder that arrived while
+        // it was there couldn't be listed (its tree answers 404 in the trash):
+        // listed again too.
+        if matches!(
+            p.stopped.as_deref(),
+            Some(crate::state::ACCESS_REMOVED | crate::state::LIBRARY_DELETED)
+        ) {
             self.state.reset_position(p.id)?;
         }
         self.state.set_library(p.id, name, writable)?;
@@ -318,6 +340,7 @@ impl Follower {
             }
             if !self.watchers.contains_key(&p.id) {
                 let events = self.events.clone();
+                let heard_at = self.heard_at.clone();
                 let id = p.id;
                 // Events only mark the pair dirty: the next round (within a
                 // second) scans, and files still being written wait for it.
@@ -329,6 +352,7 @@ impl Follower {
                 let watcher =
                     notify::recommended_watcher(move |e: notify::Result<notify::Event>| {
                         if e.is_err() || e.is_ok_and(|e| changes(&e.kind)) {
+                            heard(&heard_at, id);
                             let _ = events.send(id);
                         }
                     });
@@ -362,8 +386,10 @@ impl Follower {
                 Some(l) if l.trashed => self.stop(&p, crate::state::LIBRARY_DELETED)?,
                 Some(l) => {
                     self.library_there(&p, &l.name, l.writable)?;
+                    // A server restored from a backup: its tree is older than
+                    // the base, so the resync has no base (decisions.md, Sync).
                     if l.reset {
-                        self.state.reset_position(p.id)?;
+                        self.state.forget_base(p.id)?;
                     }
                 }
             }
@@ -412,7 +438,8 @@ impl Follower {
             .iter()
             .map(|o| (o.id, o.name.clone()))
             .collect();
-        let mut taken: Vec<PathBuf> = pairs.iter().map(|p| p.path.clone()).collect();
+        // Every account's folders: two accounts may share a default folder.
+        let mut taken: Vec<PathBuf> = self.state.pairs()?.iter().map(|p| p.path.clone()).collect();
         let mut offered = Vec::new();
         for l in candidates {
             let Ok(info) = self.client.library(l.id).await else {
@@ -432,6 +459,7 @@ impl Follower {
             let synced = small
                 && !declined.contains(&l.id)
                 && !occupied
+                && ops::check_path(&self.state, &path, None).is_ok()
                 && ops::has_room(&path, info.size)
                 // Created here, last: the pair's folder must exist before its
                 // first round (it would stop as missing otherwise).
@@ -563,7 +591,7 @@ impl Follower {
                 }
             }
             list.extend(listed);
-            self.state.record_remote(p.id, &list, position)?;
+            self.state.record_feed(p.id, &list, position)?;
             self.dirty.insert(p.id);
         }
         Ok(())
@@ -732,7 +760,7 @@ impl Follower {
         } else {
             self.deletions_held.remove(&p.id);
         }
-        let outcome = Executor::new(&self.client, &mut self.state, &p)?
+        let outcome = Executor::new(&self.client, &self.state, &p)?
             .run(plan, &scan)
             .await?;
         let recent = self.recent.entry(p.id).or_default();
@@ -792,6 +820,11 @@ impl Follower {
                 self.stop(p, "the folder was moved to the trash")?;
                 return Ok(None);
             }
+            // Never into or around another pair's folder, as when added.
+            if let Err(e) = ops::check_path(&self.state, &moved, Some(p.id)) {
+                self.stop(p, &format!("moved to {}: {e}", moved.display()))?;
+                return Ok(None);
+            }
             self.state
                 .set_pair_path(p.id, &moved, p.root_file_id.as_deref())?;
             self.state.notify(
@@ -829,6 +862,16 @@ impl Follower {
         self.state.record_remote(p.id, &states, Some(position))?;
         Ok(true)
     }
+}
+
+/// When each pair's watcher last reported a change.
+type Heard = Arc<std::sync::Mutex<HashMap<i64, Instant>>>;
+
+fn heard(heard_at: &Heard, pair: i64) {
+    heard_at
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(pair, Instant::now());
 }
 
 /// `1 item`, `3 items`.
@@ -873,4 +916,36 @@ fn open_dir(path: &Path) -> std::io::Result<std::fs::File> {
     }
     #[cfg(not(windows))]
     std::fs::File::open(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// C16: an engine stopped by an error says so, once however often.
+    #[test]
+    fn a_stopped_engine_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let state = State::open(&path).unwrap();
+        let account = state
+            .save_account(&Account {
+                id: 0,
+                instance: "https://x".into(),
+                uuid: Uuid::now_v7(),
+                email: "a@x".into(),
+                device: "d".into(),
+                password: "p".into(),
+                default_folder: dir.path().to_owned(),
+                auto_sync_limit: None,
+                signed_out: false,
+            })
+            .unwrap();
+        let e = EngineError::Client(Error::Decode("a cut listing".into()));
+        stopped(&path, account, &e).unwrap();
+        stopped(&path, account, &e).unwrap();
+        let notices = state.notices().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].message.contains("a cut listing"));
+    }
 }
