@@ -129,6 +129,12 @@ async fn an_unreadable_folder_is_not_deleted() {
     a.write("d/x.txt", "kept");
     w.converge(&[&a]).await;
     std::fs::set_permissions(a.path("d"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root reads it anyway (CI's containers): nothing to test there.
+    if std::fs::read_dir(a.path("d")).is_ok() {
+        std::fs::set_permissions(a.path("d"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: an unreadable folder is readable to this user (root)");
+        return;
+    }
     // A round after it: another change, uploaded.
     a.write("y.txt", "a round");
     eventually("y.txt uploaded", || async {
