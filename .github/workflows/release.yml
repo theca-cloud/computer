@@ -72,4 +72,14 @@ jobs:
           awk -v h="## [$TAG]" 'index($0, h) == 1 {on = 1; next} /^## \[/ {on = 0} on' CHANGELOG.md > notes.md
           printf '\nThe apps are not signed yet: [how to open them](https://github.com/%s#opening-an-unsigned-app).\n' \
             "$GITHUB_REPOSITORY" >> notes.md
-          gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md --verify-tag
+          # Before 1.0: a pre-release, and said what that means for a user's
+          # files and state (sprint 11's decision).
+          pre=
+          case "$TAG" in
+          0.*)
+              pre=--prerelease
+              # shellcheck disable=SC2016 # the backticks are Markdown, not a command
+              printf '\nA pre-release: keep a backup of the folders you sync. An upgrade may need `theca reset` (the state is rewritten until 1.0).\n' >> notes.md
+              ;;
+          esac
+          gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md --verify-tag $pre
