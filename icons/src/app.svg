@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Theca's mark, the chunked T (decisions.md, Look): a T cut from a tile, its
+       crossbar cut once, its stem in chunks of uneven length. -->
+  <title>Theca</title>
+  <mask id="t">
+    <rect width="32" height="32" fill="#fff"/>
+    <rect x="7.5" y="7" width="3.75" height="4.5" rx="1"/>
+    <rect x="12.75" y="7" width="11.75" height="4.5" rx="1"/>
+    <rect x="13.75" y="13" width="4.5" height="5.5" rx="1"/>
+    <rect x="13.75" y="20" width="4.5" height="2.5" rx="0.75"/>
+    <rect x="13.75" y="24" width="4.5" height="1.75" rx="0.6"/>
+  </mask>
+  <rect width="32" height="32" rx="8" fill="#0f766e" mask="url(#t)"/>
+</svg>

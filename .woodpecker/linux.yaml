@@ -1,0 +1,88 @@
+# The checks on Linux (amd64, the server's agents), on every push to any branch
+# when something built or tested changed; manual runs always. Each step is a
+# part of scripts/ci.sh, so a red step says what failed. macOS, Windows and
+# Linux arm64 are tested on GitHub (ADR 0005, .github/workflows/test.yml), from
+# the dev this workflow mirrors once its checks pass.
+when:
+  - event: push
+    # Nothing built or tested changed: docs, repo housekeeping.
+    path:
+      exclude: ["**/*.md", "LICENSE", ".gitignore", "cliff.toml"]
+    # Not a version commit (scripts/release.sh, `1.2.3`): it only bumps the
+    # version on code dev already tested, on prod and coming back into dev.
+    evaluate: 'not (trim(CI_COMMIT_MESSAGE) matches "^[0-9]+[.][0-9]+[.][0-9]+$")'
+  - event: manual
+
+# The mirror pushes to GitHub, which refuses a shallow or partial clone. The
+# clone plugin the server trusts with credentials.
+clone:
+  git:
+    image: woodpeckerci/plugin-git:2.11.0
+    settings:
+      partial: false
+      depth: 0
+
+services:
+  # The end-to-end tests' databases: one per test, on this server.
+  - name: postgres
+    image: postgres:18
+    environment:
+      POSTGRES_USER: theca
+      POSTGRES_PASSWORD: theca
+      POSTGRES_DB: theca
+      # The server refuses other collations.
+      POSTGRES_INITDB_ARGS: --locale-provider=builtin --builtin-locale=C.UTF-8
+
+# Built and pushed by scripts/ci-image.sh; tag = the Rust version in
+# rust-toolchain.toml. Rust, Node, WebKitGTK and the app's test tools.
+variables:
+  - &image
+    image: git.pband.ch/theca/ci-computer:1.98.0
+    pull: true
+    environment:
+      DATABASE_URL: postgres://theca:theca@postgres:5432/theca
+
+steps:
+  # Licenses and advisories: no build, so it runs alongside the others.
+  - name: deny
+    <<: *image
+    depends_on: []
+    commands:
+      - scripts/ci.sh deny
+
+  - name: lint
+    <<: *image
+    depends_on: []
+    commands:
+      - scripts/ci.sh lint
+
+  - name: test
+    <<: *image
+    depends_on: [lint]
+    commands:
+      - scripts/ci.sh test
+
+  # The app driven through its window (tauri-driver; Linux only).
+  - name: app
+    <<: *image
+    depends_on: [lint]
+    commands:
+      - scripts/ci.sh app
+
+  # dev, once every check passed, to GitHub, which tests it on the other
+  # platforms. Force: Gitea is the one truth. github_deploy_key is this
+  # repository's own deploy key, with write access to its GitHub mirror only.
+  - name: mirror
+    image: alpine/git:v2.54.0
+    depends_on: [deny, lint, test, app]
+    when:
+      - event: push
+        branch: dev
+    environment:
+      KEY:
+        from_secret: github_deploy_key
+    commands:
+      - mkdir -p ~/.ssh && printf '%s\n' "$$KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+      # GitHub's host key, from https://api.github.com/meta (ssh_keys).
+      - echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > ~/.ssh/known_hosts
+      - git push --force git@github.com:theca-cloud/computer.git HEAD:refs/heads/dev

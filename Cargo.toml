@@ -1,0 +1,79 @@
+[package]
+name = "theca"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+[[bin]]
+name = "theca"
+path = "src/main.rs"
+
+[dependencies]
+chrono = "0.4.45"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+directories = "6.0.0"
+file-id = "0.2.3"
+filepath = "0.2.0"
+fs4 = "1.1.0"
+futures = "0.3.34"
+gethostname = "1.1.0"
+notify = "8.2.1"
+# C (SQLite), against the pure-Rust preference: no pure-Rust SQLite is mature
+# enough for the only copy of what was synced. Bundled: the same SQLite on
+# every OS, nothing to install.
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tauri = { version = "2", features = ["tray-icon", "image-png"], optional = true }
+tauri-plugin-autostart = { version = "2", optional = true }
+tauri-plugin-dialog = { version = "2", optional = true }
+tauri-plugin-opener = { version = "2", optional = true }
+tauri-plugin-single-instance = { version = "2", optional = true }
+# core's release, from its public mirror (as CE builds it): no credentials
+# anywhere. Working against an unreleased core: CLAUDE.md.
+theca-client = { git = "https://github.com/theca-cloud/core", tag = "1.3.3" }
+theca-common = { git = "https://github.com/theca-cloud/core", tag = "1.3.3" }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "fs", "time", "signal", "sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+unicode-normalization = "0.1.26"
+uuid = "1.29.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dev-dependencies]
+# v7: a database name per test.
+uuid = { version = "1.29.0", features = ["v7"] }
+dotenvy = "0.15.7"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres"] }
+tempfile = "3.27.0"
+reqwest = { version = "0.13", default-features = false }
+fantoccini = { version = "0.22", default-features = false }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+proptest = "1.12.0"
+
+[features]
+# The app: the window, the tray (ADR 0004). Without it, the CLI and daemon,
+# linking no GUI library (servers).
+gui = [
+    "dep:tauri",
+    "dep:tauri-build",
+    "dep:tauri-plugin-autostart",
+    "dep:tauri-plugin-dialog",
+    "dep:tauri-plugin-opener",
+    "dep:tauri-plugin-single-instance",
+]
+# The page embedded in the binary (a build); without it, the app loads Vite's
+# dev server (tauri dev). The Tauri CLI turns it on for builds, by this name.
+custom-protocol = ["tauri/custom-protocol"]
+# Named points where the crash tests abort the process (tests/crash.rs).
+crash-points = []
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true }

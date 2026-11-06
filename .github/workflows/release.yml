@@ -1,0 +1,85 @@
+# The release (ADR 0005): on a version tag, which Woodpecker's release.yaml
+# pushes here with prod, every package built natively on its runner and
+# checked (ci/package.sh), then one GitHub release with them all, created only
+# once every package passed. No tests: the tag's code is dev's, tested on
+# every platform, plus the version bump. By hand (workflow_dispatch), it builds
+# and checks the packages without releasing: they stay on the run.
+name: release
+
+on:
+  push:
+    tags: ["[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15, os: macos, arch: arm64 }
+          - { runner: macos-15-intel, os: macos, arch: x86_64 }
+          - { runner: windows-2025, os: windows, arch: x86_64 }
+          # The oldest Ubuntu: glibc 2.35, so the packages run on Ubuntu
+          # 22.04+ and Debian 12+.
+          - { runner: ubuntu-22.04, os: linux, arch: x86_64 }
+          - { runner: ubuntu-22.04-arm, os: linux, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    # No Rust cache (test.yml has one): a release builds from scratch.
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: ui/.nvmrc
+      # Tauri's Linux prerequisites (as in test.yml and ci/Dockerfile), and
+      # what its AppImage bundler runs.
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf file
+      - run: ci/package.sh ${{ matrix.os }} ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          # This version's section of the changelog, and how to open an
+          # unsigned app (signing comes with Distribution).
+          awk -v h="## [$TAG]" 'index($0, h) == 1 {on = 1; next} /^## \[/ {on = 0} on' CHANGELOG.md > notes.md
+          printf '\nThe apps are not signed yet: [how to open them](https://github.com/%s#opening-an-unsigned-app).\n' \
+            "$GITHUB_REPOSITORY" >> notes.md
+          # Before 1.0: a pre-release, and said what that means for a user's
+          # files and state (sprint 11's decision).
+          pre=
+          case "$TAG" in
+          0.*)
+              pre=--prerelease
+              # shellcheck disable=SC2016 # the backticks are Markdown, not a command
+              printf '\nA pre-release: keep a backup of the folders you sync. An upgrade may need `theca reset` (the state is rewritten until 1.0).\n' >> notes.md
+              ;;
+          esac
+          gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md --verify-tag $pre
