@@ -1,5 +1,5 @@
-//! The end-to-end harness: the real `theca-server` binary (built from
-//! `../core`, or `THECA_SERVER`) on a database of its own, and sync clients
+//! The end-to-end harness: the real `theca-server` binary (built from the
+//! pinned core, or `THECA_SERVER`) on a database of its own, and sync clients
 //! as engines on their own state and folder, driven like a user would.
 
 #![allow(dead_code)] // each test uses part of it
@@ -28,27 +28,23 @@ use uuid::Uuid;
 pub const ADMIN: &str = "admin@test.theca";
 pub const PASSWORD: &str = "a long password";
 
-/// The server: a process of the test's own, killed when dropped; or a shared
-/// one (`THECA_TEST_SERVER_URL`: the Windows step, whose server runs on Linux).
+/// The server: a process of the test's own, killed when dropped.
 pub struct Server {
-    child: Option<Child>,
+    child: Child,
     pub url: String,
-    /// Its own database's URL (a test reads it, as the app's tests do); none
-    /// for a shared server.
-    pub database: Option<String>,
-    _dir: Option<tempfile::TempDir>,
+    /// Its own database's URL (a test reads it, as the app's tests do).
+    pub database: String,
+    _dir: tempfile::TempDir,
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        if let Some(child) = &mut self.child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
         // Its database too: a few dozen MB each, they filled the dev Postgres.
         // On a thread of its own: this runs inside the test's runtime.
-        if let (Some(database), Ok(admin)) = (&self.database, std::env::var("DATABASE_URL")) {
-            let name = database.rsplit_once('/').unwrap().1.to_owned();
+        if let Ok(admin) = std::env::var("DATABASE_URL") {
+            let name = self.database.rsplit_once('/').unwrap().1.to_owned();
             let _ = std::thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -89,7 +85,8 @@ pub fn free_port() -> u16 {
     }
 }
 
-/// A fresh database on the dev Postgres, and the server on it.
+/// A fresh database on `DATABASE_URL`'s Postgres (scripts/dev.sh's, CI's),
+/// and the server on it.
 pub async fn server() -> Server {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -129,10 +126,10 @@ pub async fn server() -> Server {
         .spawn()
         .expect("the server binary");
     let mut server = Server {
-        child: Some(child),
+        child,
         url,
-        database: Some(database),
-        _dir: Some(dir),
+        database,
+        _dir: dir,
     };
     for _ in 0..300 {
         // It listens once migrated and configured.
@@ -144,7 +141,7 @@ pub async fn server() -> Server {
         {
             return server;
         }
-        if let Some(Ok(Some(status))) = server.child.as_mut().map(|c| c.try_wait()) {
+        if let Ok(Some(status)) = server.child.try_wait() {
             panic!("the server exited: {status}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -158,15 +155,11 @@ pub struct World {
     pub admin: Client,
     pub library: api::Library,
     pub organization: Uuid,
-    /// The storage's folder (kept while the world lives); none on a shared
-    /// server.
-    storage: Option<tempfile::TempDir>,
+    /// The storage's folder (kept while the world lives).
+    storage: tempfile::TempDir,
 }
 
 pub async fn world() -> World {
-    if let Ok(url) = std::env::var("THECA_TEST_SERVER_URL") {
-        return shared(url).await;
-    }
     let server = server().await;
     let storage = tempfile::tempdir().unwrap();
     let mut admin = Client::new(&server.url).unwrap();
@@ -185,52 +178,7 @@ pub async fn world() -> World {
         admin,
         library,
         organization,
-        storage: Some(storage),
-    }
-}
-
-/// A world on a shared server (`THECA_TEST_SERVER_URL`, its admin's
-/// `THECA_TEST_ADMIN_EMAIL` and `THECA_TEST_ADMIN_PASSWORD`): an organization
-/// of the test's own. Tests then run one at a time (`--test-threads=1`): each
-/// starts by deleting the organizations the last ones left, so the admin's
-/// devices only ever see this test's libraries (auto-sync would take the
-/// others').
-async fn shared(url: String) -> World {
-    let mut admin = Client::new(&url).unwrap();
-    let email = std::env::var("THECA_TEST_ADMIN_EMAIL").expect("THECA_TEST_ADMIN_EMAIL");
-    let password = std::env::var("THECA_TEST_ADMIN_PASSWORD").expect("THECA_TEST_ADMIN_PASSWORD");
-    admin.login(&email, &password, None).await.unwrap();
-    for membership in admin.me().await.unwrap().organizations {
-        if !membership.personal {
-            let path = format!("/api/v1/organizations/{}", membership.organization);
-            let _: () = admin
-                .call(reqwest::Method::DELETE, &path, None::<&()>)
-                .await
-                .unwrap();
-        }
-    }
-    let name = format!("test-{}", &Uuid::now_v7().simple().to_string()[20..]);
-    let created: serde_json::Value = admin
-        .call(
-            reqwest::Method::POST,
-            "/api/v1/organizations",
-            Some(&json!({ "name": name })),
-        )
-        .await
-        .unwrap();
-    let organization: Uuid = created["id"].as_str().unwrap().parse().unwrap();
-    let library = admin.create_library(organization, "Docs").await.unwrap();
-    World {
-        server: Server {
-            child: None,
-            url,
-            database: None,
-            _dir: None,
-        },
-        admin,
-        library,
-        organization,
-        storage: None,
+        storage,
     }
 }
 
@@ -277,11 +225,11 @@ impl World {
     }
 
     /// A second account, a member of the world's organization (not its
-    /// owner): its client, logged in, and its user in the organization. None
-    /// on a shared server: registering needs the address verified, which
-    /// only its database can do here (no email), and its settings are shared.
-    pub async fn member(&self, email: &str) -> Option<(Client, Uuid)> {
-        let database = self.server.database.as_ref()?;
+    /// owner): its client, logged in, and its user in the organization.
+    /// Registering needs the address verified, done through the server's
+    /// database (no email here).
+    pub async fn member(&self, email: &str) -> (Client, Uuid) {
+        let database = &self.server.database;
         // Registration needs SMTP set: a server nobody listens on (emails
         // fail in the background; the address is verified below instead).
         let settings = |smtp: Option<&str>| {
@@ -336,7 +284,7 @@ impl World {
             )
             .await
             .unwrap();
-        Some((client, member.id))
+        (client, member.id)
     }
 
     /// Gives `user` write access to `library`, or takes it away.

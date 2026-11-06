@@ -1,0 +1,43 @@
+# The checks on the platforms our Woodpecker doesn't have (ADR 0005): macOS,
+# Windows and Linux arm64, on GitHub's runners (free for public repositories).
+# dev reaches GitHub only once Woodpecker's Linux checks passed (its mirror
+# step); feature branches never do. scripts/release.sh refuses to release
+# while the latest run here on dev is red.
+name: test
+
+on:
+  push:
+    branches: [dev]
+    # As Woodpecker: nothing built or tested changed.
+    paths-ignore: ["**/*.md", LICENSE, .gitignore, cliff.toml]
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025, ubuntu-22.04-arm]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version-file: ui/.nvmrc
+      - uses: Swatinem/rust-cache@v2.9.3
+      # Tauri's Linux prerequisites, as in ci/Dockerfile and release.yml.
+      - name: Linux packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+      # The tests' Postgres: Docker on Linux, a native one elsewhere.
+      - name: Postgres
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then scripts/dev.sh; else ci/postgres.sh; fi
+      - run: scripts/ci.sh lint
+      - run: scripts/ci.sh test

@@ -76,7 +76,7 @@ async fn shown(client: &Client, text: &str) -> fantoccini::elements::Element {
 /// `/connect` page would (its ID read from the server's database: the app
 /// opens it in a browser the test doesn't have).
 async fn approve(w: &World) {
-    let mut db = sqlx::PgConnection::connect(w.server.database.as_ref().expect("its own server"))
+    let mut db = sqlx::PgConnection::connect(&w.server.database)
         .await
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);

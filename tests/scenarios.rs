@@ -316,7 +316,6 @@ async fn library_trashed_and_device_signed_out() {
     a.write("y.txt", "y");
     w.converge(&[&a]).await;
 
-    // This device's own (a shared server holds others).
     w.admin
         .revoke_app_password(a.app_password.unwrap())
         .await
@@ -504,10 +503,7 @@ async fn a_stopped_folder_located() {
 #[tokio::test(flavor = "multi_thread")]
 async fn access_removed_and_given_back() {
     let w = world().await;
-    // A shared server: no second account (see `member`).
-    let Some((member, user)) = w.member("member@test.theca").await else {
-        return;
-    };
+    let (member, user) = w.member("member@test.theca").await;
     w.set_member(&w.library, user, true).await;
     let password = member
         .create_app_password(&theca_common::api::CreateAppPassword {

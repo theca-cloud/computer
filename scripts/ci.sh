@@ -2,9 +2,8 @@
 # Every CI check, run natively: `scripts/ci.sh` runs them all; `scripts/ci.sh
 # <step>` runs one, as the Woodpecker steps do:
 #   lint  formatting, clippy (warnings are errors), the app's page, the app built
-#   test  every test (the end-to-end ones need scripts/dev.sh's Postgres and
-#         the server, built from ../core; or, with THECA_TEST_SERVER_URL and
-#         its admin's THECA_TEST_ADMIN_EMAIL and _PASSWORD, a shared server)
+#   test  every test (the end-to-end ones need a Postgres, scripts/dev.sh's or
+#         DATABASE_URL's, and the server, built from the pinned core)
 #   app   the app driven through its window (Linux: tauri-driver, under a
 #         virtual screen; the CI image has them)
 #   deny  licenses, advisories, sources (Rust and the page's npm packages)
@@ -26,14 +25,17 @@ server() {
     [ -n "${THECA_SERVER:-}" ] && return
     # core's sources, wherever Cargo has them: a sibling checkout during a
     # sprint (a path dependency), Cargo's git checkout of the pinned tag after.
-    core=$(cargo metadata --format-version 1 | tr ',' '\n' |
+    # Windows writes it with escaped backslashes: turned into slashes.
+    core=$(cargo metadata --format-version 1 | tr ',' '\n' | sed 's|\\\\|/|g' |
         sed -n 's|^"manifest_path":"\(.*\)/crates/client/Cargo.toml"$|\1|p' | head -1)
     [ -n "$core" ] || { echo "core's sources not found (theca-client's manifest)" >&2; exit 1; }
     # Into this repo's target/ (not into Cargo's git checkout, in ~/.cargo).
     target=${CARGO_TARGET_DIR:-$PWD/target}
     SQLX_OFFLINE=true cargo build --manifest-path "$core/Cargo.toml" --target-dir "$target" -p theca-core
-    # Absolute: the tests start it from a directory of their own.
-    THECA_SERVER="$(cd "$target" && pwd)/debug/theca-server"
+    # Absolute: the tests start it from a directory of their own. A Windows
+    # path on Windows (Git Bash's pwd gives /d/...), and its .exe.
+    THECA_SERVER="$(cd "$target" && { pwd -W 2>/dev/null || pwd; })/debug/theca-server"
+    [ -f "$THECA_SERVER.exe" ] && THECA_SERVER="$THECA_SERVER.exe"
     export THECA_SERVER
 }
 
@@ -49,24 +51,13 @@ if [ "$step" = all ] || [ "$step" = lint ]; then
     cargo clippy --features gui,custom-protocol --all-targets -- -D warnings
 fi
 if [ "$step" = all ] || [ "$step" = test ]; then
-    # The end-to-end tests run the real server: built from ../core unless
+    # The end-to-end tests run the real server: built from the pinned core unless
     # THECA_SERVER names one.
     # The engines' debug lines, each device's named: printed for a failed test
     # only (captured), so a failure seen once on CI says what happened.
     export RUST_LOG="${RUST_LOG:-theca=debug}"
-    if [ -n "${THECA_TEST_SERVER_URL:-}" ]; then
-        # A shared server (the Windows step's, running on Linux): it must run
-        # the core this repo pins, and its tests run one at a time (each
-        # clears the organizations the last one left).
-        pinned=$(sed -n '/^name = "theca-client"$/{n;s/^version = "\(.*\)"$/\1/p;}' Cargo.lock)
-        served=$(curl -fsS "$THECA_TEST_SERVER_URL/api/version" | sed -n 's/.*"server":"\([^"]*\)".*/\1/p')
-        [ "$served" = "$pinned" ] ||
-            { echo "the test server runs core $served, this repo pins $pinned: update it" >&2; exit 1; }
-        cargo test -- --test-threads=1
-    else
-        server
-        cargo test
-    fi
+    server
+    cargo test
 fi
 # Only Linux has a WebDriver for WebKit: elsewhere, `all` skips it, and the app
 # is checked by hand (the sprint's checklist).
