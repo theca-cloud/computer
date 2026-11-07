@@ -1,6 +1,6 @@
 [package]
 name = "theca"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
@@ -19,26 +19,31 @@ fs4 = "1.1.0"
 futures = "0.3.34"
 gethostname = "1.1.0"
 notify = "8.2.1"
+# A rename that never replaces a file put there meanwhile, atomic where the
+# OS and disk can (renameat2, renamex_np, MoveFileExW): no unsafe code here.
+renamore = "0.3.2"
 # C (SQLite), against the pure-Rust preference: no pure-Rust SQLite is mature
 # enough for the only copy of what was synced. Bundled: the same SQLite on
 # every OS, nothing to install.
 rusqlite = { version = "0.41.1", features = ["bundled"] }
+# The server's version against the oldest this client works with.
+semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tauri = { version = "2", features = ["tray-icon", "image-png"], optional = true }
 tauri-plugin-autostart = { version = "2", optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
+tauri-plugin-notification = { version = "2", optional = true }
 tauri-plugin-opener = { version = "2", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
 # core's release, from its public mirror (as CE builds it): no credentials
 # anywhere. Working against an unreleased core: CLAUDE.md.
-theca-client = { git = "https://github.com/theca-cloud/core", tag = "1.3.3" }
-theca-common = { git = "https://github.com/theca-cloud/core", tag = "1.3.3" }
+theca-client = { git = "https://github.com/theca-cloud/core", tag = "1.5.0" }
+theca-common = { git = "https://github.com/theca-cloud/core", tag = "1.5.0" }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "fs", "time", "signal", "sync"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-unicode-normalization = "0.1.26"
 uuid = "1.29.0"
 
 [lints.rust]
@@ -66,6 +71,7 @@ gui = [
     "dep:tauri-build",
     "dep:tauri-plugin-autostart",
     "dep:tauri-plugin-dialog",
+    "dep:tauri-plugin-notification",
     "dep:tauri-plugin-opener",
     "dep:tauri-plugin-single-instance",
 ]

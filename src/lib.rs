@@ -30,13 +30,32 @@ pub fn crash_point(name: &str) {
 }
 
 /// The engine runs alone on a state: the app and `theca run` both take this
-/// lock, for as long as they run (ADR 0004).
+/// lock, for as long as they run (ADR 0004). Named after the state's whole
+/// file name (`state.sqlite.lock`): two states never share one.
 pub fn lock(state: &std::path::Path) -> std::io::Result<std::fs::File> {
-    let lock = std::fs::File::create(state.with_extension("lock"))?;
+    let mut name = state.file_name().unwrap_or_default().to_owned();
+    name.push(".lock");
+    let lock = std::fs::File::create(state.with_file_name(name))?;
     if lock.try_lock().is_err() {
         return Err(std::io::Error::other(
             "theca is already running on this state (the app, or `theca run`)",
         ));
     }
     Ok(lock)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Each state has its own lock (`a.db` and `a.sqlite` shared `a.lock`),
+    /// and a state named like a lock isn't truncated by taking it.
+    #[test]
+    fn a_lock_per_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let _a = super::lock(&dir.path().join("a.db")).unwrap();
+        assert!(super::lock(&dir.path().join("a.sqlite")).is_ok());
+        let state = dir.path().join("x.lock");
+        std::fs::write(&state, b"state").unwrap();
+        let _x = super::lock(&state).unwrap();
+        assert_eq!(std::fs::read(&state).unwrap(), b"state");
+    }
 }

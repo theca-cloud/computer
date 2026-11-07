@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use theca_client::{Client, Error, FeedMessage};
+use theca_client::{Cancel, Client, Error, FeedMessage};
 use theca_common::api;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::Instrument;
@@ -35,6 +35,9 @@ const QUIET: Duration = Duration::from_secs(2);
 /// ... but no longer than this: a folder never quiet (a log written every
 /// second) would hold them forever.
 const QUIET_AT_MOST: Duration = Duration::from_secs(30);
+/// How long a stop waits for the accounts' rounds to end: their transfers
+/// are cancelled at once; a service manager kills after about 10 s.
+const STOP: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
@@ -42,6 +45,8 @@ pub enum EngineError {
     State(#[from] StateError),
     #[error(transparent)]
     Client(#[from] Error),
+    #[error("{0}")]
+    Server(String),
 }
 
 /// What the GUI and the CLI ask the running engine.
@@ -124,9 +129,14 @@ pub async fn run(
             _ = shutdown.changed() => break,
         }
     }
-    for (_, task) in running {
-        task.abort();
-        let _ = task.await;
+    // Each account's round ends at once (its transfers cancelled, what
+    // finished already recorded); one that doesn't in time is aborted.
+    let deadline = tokio::time::Instant::now() + STOP;
+    for (_, mut task) in running {
+        if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
     }
     Ok(())
 }
@@ -150,7 +160,7 @@ struct Follower {
     account: Account,
     client: Client,
     /// The last position the feed announced, per library.
-    positions: HashMap<Uuid, i64>,
+    positions: HashMap<Uuid, api::Position>,
     /// The last `libraries` message.
     libraries: Vec<api::FeedLibrary>,
     /// The positions the last `libraries` message announced: a pair runs no
@@ -178,6 +188,13 @@ struct Follower {
     watchers: HashMap<i64, (PathBuf, Option<RecommendedWatcher>)>,
     events: mpsc::UnboundedSender<i64>,
     offered: Arc<std::sync::Mutex<HashMap<i64, Vec<Offer>>>>,
+    /// Pairs stopped for their folder, and what was at its path when last
+    /// checked: checked again once that changes (a remount's check scans).
+    stopped_at: HashMap<i64, Option<String>>,
+    /// Set when the process stops: no round starts, a running one ends.
+    stopping: watch::Receiver<bool>,
+    /// Cancels the round's transfers when it stops.
+    cancel: Cancel,
 }
 
 async fn follow(
@@ -191,6 +208,13 @@ async fn follow(
         return Ok(());
     };
     let client = Client::new(&account.instance)?.with_token(account.password.clone());
+    // A server older than this client works with (or rolled back since the
+    // login): stopped, saying to update it. Unreachable: the feed retries.
+    if let Ok(version) = client.check_version().await
+        && let Some(why) = ops::too_old(&version)
+    {
+        return Err(EngineError::Server(why));
+    }
     let (events, mut changed) = mpsc::unbounded_channel();
     let mut f = Follower {
         state,
@@ -209,11 +233,29 @@ async fn follow(
         watchers: HashMap::new(),
         events,
         offered: handle.offered.clone(),
+        stopped_at: HashMap::new(),
+        stopping: shutdown.clone(),
+        cancel: Cancel::default(),
     };
-    let after: BTreeMap<Uuid, i64> = f
+    // The stop cancels the transfers in flight (aborted with this task).
+    let mut cancelling = tokio::task::JoinSet::new();
+    {
+        let (mut stopping, cancel) = (shutdown.clone(), f.cancel.clone());
+        cancelling.spawn(async move {
+            if stopping.wait_for(|stop| *stop).await.is_ok() {
+                cancel.cancel();
+            }
+        });
+    }
+    let after: BTreeMap<Uuid, api::Position> = f
         .pairs()?
         .iter()
-        .filter_map(|p| p.position.map(|pos| (p.library, pos)))
+        .filter_map(|p| {
+            p.position.map(|seq| {
+                let event = p.position_event;
+                (p.library, api::Position::Event { seq, event })
+            })
+        })
         .collect();
     let mut feed = Box::pin(f.client.events(after));
     let mut woken = handle.woken.subscribe();
@@ -377,7 +419,9 @@ impl Follower {
 
     async fn libraries(&mut self, libraries: Vec<api::FeedLibrary>) -> Result<(), EngineError> {
         for l in &libraries {
-            self.positions.insert(l.id, l.position);
+            let (seq, event) = (l.position, l.event);
+            self.positions
+                .insert(l.id, api::Position::Event { seq, event });
             self.announced.insert(l.id, l.position);
         }
         for p in self.pairs()? {
@@ -400,7 +444,11 @@ impl Follower {
     }
 
     fn stop(&mut self, p: &Pair, why: &str) -> Result<(), StateError> {
+        // Checked again for a resume once what is at its path changes.
+        self.stopped_at.insert(p.id, local::root_id(&p.path));
         if p.stopped.as_deref() != Some(why) {
+            // Headless, the log is where it shows.
+            tracing::error!(pair = p.id, path = %p.path.display(), "stopped syncing: {why}");
             self.state.set_stopped(p.id, Some(why))?;
             self.state
                 .set_activity(p.id, &format!("stopped: {why}"), false)?;
@@ -481,6 +529,7 @@ impl Follower {
                 path: path.clone(),
                 root_file_id: None,
                 position: None,
+                position_event: None,
                 paused: false,
                 stopped: None,
                 writable: l.writable,
@@ -496,7 +545,7 @@ impl Follower {
                 None,
             )?;
             self.state
-                .set_pair_path(id, &path, local::file_id(&path).as_deref())?;
+                .set_pair_path(id, &path, local::root_id(&path).as_deref())?;
             taken.push(path);
             self.dirty.insert(id);
         }
@@ -564,12 +613,19 @@ impl Follower {
                 api::ResourceKind::Unknown => {}
             }
         }
-        for (library, position) in &changes.positions {
-            self.positions.insert(*library, *position);
+        let position = |library: &Uuid| {
+            changes.positions.get(library).map(|&seq| {
+                let event = changes.events.get(library).copied();
+                api::Position::Event { seq, event }
+            })
+        };
+        for library in changes.positions.keys() {
+            self.positions
+                .insert(*library, position(library).expect("listed"));
         }
         for p in pairs.iter().filter(|p| p.position.is_some()) {
             let mut list = states.remove(&p.id).unwrap_or_default();
-            let position = changes.positions.get(&p.library).copied();
+            let position = position(&p.library);
             if list.is_empty() && position.is_none() {
                 continue;
             }
@@ -673,6 +729,31 @@ impl Follower {
                 self.dirty.insert(p.id);
             }
         }
+        // A pair stopped for its folder resumes once the folder passes the
+        // root check again: what a Resume by hand did.
+        for p in self.pairs()? {
+            if p.paused || !p.stopped_for_its_folder() {
+                self.stopped_at.remove(&p.id);
+                continue;
+            }
+            let here = local::root_id(&p.path);
+            if self.stopped_at.get(&p.id) == Some(&here) {
+                continue;
+            }
+            self.stopped_at.insert(p.id, here);
+            if let Ok(back) = self.root(&p).await? {
+                self.state.set_stopped(back.id, None)?;
+                self.state.notify(
+                    Some(back.account),
+                    Some(back.id),
+                    "info",
+                    Some(&back.path.to_string_lossy()),
+                    "the folder is back: syncing again",
+                    None,
+                )?;
+                self.dirty.insert(back.id);
+            }
+        }
         let due: Vec<i64> = self
             .deletions_held
             .keys()
@@ -682,6 +763,9 @@ impl Follower {
         self.dirty.extend(due);
         let dirty: Vec<i64> = self.dirty.drain().collect();
         for id in dirty {
+            if *self.stopping.borrow() {
+                break;
+            }
             let Some(p) = self.state.pair(id)? else {
                 continue;
             };
@@ -714,8 +798,12 @@ impl Follower {
 
     async fn round(&mut self, p: &Pair) -> Result<(), EngineError> {
         tracing::debug!(pair = p.id, "round");
-        let Some(p) = self.root(p)? else {
-            return Ok(());
+        let p = match self.root(p).await? {
+            Ok(p) => p,
+            Err(why) => {
+                self.stop(p, &why)?;
+                return Ok(());
+            }
         };
         if p.position.is_none() && !self.resync(&p).await? {
             return Ok(());
@@ -729,12 +817,12 @@ impl Follower {
                 // Renamed or removed during this round: the root check says
                 // which (followed, or stopped as missing); the next round
                 // runs from there. Unreadable where it is: stopped as such.
-                match self.root(&p)? {
-                    Some(now) if now.path != p.path => {
+                match self.root(&p).await? {
+                    Ok(now) if now.path != p.path => {
                         self.dirty.insert(p.id);
                     }
-                    Some(_) => self.stop(&p, "the folder can't be read")?,
-                    None => {}
+                    Ok(_) => self.stop(&p, "the folder can't be read")?,
+                    Err(why) => self.stop(&p, &why)?,
                 }
                 return Ok(());
             }
@@ -760,7 +848,7 @@ impl Follower {
         } else {
             self.deletions_held.remove(&p.id);
         }
-        let outcome = Executor::new(&self.client, &self.state, &p)?
+        let outcome = Executor::new(&self.client, &self.state, &p, &self.cancel, &self.stopping)?
             .run(plan, &scan)
             .await?;
         let recent = self.recent.entry(p.id).or_default();
@@ -794,19 +882,50 @@ impl Follower {
     }
 
     /// The pair's folder, checked: the same folder as before (its file ID),
-    /// followed if renamed while watched; otherwise the pair stops.
-    fn root(&mut self, p: &Pair) -> Result<Option<Pair>, StateError> {
-        let here = local::file_id(&p.path);
+    /// followed if renamed while watched, or its disk remounted on another
+    /// device number if its files vouch for it; otherwise why not (the caller
+    /// stops the pair, or leaves a stopped one as it is).
+    async fn root(&mut self, p: &Pair) -> Result<Result<Pair, String>, StateError> {
+        let here = local::root_id(&p.path);
         let same = match (&here, &p.root_file_id) {
             (Some(here), Some(known)) => here == known,
             (Some(_), None) => true,
             (None, _) => false,
         };
         if same && p.path.is_dir() {
-            return Ok(Some(p.clone()));
+            return Ok(Ok(p.clone()));
         }
         tracing::debug!(pair = p.id, path = %p.path.display(), ?here, known = ?p.root_file_id,
             held = ?self.roots.get(&p.id).map(filepath::FilePath::path), "root changed");
+        if let (Some(here), Some(known)) = (&here, &p.root_file_id)
+            && local::remounted(known, here)
+            && p.path.is_dir()
+        {
+            let path = p.path.clone();
+            let scan = tokio::task::spawn_blocking(move || local::scan(&path)).await;
+            let base = self.state.entries(p.id)?;
+            if let Ok(Ok(scan)) = scan
+                && crate::plan::same_disk(&base, &scan)
+            {
+                self.state.set_pair_path(p.id, &p.path, Some(here))?;
+                self.state.notify(
+                    Some(p.account),
+                    Some(p.id),
+                    "info",
+                    Some(&p.path.to_string_lossy()),
+                    "the disk was mounted again: followed",
+                    None,
+                )?;
+                // Watched and held anew: the old ones were on the gone mount.
+                self.watchers.remove(&p.id);
+                self.roots.remove(&p.id);
+                return Ok(self.state.pair(p.id)?.ok_or_else(String::new));
+            }
+            return Ok(Err(format!(
+                "the disk at {} doesn't match the one synced: if it is that one, locate it",
+                p.path.display()
+            )));
+        }
         // Renamed or moved while held open: where is it now?
         if let Some(moved) = self
             .roots
@@ -814,16 +933,14 @@ impl Follower {
             .and_then(|f| filepath::FilePath::path(f).ok())
             && moved != p.path
             && moved.is_dir()
-            && local::file_id(&moved) == p.root_file_id
+            && local::root_id(&moved) == p.root_file_id
         {
             if in_trash(&moved) {
-                self.stop(p, "the folder was moved to the trash")?;
-                return Ok(None);
+                return Ok(Err("the folder was moved to the trash".into()));
             }
             // Never into or around another pair's folder, as when added.
             if let Err(e) = ops::check_path(&self.state, &moved, Some(p.id)) {
-                self.stop(p, &format!("moved to {}: {e}", moved.display()))?;
-                return Ok(None);
+                return Ok(Err(format!("moved to {}: {e}", moved.display())));
             }
             self.state
                 .set_pair_path(p.id, &moved, p.root_file_id.as_deref())?;
@@ -836,10 +953,9 @@ impl Follower {
                 None,
             )?;
             self.watchers.remove(&p.id);
-            return self.state.pair(p.id);
+            return Ok(self.state.pair(p.id)?.ok_or_else(String::new));
         }
-        self.stop(p, &format!("{} is missing", p.path.display()))?;
-        Ok(None)
+        Ok(Err(format!("{} is missing", p.path.display())))
     }
 
     /// Lists the library's tree as its remote state (a reset, a lost state, a

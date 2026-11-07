@@ -9,6 +9,7 @@ use tokio::sync::broadcast;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use theca_common::api;
 use uuid::Uuid;
 
 /// The schema, rewritten in place until the client's 1.0; then forward-only,
@@ -43,6 +44,9 @@ CREATE TABLE pair (
     root_file_id TEXT,
     -- The last event applied; NULL: the pair needs a resync.
     position INTEGER,
+    -- That event's ID, sent back with the position: a server restored from
+    -- a backup reuses the numbers past its restore point.
+    position_event TEXT,
     paused INTEGER NOT NULL DEFAULT 0,
     -- Why it stopped (missing folder, library deleted, access removed...).
     stopped TEXT,
@@ -109,7 +113,7 @@ CREATE TABLE notice (
 );
 "#;
 
-const VERSION: i32 = 1;
+const VERSION: i32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
@@ -117,6 +121,11 @@ pub enum StateError {
     Sqlite(#[from] rusqlite::Error),
     #[error("the state database is version {0}, this client knows {VERSION}: update theca")]
     Newer(i32),
+    #[error(
+        "the state database {} was made by an older theca: delete it, then log in and add your folders again (their files stay, and are adopted)",
+        .0.display()
+    )]
+    Older(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, StateError>;
@@ -185,6 +194,7 @@ impl State {
                 db.pragma_update(None, "user_version", VERSION)?;
             }
             VERSION => {}
+            older if older < VERSION => return Err(StateError::Older(path.to_owned())),
             newer => return Err(StateError::Newer(newer)),
         }
         Ok(Self {
@@ -265,6 +275,7 @@ pub struct Pair {
     pub path: PathBuf,
     pub root_file_id: Option<String>,
     pub position: Option<i64>,
+    pub position_event: Option<Uuid>,
     pub paused: bool,
     pub stopped: Option<String>,
     pub writable: bool,
@@ -279,6 +290,15 @@ pub const LIBRARY_DELETED: &str = "library deleted";
 pub const ACCESS_REMOVED: &str = "access removed";
 
 impl Pair {
+    /// Why it syncs nothing until someone acts, or a retry succeeds: stopped,
+    /// or its account's engine stopped on an error (started again within
+    /// 30 s, `engine::stopped`).
+    pub fn not_syncing(&self) -> Option<&str> {
+        self.stopped
+            .as_deref()
+            .or_else(|| self.activity.strip_prefix("error: "))
+    }
+
     /// Stopped because of its local folder (missing, in the trash,
     /// unreadable): the user locates it, or tries again.
     pub fn stopped_for_its_folder(&self) -> bool {
@@ -417,7 +437,7 @@ impl State {
         let db = self.db();
         let mut query = db.prepare(
             "SELECT id, account, library, root, library_name, path, root_file_id, position,
-                    paused, stopped, writable, activity, synced_at
+                    paused, stopped, writable, activity, synced_at, position_event
              FROM pair ORDER BY id",
         )?;
         let rows = query.query_map([], |r| {
@@ -437,6 +457,7 @@ impl State {
                 synced_at: r
                     .get::<_, Option<i64>>(12)?
                     .and_then(DateTime::from_timestamp_millis),
+                position_event: r.get::<_, Option<String>>(13)?.map(uuid),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -544,7 +565,10 @@ impl State {
         // finds it NULL and writes nothing back.
         let mut db = self.db();
         let tx = db.transaction()?;
-        tx.execute("UPDATE pair SET position = NULL WHERE id = ?1", [pair])?;
+        tx.execute(
+            "UPDATE pair SET position = NULL, position_event = NULL WHERE id = ?1",
+            [pair],
+        )?;
         tx.execute("DELETE FROM entry WHERE pair = ?1", [pair])?;
         tx.execute("DELETE FROM remote WHERE pair = ?1", [pair])?;
         tx.commit()?;
@@ -554,8 +578,10 @@ impl State {
     }
 
     pub fn reset_position(&self, pair: i64) -> Result<()> {
-        self.db()
-            .execute("UPDATE pair SET position = NULL WHERE id = ?1", [pair])?;
+        self.db().execute(
+            "UPDATE pair SET position = NULL, position_event = NULL WHERE id = ?1",
+            [pair],
+        )?;
         Ok(())
     }
 
@@ -647,7 +673,7 @@ impl State {
         &self,
         pair: i64,
         states: &[(Uuid, Option<RemoteState>)],
-        position: Option<i64>,
+        position: Option<api::Position>,
     ) -> Result<()> {
         let mut db = self.db();
         let tx = db.transaction()?;
@@ -656,10 +682,7 @@ impl State {
             put_remote(&tx, pair, *node, state.as_ref())?;
         }
         if let Some(position) = position {
-            tx.execute(
-                "UPDATE pair SET position = ?2 WHERE id = ?1",
-                params![pair, position],
-            )?;
+            set_position(&tx, pair, position)?;
         }
         tx.commit()?;
         Ok(())
@@ -672,7 +695,7 @@ impl State {
         &self,
         pair: i64,
         states: &[(Uuid, Option<RemoteState>)],
-        position: Option<i64>,
+        position: Option<api::Position>,
     ) -> Result<()> {
         let mut db = self.db();
         let tx = db.transaction()?;
@@ -688,10 +711,7 @@ impl State {
             put_remote(&tx, pair, *node, state.as_ref())?;
         }
         if let Some(position) = position {
-            tx.execute(
-                "UPDATE pair SET position = ?2 WHERE id = ?1",
-                params![pair, position],
-            )?;
+            set_position(&tx, pair, position)?;
         }
         tx.commit()?;
         Ok(())
@@ -827,6 +847,19 @@ impl State {
     }
 }
 
+/// The pair's position: the last event applied, by number and ID.
+fn set_position(db: &rusqlite::Connection, pair: i64, position: api::Position) -> Result<()> {
+    db.execute(
+        "UPDATE pair SET position = ?2, position_event = ?3 WHERE id = ?1",
+        params![
+            pair,
+            position.seq(),
+            position.event().map(|e| e.to_string())
+        ],
+    )?;
+    Ok(())
+}
+
 fn put_remote(
     tx: &rusqlite::Transaction<'_>,
     pair: i64,
@@ -855,6 +888,34 @@ fn put_remote(
 mod tests {
     use super::*;
 
+    /// A pair syncs nothing when stopped, or when its account's engine
+    /// stopped on an error (its activity says so until a retry goes through).
+    #[test]
+    fn not_syncing_when_stopped_or_its_engine_failed() {
+        let state = State::memory().unwrap();
+        let mut p = state.pair(pair(&state)).unwrap().unwrap();
+        assert_eq!(p.not_syncing(), None);
+        p.activity = "error: the state database: disk full".into();
+        assert_eq!(p.not_syncing(), Some("the state database: disk full"));
+        p.stopped = Some("x is missing".into());
+        assert_eq!(p.not_syncing(), Some("x is missing"));
+    }
+
+    /// A state an older version wrote is refused, naming the file to delete:
+    /// its schema was rewritten in place since (until the client's 1.0).
+    #[test]
+    fn an_older_state_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        Connection::open(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", VERSION - 1)
+            .unwrap();
+        let e = State::open(&path).err().expect("refused");
+        assert!(matches!(e, StateError::Older(_)), "{e}");
+        assert!(e.to_string().contains(&path.display().to_string()), "{e}");
+    }
+
     fn pair(state: &State) -> i64 {
         let account = state
             .save_account(&Account {
@@ -879,6 +940,7 @@ mod tests {
                 path: "/tmp/Docs".into(),
                 root_file_id: None,
                 position: None,
+                position_event: None,
                 paused: false,
                 stopped: None,
                 writable: true,
@@ -908,7 +970,9 @@ mod tests {
         let state = State::memory().unwrap();
         let pair = pair(&state);
         let e = entry();
-        state.record_remote(pair, &[], Some(1)).unwrap();
+        state
+            .record_remote(pair, &[], Some(theca_common::api::Position::Seq(1)))
+            .unwrap();
         state.synced(pair, &e, None, &[]).unwrap();
         assert_eq!(state.entries(pair).unwrap().len(), 1);
         state.forget_base(pair).unwrap();
@@ -933,11 +997,17 @@ mod tests {
     fn the_feed_never_follows_a_forgotten_base() {
         let state = State::memory().unwrap();
         let pair = pair(&state);
-        state.record_remote(pair, &[], Some(1)).unwrap();
+        state
+            .record_remote(pair, &[], Some(theca_common::api::Position::Seq(1)))
+            .unwrap();
         state.forget_base(pair).unwrap();
         let x = Uuid::from_u128(8);
         state
-            .record_feed(pair, &[(x, Some(state_of("x")))], Some(5))
+            .record_feed(
+                pair,
+                &[(x, Some(state_of("x")))],
+                Some(theca_common::api::Position::Seq(5)),
+            )
             .unwrap();
         assert_eq!(state.pair(pair).unwrap().unwrap().position, None);
         assert!(state.remote(pair).unwrap().is_empty());
@@ -951,10 +1021,18 @@ mod tests {
         let pair = pair(&state);
         let (x, y) = (Uuid::from_u128(8), Uuid::from_u128(9));
         state
-            .record_remote(pair, &[(x, Some(state_of("x")))], Some(1))
+            .record_remote(
+                pair,
+                &[(x, Some(state_of("x")))],
+                Some(theca_common::api::Position::Seq(1)),
+            )
             .unwrap();
         state
-            .record_remote(pair, &[(y, Some(state_of("y")))], Some(2))
+            .record_remote(
+                pair,
+                &[(y, Some(state_of("y")))],
+                Some(theca_common::api::Position::Seq(2)),
+            )
             .unwrap();
         let pending: Vec<Uuid> = state
             .remote(pair)
@@ -972,7 +1050,9 @@ mod tests {
     fn forgetting_the_base_is_all_or_nothing() {
         let state = State::memory().unwrap();
         let pair = pair(&state);
-        state.record_remote(pair, &[], Some(1)).unwrap();
+        state
+            .record_remote(pair, &[], Some(theca_common::api::Position::Seq(1)))
+            .unwrap();
         state.synced(pair, &entry(), None, &[]).unwrap();
         let x = Uuid::from_u128(8);
         state

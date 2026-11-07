@@ -38,6 +38,25 @@ fn refused<T>(why: impl Into<String>) -> Result<T> {
     Err(OpError::Refused(why.into()))
 }
 
+/// The oldest server this client works with, as `/api/version` gives it (the
+/// `core` it runs), and the community edition shipping it: `0.2.0` sends
+/// positions with their event's ID, which an older server refuses. Moves with
+/// the client's needs, never with each `core` release.
+const MIN_SERVER: (&str, &str) = ("1.4.0", "1.4.4");
+
+/// Why a server of this version is too old for this client, if it is (a
+/// version it can't read too).
+pub fn too_old(version: &str) -> Option<String> {
+    let (min, ce) = MIN_SERVER;
+    let min = semver::Version::parse(min).expect("a version");
+    match semver::Version::parse(version) {
+        Ok(v) if v >= min => None,
+        _ => Some(format!(
+            "the server runs Theca {version}; this app needs {min} or later: update the server (the community edition {ce} or later)"
+        )),
+    }
+}
+
 /// Libraries up to this size are synced when they appear, by default.
 pub const AUTO_SYNC_LIMIT: i64 = 500 * 1024 * 1024;
 
@@ -88,7 +107,9 @@ pub async fn login(
 ) -> Result<Account> {
     let instance = instance.trim_end_matches('/').to_owned();
     let client = Client::new(&instance)?;
-    client.check_version().await?;
+    if let Some(why) = too_old(&client.check_version().await?) {
+        return refused(why);
+    }
     let password = match token {
         Some(token) => token,
         None => {
@@ -253,6 +274,7 @@ pub async fn add(
         path,
         root_file_id: None,
         position: None,
+        position_event: None,
         paused: false,
         stopped: None,
         writable: found.writable,
@@ -260,7 +282,7 @@ pub async fn add(
         synced_at: None,
     };
     pair.id = state.add_pair(&pair)?;
-    state.set_pair_path(pair.id, &pair.path, local::file_id(&pair.path).as_deref())?;
+    state.set_pair_path(pair.id, &pair.path, local::root_id(&pair.path).as_deref())?;
     Ok(pair)
 }
 
@@ -366,39 +388,36 @@ pub fn has_room(path: &Path, size: i64) -> bool {
 pub fn delete_synced_files(pair: &Pair, entries: &[crate::state::Entry]) -> usize {
     // Not the pair's folder any more (replaced, a disk unmounted): what is
     // there now was never synced.
-    if local::file_id(&pair.path) != pair.root_file_id {
+    if local::root_id(&pair.path) != pair.root_file_id {
         return entries.iter().filter(|e| e.is_file).count();
     }
     let by_node: std::collections::HashMap<Uuid, &crate::state::Entry> =
         entries.iter().map(|e| (e.node, e)).collect();
-    let names = |mut node: Uuid| {
-        let mut names = Vec::new();
+    // A node's names and file IDs from the root.
+    let steps = |mut node: Uuid| {
+        let mut steps = Vec::new();
         while node != pair.root {
             let e = by_node.get(&node)?;
-            names.push(e.name.clone());
+            steps.push((e.name.as_str(), e.file_id.as_deref()));
             node = e.parent;
         }
-        names.reverse();
-        Some(names)
+        steps.reverse();
+        Some(steps)
     };
     for e in entries.iter().filter(|e| e.is_file) {
-        let Some(names) = names(e.node) else { continue };
-        let path = local::resolve(&pair.path, &names);
+        let Some(steps) = steps(e.node) else { continue };
+        let path = local::resolve(&pair.path, &steps);
         // The engine's whole fingerprint: another file with the same size
         // and mtime (a copy restoring times, an atomic save) was never synced.
-        if let Ok(meta) = std::fs::symlink_metadata(&path)
-            && meta.len() as i64 == e.size
-            && local::mtime(&meta) == e.mtime
-            && local::file_id(&path) == e.file_id
-        {
+        if local::unchanged(&path, e.size, e.mtime, e.file_id.as_deref()) {
             let _ = std::fs::remove_file(&path);
         }
     }
     // Folders, deepest first, if empty.
-    let mut folders: Vec<Vec<String>> = entries
+    let mut folders: Vec<Vec<(&str, Option<&str>)>> = entries
         .iter()
         .filter(|e| !e.is_file)
-        .filter_map(|e| names(e.node))
+        .filter_map(|e| steps(e.node))
         .collect();
     folders.sort_by_key(|f| std::cmp::Reverse(f.len()));
     for folder in folders {
@@ -478,7 +497,7 @@ pub fn locate(state: &State, pair: &Pair, path: &Path, confirm: bool) -> Result<
         return refused(format!("{} isn't a folder", path.display()));
     }
     check_path(state, path, Some(pair.id))?;
-    let id = local::file_id(path);
+    let id = local::root_id(path);
     let same = id.is_some() && id == pair.root_file_id;
     if !same && !confirm {
         return Ok(Located::Different);
@@ -557,6 +576,22 @@ pub fn find_account(state: &State, which: Option<&str>) -> Result<Account> {
 mod tests {
     use super::*;
 
+    /// A server older than the minimum, or whose version can't be read, is
+    /// refused; a release candidate of a newer one is not.
+    #[test]
+    fn a_server_too_old_is_refused() {
+        assert!(too_old("1.4.0").is_none());
+        assert!(too_old("1.5.0-rc").is_none());
+        assert!(too_old("2.0.0").is_none());
+        let why = too_old("1.3.3").unwrap();
+        assert!(
+            why.contains("1.3.3") && why.contains("1.4.0") && why.contains("1.4.4"),
+            "{why}"
+        );
+        assert!(too_old("1.4.0-rc").is_some());
+        assert!(too_old("not a version").is_some());
+    }
+
     /// A pair on a real folder holding `a.txt`, synced (its base entry).
     fn synced_pair(dir: &Path) -> (State, Pair) {
         let state = State::memory().unwrap();
@@ -581,8 +616,9 @@ mod tests {
             root,
             library_name: "Docs".into(),
             path: dir.to_owned(),
-            root_file_id: local::file_id(dir),
+            root_file_id: local::root_id(dir),
             position: Some(1),
+            position_event: None,
             paused: false,
             stopped: None,
             writable: true,
@@ -593,7 +629,9 @@ mod tests {
         state
             .set_pair_path(pair.id, dir, pair.root_file_id.as_deref())
             .unwrap();
-        state.record_remote(pair.id, &[], Some(1)).unwrap();
+        state
+            .record_remote(pair.id, &[], Some(theca_common::api::Position::Seq(1)))
+            .unwrap();
         std::fs::write(dir.join("a.txt"), "synced").unwrap();
         let meta = std::fs::metadata(dir.join("a.txt")).unwrap();
         let entry = crate::state::Entry {

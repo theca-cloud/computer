@@ -278,8 +278,11 @@ async fn command(cli: Cli) -> Result<()> {
             let _lock = theca::lock(&path)?;
             let (stop, stopped) = tokio::sync::watch::channel(false);
             tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
+                stop_signal().await;
                 let _ = stop.send(true);
+                // A second one: at once.
+                stop_signal().await;
+                std::process::exit(130);
             });
             engine::run(path, Handle::default(), stopped).await?;
         }
@@ -367,6 +370,18 @@ fn status(state: &State) -> Result<()> {
             println!("{} {}{}{undo}", n.level, path, n.message);
         }
     }
+    // A pair stopped syncs nothing until someone acts: a script or a monitor
+    // reading the exit code knows.
+    let stopped = pairs
+        .iter()
+        .filter(|p| p.not_syncing().is_some() && !p.paused)
+        .count();
+    if stopped > 0 {
+        return refused(format!(
+            "{} stopped syncing (above)",
+            engine::plural(stopped, "folder")
+        ));
+    }
     Ok(())
 }
 
@@ -384,4 +399,18 @@ fn size(bytes: i64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// Ctrl-C, or SIGTERM on Unix (a service manager or `kill` stopping it).
+async fn stop_signal() {
+    #[cfg(unix)]
+    if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+        return;
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }

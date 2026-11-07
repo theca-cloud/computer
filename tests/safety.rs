@@ -38,7 +38,11 @@ async fn a_reset_forgets_the_base() {
         .synced(pair.id, &ghost, Some("ghost.txt"), &[])
         .unwrap();
     a.state()
-        .record_remote(pair.id, &[], Some(1_000_000))
+        .record_remote(
+            pair.id,
+            &[],
+            Some(theca_common::api::Position::Seq(1_000_000)),
+        )
         .unwrap();
 
     a.restart();
@@ -584,7 +588,7 @@ fn visible(folder: &std::path::Path) -> Vec<String> {
 /// state too; with the network back, the new version comes down whole.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cut_download_leaves_the_file_as_it_was() {
-    let (w, cut) = world_cut().await;
+    let (w, wire) = world_cut().await;
     let mut a = w.device("a").await;
     let one = noise(4 * 1024 * 1024);
     std::fs::write(a.path("big.bin"), &one).unwrap();
@@ -608,7 +612,7 @@ async fn a_cut_download_leaves_the_file_as_it_was() {
     )
     .await
     .unwrap();
-    cut.store(true, std::sync::atomic::Ordering::SeqCst);
+    wire.cut.store(true, std::sync::atomic::Ordering::SeqCst);
     a.restart();
     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
     a.stop().await;
@@ -618,7 +622,7 @@ async fn a_cut_download_leaves_the_file_as_it_was() {
     );
     assert_eq!(visible(&a.folder), ["big.bin"]);
     assert_eq!(a.state().entries(a.pair().id).unwrap(), before);
-    cut.store(false, std::sync::atomic::Ordering::SeqCst);
+    wire.cut.store(false, std::sync::atomic::Ordering::SeqCst);
     a.restart();
     w.converge(&[&a]).await;
     assert!(std::fs::read(a.path("big.bin")).unwrap() == two);
@@ -628,17 +632,17 @@ async fn a_cut_download_leaves_the_file_as_it_was() {
 /// up whole.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cut_upload_makes_no_version() {
-    let (w, cut) = world_cut().await;
+    let (w, wire) = world_cut().await;
     let mut a = w.device("a").await;
     a.write("first.txt", "1");
     w.converge(&[&a]).await;
-    cut.store(true, std::sync::atomic::Ordering::SeqCst);
+    wire.cut.store(true, std::sync::atomic::Ordering::SeqCst);
     let big = noise(4 * 1024 * 1024);
     std::fs::write(a.path("big.bin"), &big).unwrap();
     settle(&a.path("big.bin"));
     tokio::time::sleep(std::time::Duration::from_secs(8)).await;
     a.stop().await;
-    cut.store(false, std::sync::atomic::Ordering::SeqCst);
+    wire.cut.store(false, std::sync::atomic::Ordering::SeqCst);
     assert!(!w.remote(&w.library).await.contains_key("big.bin"));
     a.restart();
     w.converge(&[&a]).await;
@@ -659,6 +663,18 @@ async fn a_replaced_folder_is_never_read_as_deleted() {
     eventually("stopped", || async { a.pair().stopped.is_some() }).await;
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     assert!(w.remote(&w.library).await.contains_key("x.txt"));
+    // Another folder (another inode) never resumes it.
+    assert!(a.pair().stopped.is_some());
+    // Said where a script or a monitor looks: `theca status` fails.
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_theca"))
+        .arg("--state")
+        .arg(&a.state_path)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(!status.status.success());
+    let said = String::from_utf8_lossy(&status.stderr);
+    assert!(said.contains("stopped"), "{said}");
 }
 
 /// Two engines never run on one state: the second `theca run` refuses.
@@ -812,4 +828,386 @@ async fn a_folder_moved_into_another_pair_stops() {
         !a.pair().path.starts_with(&other),
         "followed into another pair"
     );
+}
+
+/// Two names the server keeps apart (`lower()`: σ and ς differ) that the disk
+/// holds as one file (APFS and NTFS fold both to Σ), at a first sync into a
+/// folder holding one of them: only its own name merges with it; the other is
+/// listed, never merged nor downloaded over it, and stays as it was on the
+/// server, rounds after. (The old key, Rust's `to_lowercase`, gave `ΟΔΟΣ` and
+/// `οδος` one key: both merged with the local file.)
+#[tokio::test(flavor = "multi_thread")]
+async fn two_server_names_one_file_on_the_disk() {
+    let w = world().await;
+    let mut a = w.device_for("a", &w.library, false).await;
+    let probe = a.folder.parent().unwrap().join("οδος");
+    std::fs::write(&probe, "").unwrap();
+    let folds = probe.with_file_name("οδοσ").exists();
+    std::fs::remove_file(&probe).unwrap();
+    if !folds {
+        eprintln!("skipped: the disk tells σ from ς");
+        return;
+    }
+    w.upload(&w.library, "ΟΔΟΣ", b"capital").await;
+    w.upload(&w.library, "οδος", b"final").await;
+    a.write("οδος", "mine");
+    a.restart();
+    eventually("the other listed", || async {
+        a.notices()
+            .iter()
+            .any(|n| n.contains("not downloaded: something local has this name"))
+    })
+    .await;
+    // Another round goes by.
+    a.write("later.txt", "later");
+    eventually("a round later", || async {
+        w.remote(&w.library).await.contains_key("later.txt")
+    })
+    .await;
+    let remote = w.remote(&w.library).await;
+    assert_eq!(remote["ΟΔΟΣ"].as_deref(), Some(&b"capital"[..]));
+    assert_eq!(remote["οδος"].as_deref(), Some(&b"mine"[..]));
+    assert_eq!(std::fs::read(a.path("οδος")).unwrap(), b"mine");
+}
+
+/// A first sync matching `Docs/Report.txt` to the server's `docs/report.txt`
+/// takes the server's spelling: the local folder and file are renamed to it,
+/// and nothing is renamed on the server (every device would follow a rename
+/// nobody made).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_sync_takes_the_servers_spelling() {
+    let w = world().await;
+    let mut a = w.device_for("a", &w.library, false).await;
+    let docs = w
+        .admin
+        .create_folders(w.library.root, &["docs".to_owned()])
+        .await
+        .unwrap()[0]
+        .id;
+    theca_client::upload(
+        &w.admin,
+        &theca_client::MemorySource(b"same".to_vec()),
+        theca_client::Target::New {
+            library: w.library.id,
+            parent: docs,
+            name: theca_common::name::Name::new("report.txt").unwrap(),
+        },
+        &theca_client::UploadOptions::default(),
+        |_| {},
+        &theca_client::Cancel::default(),
+    )
+    .await
+    .unwrap();
+    a.write("Docs/Report.txt", "same");
+    a.restart();
+    eventually("synced", || async {
+        a.state()
+            .entries(a.pair().id)
+            .unwrap()
+            .iter()
+            .any(|e| e.is_file)
+    })
+    .await;
+    // A round after the first sync.
+    a.write("later.txt", "later");
+    eventually("a round later", || async {
+        w.remote(&w.library).await.contains_key("later.txt")
+    })
+    .await;
+    let remote: Vec<String> = w.remote(&w.library).await.into_keys().collect();
+    assert_eq!(remote, ["docs", "docs/report.txt", "later.txt"]);
+    let on_disk: Vec<String> = local(&a.folder).into_keys().collect();
+    assert_eq!(on_disk, ["docs", "docs/report.txt", "later.txt"]);
+}
+
+/// The pair's root with its inode, on another device number (an external
+/// disk remounted: Unix numbers devices as they come).
+#[cfg(unix)]
+fn remount(a: &Device) {
+    let pair = a.pair();
+    let known = pair.root_file_id.clone().unwrap();
+    let (_, inode) = known.rsplit_once(':').unwrap();
+    a.state()
+        .set_pair_path(pair.id, &pair.path, Some(&format!("424242:{inode}")))
+        .unwrap();
+}
+
+/// An external disk remounted on another device number: the base's files,
+/// found by inode with the size and time synced, vouch for it, and the pair
+/// goes on.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remounted_disk_goes_on() {
+    let w = world().await;
+    let mut a = w.device("a").await;
+    a.write("x.txt", "x");
+    w.converge(&[&a]).await;
+    a.stop().await;
+    remount(&a);
+    a.restart();
+    a.write("y.txt", "y");
+    w.converge(&[&a]).await;
+    let pair = a.pair();
+    assert!(pair.stopped.is_none(), "{:?}", pair.stopped);
+    assert!(
+        !pair.root_file_id.unwrap().starts_with("424242:"),
+        "the device recorded"
+    );
+}
+
+/// A disk with the root's inode on another device whose synced file changed
+/// meanwhile (edited on another computer, or another disk altogether): it
+/// doesn't vouch, and the pair stops, saying so.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_remounted_disk_that_changed_stops() {
+    let w = world().await;
+    let mut a = w.device("a").await;
+    a.write("x.txt", "x");
+    w.converge(&[&a]).await;
+    a.stop().await;
+    remount(&a);
+    a.write("x.txt", "edited elsewhere");
+    a.restart();
+    eventually("stopped", || async {
+        a.pair()
+            .stopped
+            .is_some_and(|why| why.contains("doesn't match"))
+    })
+    .await;
+    assert_eq!(
+        w.remote(&w.library).await["x.txt"].as_deref(),
+        Some(&b"x"[..])
+    );
+}
+
+/// A disk image attached at a folder, detached when dropped (a failing test
+/// included).
+#[cfg(target_os = "macos")]
+struct Mounted(std::path::PathBuf);
+
+#[cfg(target_os = "macos")]
+fn hdiutil(args: &[&std::ffi::OsStr]) {
+    let out = std::process::Command::new("hdiutil")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(target_os = "macos")]
+impl Mounted {
+    fn attach(image: &std::path::Path, at: &std::path::Path) -> Self {
+        hdiutil(&[
+            "attach".as_ref(),
+            "-nobrowse".as_ref(),
+            "-mountpoint".as_ref(),
+            at.as_os_str(),
+            image.as_os_str(),
+        ]);
+        Self(at.to_owned())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for Mounted {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("hdiutil")
+            .args(["detach".as_ref(), "-force".as_ref(), self.0.as_os_str()])
+            .output();
+    }
+}
+
+/// The same with real disks (macOS: disk images, no root needed). Image A,
+/// the pair's folder, detached while the client is stopped; image B attached
+/// meanwhile takes its device number; A attached again comes back on another
+/// one: followed. B mounted in A's place instead (its root is the same inode
+/// too): stopped.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disk_image_remounted() {
+    let images = tempfile::tempdir().unwrap();
+    let (a_image, b_image) = (images.path().join("a.dmg"), images.path().join("b.dmg"));
+    let b_mount = images.path().join("b");
+    std::fs::create_dir(&b_mount).unwrap();
+    for image in [&a_image, &b_image] {
+        hdiutil(&[
+            "create".as_ref(),
+            "-size".as_ref(),
+            "2m".as_ref(),
+            "-fs".as_ref(),
+            "HFS+".as_ref(),
+            image.as_os_str(),
+        ]);
+    }
+    let device =
+        |p: &std::path::Path| std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(p).unwrap());
+
+    let w = world().await;
+    let mut a = w.device_for("a", &w.library, false).await;
+    std::fs::create_dir_all(&a.folder).unwrap();
+    let mounted = Mounted::attach(&a_image, &a.folder);
+    // The pair's root is the image's, known from its first round.
+    let pair = a.pair();
+    a.state().set_pair_path(pair.id, &pair.path, None).unwrap();
+    a.write("x.txt", "x");
+    a.restart();
+    w.converge(&[&a]).await;
+    a.stop().await;
+    let before = device(&a.folder);
+    drop(mounted);
+    let b = Mounted::attach(&b_image, &b_mount);
+    let mounted = Mounted::attach(&a_image, &a.folder);
+    assert_ne!(device(&a.folder), before, "A came back on another device");
+    a.restart();
+    a.write("y.txt", "y");
+    w.converge(&[&a]).await;
+    assert!(a.pair().stopped.is_none(), "{:?}", a.pair().stopped);
+
+    // B in A's place.
+    a.stop().await;
+    drop((mounted, b));
+    let _b = Mounted::attach(&b_image, &a.folder);
+    a.restart();
+    eventually("stopped", || async {
+        a.pair()
+            .stopped
+            .is_some_and(|why| why.contains("doesn't match"))
+    })
+    .await;
+    a.stop().await;
+    let remote: Vec<String> = w.remote(&w.library).await.into_keys().collect();
+    assert_eq!(remote, ["x.txt", "y.txt"]);
+}
+
+/// A stop in the middle of a download (Ctrl-C, SIGTERM, the app's Quit):
+/// the engine returns within seconds and leaves no part file behind (an
+/// aborted round left it, hidden, until its folder was deleted); the next
+/// start converges.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_mid_download_leaves_no_part() {
+    let (w, wire) = world_cut().await;
+    let mut a = w.device("a").await;
+    w.converge(&[&a]).await;
+    a.stop().await;
+    w.upload(&w.library, "big.bin", &noise(32 * 1024 * 1024))
+        .await;
+    // A few chunks through (written to the part file), then a stall.
+    wire.budget
+        .store(8 * 1024 * 1024, std::sync::atomic::Ordering::SeqCst);
+    a.restart();
+    let parts = |folder: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(folder)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(local::PART_SUFFIX))
+            .collect()
+    };
+    eventually("downloading", || async { !parts(&a.folder).is_empty() }).await;
+    let started = std::time::Instant::now();
+    a.stop().await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(parts(&a.folder), Vec::<String>::new());
+    wire.budget
+        .store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+    a.restart();
+    w.converge(&[&a]).await;
+}
+
+/// `theca run` stopped by SIGTERM (systemd, launchd, `kill`) mid-download: it
+/// exits cleanly within seconds, leaving no part file (the signal's default
+/// killed it on the spot).
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_stops_theca_run_cleanly() {
+    let (w, wire) = world_cut().await;
+    let mut a = w.device("a").await;
+    w.converge(&[&a]).await;
+    a.stop().await;
+    w.upload(&w.library, "big.bin", &noise(32 * 1024 * 1024))
+        .await;
+    wire.budget
+        .store(8 * 1024 * 1024, std::sync::atomic::Ordering::SeqCst);
+    let mut run = std::process::Command::new(env!("CARGO_BIN_EXE_theca"))
+        .arg("--state")
+        .arg(&a.state_path)
+        .arg("run")
+        .spawn()
+        .unwrap();
+    let parts = || -> usize {
+        std::fs::read_dir(&a.folder)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with(local::PART_SUFFIX)
+            })
+            .count()
+    };
+    eventually("downloading", || async { parts() > 0 }).await;
+    let started = std::time::Instant::now();
+    let killed = std::process::Command::new("kill")
+        .args(["-TERM", &run.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let status = tokio::task::spawn_blocking(move || run.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(status.success(), "{status}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(8));
+    assert_eq!(parts(), 0);
+}
+
+/// A pair stopped for its folder (a disk unplugged with the client running:
+/// an empty mount point left) resumes by itself once the folder is back and
+/// passes the root check: nothing to Resume by hand.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_folder_back_resumes_its_pair() {
+    let w = world().await;
+    let mut a = w.device("a").await;
+    a.write("x.txt", "x");
+    w.converge(&[&a]).await;
+    // Unplugged (an empty mount point left), seen once the client runs.
+    a.stop().await;
+    let away = a.folder.with_file_name("unplugged");
+    std::fs::rename(&a.folder, &away).unwrap();
+    std::fs::create_dir(&a.folder).unwrap();
+    a.restart();
+    eventually("stopped", || async { a.pair().stopped.is_some() }).await;
+    std::fs::remove_dir(&a.folder).unwrap();
+    std::fs::rename(&away, &a.folder).unwrap();
+    eventually("resumed", || async { a.pair().stopped.is_none() }).await;
+    a.write("y.txt", "y");
+    w.converge(&[&a]).await;
+}
+
+/// A pair stopped for a reason the folder's return can't lift (moved to the
+/// trash) keeps that reason: checking whether it can resume never rewrites
+/// it (it became "missing", with a second notice).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stop_keeps_its_reason() {
+    let w = world().await;
+    let a = w.device("a").await;
+    a.write("x.txt", "x");
+    w.converge(&[&a]).await;
+    let trash = a.folder.parent().unwrap().join(".Trash");
+    std::fs::create_dir(&trash).unwrap();
+    std::fs::rename(&a.folder, trash.join("Docs")).unwrap();
+    eventually("stopped", || async {
+        a.pair().stopped.is_some_and(|why| why.contains("trash"))
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let why = a.pair().stopped.unwrap();
+    assert!(why.contains("trash"), "{why}");
+    let stops = a.notices().iter().filter(|n| n.contains("stopped")).count();
+    assert_eq!(stops, 1, "{:?}", a.notices());
 }
