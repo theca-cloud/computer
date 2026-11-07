@@ -96,12 +96,15 @@ fn error(e: Error) -> KeychainError {
 mod tests {
     use super::*;
 
-    /// The entries' service is the app's identifier, as the app is built.
+    /// The entries' service is the app's identifier, as the app is built, and
+    /// the one 1.0.0 released: another would find none of the entries users
+    /// have, and sign every account out.
     #[test]
     fn the_service_is_the_identifier() {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         assert_eq!(config["identifier"], SERVICE);
+        assert_eq!(SERVICE, "rs.theca.computer");
     }
 
     /// Stored, read, deleted, and deleted again; a missing entry is told
