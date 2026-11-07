@@ -1,0 +1,206 @@
+{
+  "accounts": [
+    {
+      "auto_sync_limit": 524288000,
+      "declined": [
+        "01900000-0000-7000-8000-000000000046"
+      ],
+      "default_folder": "/home/user/theca",
+      "device": "laptop",
+      "email": "ada@example.com",
+      "instance": "https://cloud.example.com",
+      "keychain": true,
+      "password": "app-password-a",
+      "secret": null,
+      "signed_out": false,
+      "uuid": "01900000-0000-7000-8000-000000000001"
+    },
+    {
+      "auto_sync_limit": null,
+      "declined": [],
+      "default_folder": "/home/user/theca",
+      "device": "laptop",
+      "email": "bob@example.org",
+      "instance": "https://files.example.org",
+      "keychain": true,
+      "password": "app-password-b",
+      "secret": null,
+      "signed_out": true,
+      "uuid": "01900000-0000-7000-8000-000000000002"
+    }
+  ],
+  "notices": [
+    {
+      "account": "01900000-0000-7000-8000-000000000001",
+      "at": 1794084334071,
+      "level": "info",
+      "library": "01900000-0000-7000-8000-00000000000a",
+      "message": "moved to the trash",
+      "path": "Reports/old.txt",
+      "undo": "01900000-0000-7000-8000-000000000050 01900000-0000-7000-8000-000000000051"
+    },
+    {
+      "account": "01900000-0000-7000-8000-000000000001",
+      "at": 1794084334071,
+      "level": "error",
+      "library": "01900000-0000-7000-8000-00000000001e",
+      "message": "stopped: the folder is missing (the local files stay)",
+      "path": "/home/user/theca/Photos",
+      "undo": null
+    },
+    {
+      "account": "01900000-0000-7000-8000-000000000002",
+      "at": 1794084334071,
+      "level": "error",
+      "library": null,
+      "message": "This device was signed out of https://files.example.org: sign in again, or remove the account",
+      "path": null,
+      "undo": null
+    }
+  ],
+  "pairs": [
+    {
+      "account": "01900000-0000-7000-8000-000000000001",
+      "activity": "up to date",
+      "entries": [
+        {
+          "file_id": "4243",
+          "is_file": false,
+          "mtime": 0,
+          "name": "Reports",
+          "node": "01900000-0000-7000-8000-00000000000c",
+          "parent": "01900000-0000-7000-8000-00000000000b",
+          "size": 0,
+          "version": null
+        },
+        {
+          "file_id": "4244",
+          "is_file": true,
+          "mtime": 1762000000123456789,
+          "name": "Q3 report.pdf",
+          "node": "01900000-0000-7000-8000-00000000000d",
+          "parent": "01900000-0000-7000-8000-00000000000c",
+          "size": 183402,
+          "version": "01900000-0000-7000-8000-000000000011"
+        },
+        {
+          "file_id": "4245",
+          "is_file": true,
+          "mtime": 1762000100000000000,
+          "name": "Notes ΟΔΟΣ.txt",
+          "node": "01900000-0000-7000-8000-00000000000e",
+          "parent": "01900000-0000-7000-8000-00000000000b",
+          "size": 12,
+          "version": "01900000-0000-7000-8000-000000000012"
+        }
+      ],
+      "error": null,
+      "library": "01900000-0000-7000-8000-00000000000a",
+      "library_name": "Documents",
+      "path": "/home/user/theca/Documents",
+      "paused": false,
+      "position": 44,
+      "position_event": "01900000-0000-7000-8000-000000000014",
+      "remote": [
+        {
+          "node": "01900000-0000-7000-8000-00000000000d",
+          "state": {
+            "is_file": true,
+            "modified": 1762100000000000000,
+            "name": "Q3 report.pdf",
+            "parent": "01900000-0000-7000-8000-00000000000c",
+            "size": 190000,
+            "version": "01900000-0000-7000-8000-000000000013"
+          }
+        },
+        {
+          "node": "01900000-0000-7000-8000-00000000000f",
+          "state": null
+        }
+      ],
+      "root": "01900000-0000-7000-8000-00000000000b",
+      "root_file_id": "16777232:4242",
+      "stop": null,
+      "stop_detail": null,
+      "synced_at": 1794084334069,
+      "writable": true
+    },
+    {
+      "account": "01900000-0000-7000-8000-000000000001",
+      "activity": "stopped: the folder is missing",
+      "entries": [],
+      "error": null,
+      "library": "01900000-0000-7000-8000-00000000001e",
+      "library_name": "Photos",
+      "path": "/home/user/theca/Photos",
+      "paused": true,
+      "position": null,
+      "position_event": null,
+      "remote": [],
+      "root": "01900000-0000-7000-8000-00000000001f",
+      "root_file_id": null,
+      "stop": "folder",
+      "stop_detail": "the folder is missing",
+      "synced_at": null,
+      "writable": true
+    },
+    {
+      "account": "01900000-0000-7000-8000-000000000001",
+      "activity": "stopped: library deleted",
+      "entries": [],
+      "error": null,
+      "library": "01900000-0000-7000-8000-000000000028",
+      "library_name": "Archive",
+      "path": "/home/user/theca/Archive",
+      "paused": false,
+      "position": null,
+      "position_event": null,
+      "remote": [],
+      "root": "01900000-0000-7000-8000-000000000029",
+      "root_file_id": null,
+      "stop": "library_deleted",
+      "stop_detail": null,
+      "synced_at": null,
+      "writable": true
+    },
+    {
+      "account": "01900000-0000-7000-8000-000000000001",
+      "activity": "waiting",
+      "entries": [],
+      "error": "the server answered 502 Bad Gateway",
+      "library": "01900000-0000-7000-8000-000000000032",
+      "library_name": "Music",
+      "path": "/home/user/theca/Music",
+      "paused": false,
+      "position": null,
+      "position_event": null,
+      "remote": [],
+      "root": "01900000-0000-7000-8000-000000000033",
+      "root_file_id": null,
+      "stop": null,
+      "stop_detail": null,
+      "synced_at": null,
+      "writable": true
+    },
+    {
+      "account": "01900000-0000-7000-8000-000000000002",
+      "activity": "signed out",
+      "entries": [],
+      "error": null,
+      "library": "01900000-0000-7000-8000-00000000003c",
+      "library_name": "Shared",
+      "path": "/home/user/theca/Shared",
+      "paused": false,
+      "position": null,
+      "position_event": null,
+      "remote": [],
+      "root": "01900000-0000-7000-8000-00000000003d",
+      "root_file_id": null,
+      "stop": "access_removed",
+      "stop_detail": null,
+      "synced_at": null,
+      "writable": false
+    }
+  ],
+  "version": "0.2.0"
+}

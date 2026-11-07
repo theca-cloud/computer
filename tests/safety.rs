@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use theca::local;
-use theca::state::Entry;
+use theca::state::{Entry, Stop};
 use uuid::Uuid;
 
 /// A1: the server's database restored from a backup (the feed's `reset`) is a
@@ -222,6 +222,7 @@ async fn two_accounts_never_share_a_folder() {
         "a",
         Some(a.folder.parent().unwrap().to_owned()),
         Some(created.password),
+        true,
         |_| panic!("a token needs no browser"),
     )
     .await
@@ -495,7 +496,7 @@ async fn a_folder_arriving_in_a_trashed_library_comes_down_on_restore() {
     w.admin.delete_library(w.library.id, false).await.unwrap();
     a.restart();
     eventually("stopped", || async {
-        a.pair().stopped.as_deref() == Some("library deleted")
+        a.pair().stop == Some(Stop::LibraryDeleted)
     })
     .await;
     w.admin.restore_library(w.library.id).await.unwrap();
@@ -660,11 +661,11 @@ async fn a_replaced_folder_is_never_read_as_deleted() {
     std::fs::rename(&a.folder, a.folder.with_file_name("unmounted")).unwrap();
     std::fs::create_dir(&a.folder).unwrap();
     a.restart();
-    eventually("stopped", || async { a.pair().stopped.is_some() }).await;
+    eventually("stopped", || async { a.pair().stop.is_some() }).await;
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     assert!(w.remote(&w.library).await.contains_key("x.txt"));
     // Another folder (another inode) never resumes it.
-    assert!(a.pair().stopped.is_some());
+    assert!(a.pair().stop.is_some());
     // Said where a script or a monitor looks: `theca status` fails.
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_theca"))
         .arg("--state")
@@ -681,7 +682,7 @@ async fn a_replaced_folder_is_never_read_as_deleted() {
 #[tokio::test(flavor = "multi_thread")]
 async fn two_engines_never_share_a_state() {
     let w = world().await;
-    let mut a = w.device("a").await;
+    let mut a = w.device_without_keychain("a").await;
     a.stop().await;
     let theca = || {
         let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_theca"));
@@ -823,7 +824,7 @@ async fn a_folder_moved_into_another_pair_stops() {
     .unwrap();
     a.handle.wake();
     std::fs::rename(&a.folder, other.join("Docs")).unwrap();
-    eventually("stopped", || async { a.pair().stopped.is_some() }).await;
+    eventually("stopped", || async { a.pair().stop.is_some() }).await;
     assert!(
         !a.pair().path.starts_with(&other),
         "followed into another pair"
@@ -948,7 +949,7 @@ async fn a_remounted_disk_goes_on() {
     a.write("y.txt", "y");
     w.converge(&[&a]).await;
     let pair = a.pair();
-    assert!(pair.stopped.is_none(), "{:?}", pair.stopped);
+    assert!(pair.stop.is_none(), "{:?}", pair.stop);
     assert!(
         !pair.root_file_id.unwrap().starts_with("424242:"),
         "the device recorded"
@@ -971,8 +972,8 @@ async fn a_remounted_disk_that_changed_stops() {
     a.restart();
     eventually("stopped", || async {
         a.pair()
-            .stopped
-            .is_some_and(|why| why.contains("doesn't match"))
+            .stop
+            .is_some_and(|s| s.reason().contains("doesn't match"))
     })
     .await;
     assert_eq!(
@@ -1066,7 +1067,7 @@ async fn a_disk_image_remounted() {
     a.restart();
     a.write("y.txt", "y");
     w.converge(&[&a]).await;
-    assert!(a.pair().stopped.is_none(), "{:?}", a.pair().stopped);
+    assert!(a.pair().stop.is_none(), "{:?}", a.pair().stop);
 
     // B in A's place.
     a.stop().await;
@@ -1075,8 +1076,8 @@ async fn a_disk_image_remounted() {
     a.restart();
     eventually("stopped", || async {
         a.pair()
-            .stopped
-            .is_some_and(|why| why.contains("doesn't match"))
+            .stop
+            .is_some_and(|s| s.reason().contains("doesn't match"))
     })
     .await;
     a.stop().await;
@@ -1126,7 +1127,7 @@ async fn a_stop_mid_download_leaves_no_part() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_stops_theca_run_cleanly() {
     let (w, wire) = world_cut().await;
-    let mut a = w.device("a").await;
+    let mut a = w.device_without_keychain("a").await;
     w.converge(&[&a]).await;
     a.stop().await;
     w.upload(&w.library, "big.bin", &noise(32 * 1024 * 1024))
@@ -1181,10 +1182,10 @@ async fn a_folder_back_resumes_its_pair() {
     std::fs::rename(&a.folder, &away).unwrap();
     std::fs::create_dir(&a.folder).unwrap();
     a.restart();
-    eventually("stopped", || async { a.pair().stopped.is_some() }).await;
+    eventually("stopped", || async { a.pair().stop.is_some() }).await;
     std::fs::remove_dir(&a.folder).unwrap();
     std::fs::rename(&away, &a.folder).unwrap();
-    eventually("resumed", || async { a.pair().stopped.is_none() }).await;
+    eventually("resumed", || async { a.pair().stop.is_none() }).await;
     a.write("y.txt", "y");
     w.converge(&[&a]).await;
 }
@@ -1202,12 +1203,12 @@ async fn a_stop_keeps_its_reason() {
     std::fs::create_dir(&trash).unwrap();
     std::fs::rename(&a.folder, trash.join("Docs")).unwrap();
     eventually("stopped", || async {
-        a.pair().stopped.is_some_and(|why| why.contains("trash"))
+        a.pair().stop.is_some_and(|s| s.reason().contains("trash"))
     })
     .await;
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    let why = a.pair().stopped.unwrap();
-    assert!(why.contains("trash"), "{why}");
+    let why = a.pair().stop.unwrap();
+    assert!(why.reason().contains("trash"), "{why:?}");
     let stops = a.notices().iter().filter(|n| n.contains("stopped")).count();
     assert_eq!(stops, 1, "{:?}", a.notices());
 }

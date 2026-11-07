@@ -35,6 +35,7 @@
 	"activity_up_to_date": "Up to date",
 	"activity_offline": "Offline",
 	"activity_signed_out": "Signed out",
+	"activity_error": "Error: {reason}",
 	"last_synced": "Last synced {when}",
 	"never_synced": "Not synced yet",
 	"pause": "Pause",

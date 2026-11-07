@@ -30,7 +30,7 @@ async fn crash(state: &Path, point: &str, args: &[&str]) {
 #[tokio::test(flavor = "multi_thread")]
 async fn removal_killed_after_the_deletions() {
     let w = world().await;
-    let mut a = w.device("a").await;
+    let mut a = w.device_without_keychain("a").await;
     a.write("x.txt", "synced");
     w.converge(&[&a]).await;
     a.stop().await;
@@ -80,7 +80,7 @@ async fn edit(w: &World, a: &Device, name: &str, content: &[u8]) {
 #[tokio::test(flavor = "multi_thread")]
 async fn downloads_are_recorded_as_they_land() {
     let w = world().await;
-    let mut a = w.device("a").await;
+    let mut a = w.device_without_keychain("a").await;
     a.write("one.txt", "1");
     a.write("two.txt", "2");
     w.converge(&[&a]).await;
@@ -100,7 +100,7 @@ async fn downloads_are_recorded_as_they_land() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_download_killed_before_its_record_forks_nothing() {
     let w = world().await;
-    let mut a = w.device("a").await;
+    let mut a = w.device_without_keychain("a").await;
     a.write("x.txt", "one");
     w.converge(&[&a]).await;
     a.stop().await;
@@ -143,7 +143,7 @@ async fn a_download_killed_before_its_record_forks_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_upload_killed_before_its_record_forks_nothing() {
     let w = world().await;
-    let mut a = w.device("a").await;
+    let mut a = w.device_without_keychain("a").await;
     a.write("x.txt", "one");
     w.converge(&[&a]).await;
     a.stop().await;
@@ -178,7 +178,7 @@ async fn an_upload_killed_before_its_record_forks_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_trash_killed_before_its_record_is_done_once() {
     let w = world().await;
-    let mut a = w.device("a").await;
+    let mut a = w.device_without_keychain("a").await;
     a.write("x.txt", "x");
     a.write("y.txt", "y");
     w.converge(&[&a]).await;
@@ -201,7 +201,7 @@ async fn a_trash_killed_before_its_record_is_done_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_local_move_killed_before_its_record_converges() {
     let w = world().await;
-    let mut a = w.device("a").await;
+    let mut a = w.device_without_keychain("a").await;
     a.write("x.txt", "x");
     w.converge(&[&a]).await;
     a.stop().await;
@@ -237,7 +237,7 @@ async fn a_local_move_killed_before_its_record_converges() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_local_delete_killed_before_its_record_converges() {
     let w = world().await;
-    let mut a = w.device("a").await;
+    let mut a = w.device_without_keychain("a").await;
     a.write("x.txt", "x");
     a.write("y.txt", "y");
     w.converge(&[&a]).await;

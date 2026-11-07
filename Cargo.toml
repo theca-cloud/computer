@@ -18,6 +18,10 @@ filepath = "0.2.0"
 fs4 = "1.1.0"
 futures = "0.3.34"
 gethostname = "1.1.0"
+# The app passwords in the OS keychain: keyring 4's core, and its store for
+# each OS below (the `keyring` crate would set its own store, and tests use
+# the core's mock).
+keyring-core = "1.0.1"
 notify = "8.2.1"
 # A rename that never replaces a file put there meanwhile, atomic where the
 # OS and disk can (renameat2, renamex_np, MoveFileExW): no unsafe code here.
@@ -44,7 +48,17 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "fs", "time", "signal", "sync"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-uuid = "1.29.0"
+uuid = { version = "1.29.0", features = ["v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store = "1.1.0"
+
+# Secret Service over zbus: pure Rust.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
 
 [lints.rust]
 unsafe_code = "forbid"

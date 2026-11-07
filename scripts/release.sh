@@ -1,8 +1,9 @@
 #!/usr/bin/env sh
 # Releases `dev` into `prod` (or a hotfix already on `prod`): runs scripts/ci.sh,
 # merges with --no-ff, bumps the version in Cargo.toml / package.json, prepends
-# the release to CHANGELOG.md (git-cliff, cliff.toml), commits it all as the
-# version (`1.2.3`), tags it, and fast-forwards `dev`. Never pushes.
+# the release to CHANGELOG.md (git-cliff, cliff.toml), writes the release's
+# client state for the upgrade test, commits it all as the version (`1.2.3`),
+# tags it, and fast-forwards `dev`. Never pushes.
 #
 # The version comes from the Conventional Commits on `dev` (cliff.toml's [bump]),
 # except 1.0.0: going to 1.0.0 is a decision, so it is never automatic.
@@ -109,6 +110,12 @@ if [ -s "$changes" ]; then # empty when only skipped commits (chore, test...)
     git add CHANGELOG.md
 fi
 rm -f "$changes"
+
+# The release's client state, written by this tree and read back by every later
+# one (tests/upgrade.rs): committed with the version, never edited after.
+THECA_FILL_OUT="$PWD/tests/upgrade/$next" cargo test -q --test upgrade fill -- --ignored >/dev/null ||
+    die "the upgrade test's fill failed: git merge --abort, or git reset --hard, then fix it on dev"
+git add "tests/upgrade/$next"
 
 git add -u
 git commit -q -m "$next"

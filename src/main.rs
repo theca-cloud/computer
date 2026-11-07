@@ -5,14 +5,21 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use theca::engine::{self, Handle, plural};
-use theca::ops;
+use theca::keychain::KeychainError;
 use theca::state::{self, State};
+use theca::{exit, ops};
 
-/// What a command fails with: said on stderr, exit code 1.
+/// What a command fails with: said on stderr, with its exit code (`exit`).
 #[derive(Debug, thiserror::Error)]
 enum CliError {
     #[error("{0}")]
     Refused(String),
+    /// `status`: a pair isn't syncing.
+    #[error("{0}")]
+    NotSyncing(String),
+    /// `status`: an account is signed out.
+    #[error("{0}")]
+    SignedOut(String),
     #[error(transparent)]
     Op(#[from] ops::OpError),
     #[error(transparent)]
@@ -24,6 +31,20 @@ enum CliError {
     #[cfg(feature = "gui")]
     #[error(transparent)]
     App(#[from] tauri::Error),
+}
+
+impl CliError {
+    fn code(&self) -> u8 {
+        match self {
+            CliError::NotSyncing(_) => exit::NOT_SYNCING,
+            CliError::SignedOut(_)
+            | CliError::Op(ops::OpError::Keychain(KeychainError::Missing)) => exit::SIGNED_OUT,
+            CliError::Op(ops::OpError::Client(e)) if e.code() == Some("unauthenticated") => {
+                exit::SIGNED_OUT
+            }
+            _ => exit::ERROR,
+        }
+    }
 }
 
 type Result<T> = std::result::Result<T, CliError>;
@@ -64,9 +85,25 @@ enum Command {
         /// An app password made in the web app: no browser (scripts).
         #[arg(long, env = "THECA_TOKEN", hide_env_values = true)]
         token: Option<String>,
+        /// Keep the app password in this app's state file, not in the OS
+        /// keychain (where there is none, it is kept there anyway).
+        /// `THECA_NO_KEYRING`: anything but empty, 0, false, no or off.
+        #[arg(long, env = "THECA_NO_KEYRING", value_parser = clap::builder::FalseyValueParser::new())]
+        no_keyring: bool,
     },
     /// The accounts on this device.
     Accounts,
+    /// An account's settings: shown, or changed.
+    Account {
+        account: String,
+        /// Where its libraries go by default.
+        #[arg(long)]
+        folder: Option<PathBuf>,
+        /// Libraries up to this many MB appearing later are synced by
+        /// themselves (0: never).
+        #[arg(long)]
+        auto_sync_mb: Option<i64>,
+    },
     /// Remove an account from this device.
     RemoveAccount {
         account: String,
@@ -89,10 +126,6 @@ enum Command {
         merge: bool,
         #[arg(long)]
         account: Option<String>,
-        /// Libraries up to this many MB appearing later are synced by
-        /// themselves (0: never).
-        #[arg(long)]
-        auto_sync_mb: Option<i64>,
     },
     /// Stop syncing a folder (by library name, path or ID).
     Remove {
@@ -144,7 +177,7 @@ fn exit(result: Result<()>) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("theca: {e}");
-            ExitCode::FAILURE
+            ExitCode::from(e.code())
         }
     }
 }
@@ -166,13 +199,28 @@ async fn command(cli: Cli) -> Result<()> {
             name,
             folder,
             token,
+            no_keyring,
         } => {
             let name = name.unwrap_or_else(ops::device_name);
-            let account = ops::login(&state, &instance, &name, folder, token, |flow| {
-                println!("Open this page to allow \"{name}\": {}", flow.url);
-                println!("Check it shows the code {}", flow.code);
-            })
+            let account = ops::login(
+                &state,
+                &instance,
+                &name,
+                folder,
+                token,
+                !no_keyring,
+                |flow| {
+                    println!("Open this page to allow \"{name}\": {}", flow.url);
+                    println!("Check it shows the code {}", flow.code);
+                },
+            )
             .await?;
+            if !no_keyring && matches!(account.password, state::Password::InState(_)) {
+                println!(
+                    "No keychain could be reached: the app password is kept in {}.",
+                    path.display()
+                );
+            }
             println!(
                 "Logged in as {} on {}. Libraries go into {} by default.",
                 account.email,
@@ -192,6 +240,31 @@ async fn command(cli: Cli) -> Result<()> {
                     a.default_folder.display(),
                     a.device
                 );
+            }
+        }
+        Command::Account {
+            account,
+            folder,
+            auto_sync_mb,
+        } => {
+            let account = ops::find_account(&state, Some(&account))?;
+            if let Some(folder) = folder {
+                // Resolved here: `add` runs in another directory.
+                let folder = std::path::absolute(&folder).unwrap_or(folder);
+                state.set_default_folder(account.id, &folder)?;
+            }
+            if let Some(mb) = auto_sync_mb {
+                state.set_auto_sync_limit(account.id, (mb > 0).then_some(mb * 1024 * 1024))?;
+            }
+            let a = state.account(account.id)?.unwrap_or(account);
+            println!("{} on {}", a.email, a.instance);
+            println!("  libraries go into {}", a.default_folder.display());
+            match a.auto_sync_limit {
+                Some(limit) => println!(
+                    "  new libraries up to {} are synced by themselves",
+                    size(limit)
+                ),
+                None => println!("  new libraries are offered, never synced by themselves"),
             }
         }
         Command::RemoveAccount {
@@ -222,12 +295,8 @@ async fn command(cli: Cli) -> Result<()> {
             path,
             merge,
             account,
-            auto_sync_mb,
         } => {
             let account = ops::find_account(&state, account.as_deref())?;
-            if let Some(mb) = auto_sync_mb {
-                state.set_auto_sync_limit(account.id, (mb > 0).then_some(mb * 1024 * 1024))?;
-            }
             let pair = ops::add(&state, &account, &library, path, merge).await?;
             println!(
                 "{} syncs into {} (theca run, or the app, does it).",
@@ -336,8 +405,10 @@ fn status(state: &State) -> Result<()> {
         for p in pairs.iter().filter(|p| p.account == a.id) {
             let what = if p.paused {
                 "paused".to_owned()
-            } else if let Some(why) = &p.stopped {
-                format!("stopped: {why}")
+            } else if let Some(stop) = &p.stop {
+                format!("stopped: {}", stop.reason())
+            } else if let Some(e) = &p.error {
+                format!("error: {e}")
             } else {
                 p.activity.clone()
             };
@@ -370,17 +441,23 @@ fn status(state: &State) -> Result<()> {
             println!("{} {}{}{undo}", n.level, path, n.message);
         }
     }
-    // A pair stopped syncs nothing until someone acts: a script or a monitor
-    // reading the exit code knows.
+    // An account signed out, or a pair stopped, syncs nothing until someone
+    // acts: a script or a monitor reading the exit code knows.
+    if let Some(a) = accounts.iter().find(|a| a.signed_out) {
+        return Err(CliError::SignedOut(format!(
+            "signed out of {}: theca login {}",
+            a.instance, a.instance
+        )));
+    }
     let stopped = pairs
         .iter()
         .filter(|p| p.not_syncing().is_some() && !p.paused)
         .count();
     if stopped > 0 {
-        return refused(format!(
+        return Err(CliError::NotSyncing(format!(
             "{} stopped syncing (above)",
             engine::plural(stopped, "folder")
-        ));
+        )));
     }
     Ok(())
 }
@@ -413,4 +490,33 @@ async fn stop_signal() {
         return;
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A password the server refuses, or gone from the keychain: 4, as a
+    /// signed-out account; any other error: 1.
+    #[test]
+    fn what_exits_with_signed_out() {
+        let refused = |code: &str| {
+            CliError::Op(ops::OpError::Client(theca_client::Error::Api {
+                status: 401,
+                error: theca_common::api::ApiError {
+                    code: code.into(),
+                    message: String::new(),
+                    chunks: Vec::new(),
+                },
+            }))
+        };
+        assert_eq!(refused("unauthenticated").code(), exit::SIGNED_OUT);
+        assert_eq!(refused("forbidden").code(), exit::ERROR);
+        let missing = CliError::Op(ops::OpError::Keychain(KeychainError::Missing));
+        assert_eq!(missing.code(), exit::SIGNED_OUT);
+        let locked = CliError::Op(ops::OpError::Keychain(KeychainError::Unreachable(
+            "locked".into(),
+        )));
+        assert_eq!(locked.code(), exit::ERROR);
+    }
 }

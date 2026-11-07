@@ -8,8 +8,9 @@ use theca_client::{Client, Error};
 use theca_common::api;
 use uuid::Uuid;
 
+use crate::keychain::{self, KeychainError};
 use crate::local;
-use crate::state::{Account, Pair, State, StateError};
+use crate::state::{Account, Pair, Password, State, StateError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpError {
@@ -17,6 +18,8 @@ pub enum OpError {
     State(#[from] StateError),
     #[error(transparent)]
     Client(#[from] Error),
+    #[error(transparent)]
+    Keychain(#[from] KeychainError),
     #[error("{0}")]
     Refused(String),
     /// A first sync into a folder holding files: a merge, asked first.
@@ -96,13 +99,15 @@ pub fn proposed_folder(state: &State, instance: &str) -> Result<PathBuf> {
 /// Logs a device in through the browser: `show` gets the flow (its URL to
 /// open, its code to show); this waits for the approval, then saves the
 /// account. With `token` (an app password made in the web app, for
-/// scripts), no flow.
+/// scripts), no flow. The app password goes into the OS keychain when
+/// `keyring` and there is one, else into the state (said in a notice).
 pub async fn login(
     state: &State,
     instance: &str,
     device: &str,
     folder: Option<PathBuf>,
     token: Option<String>,
+    keyring: bool,
     show: impl FnOnce(&api::LoginFlow),
 ) -> Result<Account> {
     let instance = instance.trim_end_matches('/').to_owned();
@@ -139,6 +144,7 @@ pub async fn login(
         (None, Some(known)) => known.default_folder.clone(),
         (None, None) => proposed_folder(state, &instance)?,
     };
+    let (password, left) = keep_password(known.as_ref().map(|k| &k.password), password, keyring);
     let mut account = Account {
         id: 0,
         instance,
@@ -153,11 +159,57 @@ pub async fn login(
         signed_out: false,
     };
     account.id = state.save_account(&account)?;
+    // Only once the account no longer names it.
+    if let Some(left) = left {
+        let _ = keychain::delete(&left);
+    }
+    if keyring && matches!(account.password, Password::InState(_)) {
+        state.notify(
+            Some(account.id),
+            None,
+            "info",
+            None,
+            "the app password is kept in this app's state file: no keychain could be reached",
+            None,
+        )?;
+    }
     Ok(account)
 }
 
+/// Where a new app password goes: the account's keychain entry (written
+/// over when signing in again), a new one, or the state; and the entry the
+/// password left, to delete once the account is saved.
+fn keep_password(
+    known: Option<&Password>,
+    password: String,
+    keyring: bool,
+) -> (Password, Option<String>) {
+    let entry = match known {
+        Some(Password::Keychain(secret)) => secret.clone(),
+        _ => keychain::new_secret(),
+    };
+    let kept = if !keyring {
+        Password::InState(password)
+    } else {
+        match keychain::store(&entry, &password) {
+            Ok(()) => Password::Keychain(entry),
+            Err(e) => {
+                tracing::warn!("the app password is kept in the state: {e}");
+                Password::InState(password)
+            }
+        }
+    };
+    let left = match known {
+        Some(Password::Keychain(old)) if kept != Password::Keychain(old.clone()) => {
+            Some(old.clone())
+        }
+        _ => None,
+    };
+    (kept, left)
+}
+
 pub fn client(account: &Account) -> Result<Client> {
-    Ok(Client::new(&account.instance)?.with_token(account.password.clone()))
+    Ok(Client::new(&account.instance)?.with_token(keychain::password(account)?))
 }
 
 /// A library as the user sees it: synced where, or offered.
@@ -276,9 +328,10 @@ pub async fn add(
         position: None,
         position_event: None,
         paused: false,
-        stopped: None,
+        stop: None,
         writable: found.writable,
         activity: "waiting".into(),
+        error: None,
         synced_at: None,
     };
     pair.id = state.add_pair(&pair)?;
@@ -463,6 +516,13 @@ pub async fn remove_account(state: &State, account: &Account, delete_files: bool
         let _ = client.logout().await;
     }
     state.remove_account(account.id)?;
+    // The account is gone either way: a keychain out of reach leaves an entry
+    // nobody names.
+    if let Password::Keychain(secret) = &account.password
+        && let Err(e) = keychain::delete(secret)
+    {
+        tracing::warn!("the app password stays in the keychain: {e}");
+    }
     Ok(kept)
 }
 
@@ -602,7 +662,7 @@ mod tests {
                 uuid: Uuid::now_v7(),
                 email: "a@x".into(),
                 device: "d".into(),
-                password: "p".into(),
+                password: Password::InState("p".into()),
                 default_folder: dir.to_owned(),
                 auto_sync_limit: None,
                 signed_out: false,
@@ -620,9 +680,10 @@ mod tests {
             position: Some(1),
             position_event: None,
             paused: false,
-            stopped: None,
+            stop: None,
             writable: true,
             activity: String::new(),
+            error: None,
             synced_at: None,
         };
         pair.id = state.add_pair(&pair).unwrap();

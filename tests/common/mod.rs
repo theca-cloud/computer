@@ -28,6 +28,16 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 use uuid::Uuid;
 
+/// The keychain the tests' app passwords go into: the OS's where CI has one
+/// that never prompts (`THECA_TEST_KEYCHAIN=os`: GitHub's macOS and Windows
+/// runners), else an in-memory one (a developer's Mac would ask at every
+/// build; Linux runners have no Secret Service).
+pub fn keychain() {
+    if std::env::var("THECA_TEST_KEYCHAIN").as_deref() != Ok("os") {
+        theca::keychain::use_mock();
+    }
+}
+
 pub const ADMIN: &str = "admin@test.theca";
 pub const PASSWORD: &str = "a long password";
 
@@ -413,7 +423,24 @@ impl World {
         self.device_for(name, &self.library, true).await
     }
 
+    /// A device whose app password is in its state (`--no-keyring`): a child
+    /// `theca` runs on it, and can't read this process's keychain (the mock),
+    /// nor, on macOS, an entry another binary wrote without a prompt.
+    pub async fn device_without_keychain(&self, name: &str) -> Device {
+        self.device_made(name, &self.library, true, false).await
+    }
+
     pub async fn device_for(&self, name: &str, library: &api::Library, start: bool) -> Device {
+        self.device_made(name, library, start, true).await
+    }
+
+    async fn device_made(
+        &self,
+        name: &str,
+        library: &api::Library,
+        start: bool,
+        keyring: bool,
+    ) -> Device {
         let created = self
             .admin
             .create_app_password(&api::CreateAppPassword {
@@ -425,7 +452,7 @@ impl World {
             .await
             .unwrap();
         let mut device = self
-            .device_with(name, library, &created.password, start)
+            .device_with(name, library, &created.password, start, keyring)
             .await;
         device.app_password = Some(created.app_password.id);
         device
@@ -437,7 +464,9 @@ impl World {
         library: &api::Library,
         password: &str,
         start: bool,
+        keyring: bool,
     ) -> Device {
+        keychain();
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.sqlite");
         let folder = dir.path().join("theca");
@@ -449,6 +478,7 @@ impl World {
             name,
             Some(folder.clone()),
             Some(password.into()),
+            keyring,
             |_| panic!("a token needs no browser"),
         )
         .await

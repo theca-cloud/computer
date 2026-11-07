@@ -16,10 +16,11 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::exec::{Executor, remote_state};
+use crate::keychain::{self, KeychainError};
 use crate::local;
 use crate::ops;
 use crate::plan::{Action, Input, plan};
-use crate::state::{Account, Offer, Pair, RemoteState, State, StateError, Update};
+use crate::state::{Account, Offer, Pair, RemoteState, State, StateError, Stop, Update};
 
 /// A full scan even without any sign of change: watchers drop events.
 const FULL_SCAN: Duration = Duration::from_secs(3600);
@@ -45,6 +46,8 @@ pub enum EngineError {
     State(#[from] StateError),
     #[error(transparent)]
     Client(#[from] Error),
+    #[error(transparent)]
+    Keychain(#[from] KeychainError),
     #[error("{0}")]
     Server(String),
 }
@@ -149,7 +152,28 @@ fn stopped(state_path: &Path, account: i64, e: &EngineError) -> Result<(), State
     let message = format!("syncing stopped, tried again every 30 s: {e}");
     state.notify(Some(account), None, "error", None, &message, None)?;
     for p in state.pairs()?.iter().filter(|p| p.account == account) {
-        state.set_activity(p.id, &format!("error: {e}"), false)?;
+        state.set_error(p.id, &e.to_string())?;
+    }
+    Ok(())
+}
+
+/// The account's app password was refused, or is gone from the keychain:
+/// nothing runs until a new login.
+fn sign_out(state: &State, account: &Account, why: &str) -> Result<(), StateError> {
+    state.set_signed_out(account.id)?;
+    state.notify(
+        Some(account.id),
+        None,
+        "error",
+        None,
+        &format!(
+            "This device was signed out of {} ({why}): sign in again, or remove the account",
+            account.instance
+        ),
+        None,
+    )?;
+    for p in state.pairs()?.iter().filter(|p| p.account == account.id) {
+        state.set_activity(p.id, "signed out", false)?;
     }
     Ok(())
 }
@@ -207,7 +231,20 @@ async fn follow(
     let Some(account) = state.account(account)? else {
         return Ok(());
     };
-    let client = Client::new(&account.instance)?.with_token(account.password.clone());
+    // Gone from the keychain: signed out. The keychain locked, or not up yet:
+    // an error, tried again within 30 s.
+    let password = match keychain::password(&account) {
+        Err(KeychainError::Missing) => {
+            sign_out(
+                &state,
+                &account,
+                "its app password is missing from the keychain",
+            )?;
+            return Ok(());
+        }
+        password => password?,
+    };
+    let client = Client::new(&account.instance)?.with_token(password);
     // A server older than this client works with (or rolled back since the
     // login): stopped, saying to update it. Unreachable: the feed retries.
     if let Ok(version) = client.check_version().await
@@ -267,12 +304,7 @@ async fn follow(
                 Some(Ok(FeedMessage::Changes(changes))) => f.changes(changes).await?,
                 Some(Err(e)) => {
                     if matches!(e.code(), Some("unauthenticated")) {
-                        f.state.set_signed_out(f.account.id)?;
-                        f.state.notify(Some(f.account.id), None, "error", None,
-                            &format!("This device was signed out of {}: sign in again, or remove the account", f.account.instance), None)?;
-                        for p in f.pairs()? {
-                            f.state.set_activity(p.id, "signed out", false)?;
-                        }
+                        sign_out(&f.state, &f.account, "the server refused its app password")?;
                     } else {
                         f.state.notify(Some(f.account.id), None, "error", None, &e.to_string(), None)?;
                     }
@@ -321,10 +353,8 @@ impl Follower {
     /// A pair's library is there (again): a pair its absence stopped runs,
     /// and its name and access are kept.
     fn library_there(&mut self, p: &Pair, name: &str, writable: bool) -> Result<(), StateError> {
-        if matches!(
-            p.stopped.as_deref(),
-            Some(crate::state::ACCESS_REMOVED | crate::state::LIBRARY_DELETED)
-        ) {
+        let for_its_library = matches!(p.stop, Some(Stop::AccessRemoved | Stop::LibraryDeleted));
+        if for_its_library {
             self.state.set_stopped(p.id, None)?;
         }
         // Access given back: the stream doesn't replay what happened
@@ -333,10 +363,7 @@ impl Follower {
         // trashed library stayed in the feed, but a folder that arrived while
         // it was there couldn't be listed (its tree answers 404 in the trash):
         // listed again too.
-        if matches!(
-            p.stopped.as_deref(),
-            Some(crate::state::ACCESS_REMOVED | crate::state::LIBRARY_DELETED)
-        ) {
+        if for_its_library {
             self.state.reset_position(p.id)?;
         }
         self.state.set_library(p.id, name, writable)?;
@@ -358,7 +385,7 @@ impl Follower {
         let pairs = self.pairs()?;
         let running: HashSet<i64> = pairs
             .iter()
-            .filter(|p| !p.paused && p.stopped.is_none())
+            .filter(|p| !p.paused && p.stop.is_none())
             .map(|p| p.id)
             .collect();
         let paths: HashMap<i64, &PathBuf> = pairs.iter().map(|p| (p.id, &p.path)).collect();
@@ -426,8 +453,8 @@ impl Follower {
         }
         for p in self.pairs()? {
             match libraries.iter().find(|l| l.id == p.library) {
-                None => self.stop(&p, crate::state::ACCESS_REMOVED)?,
-                Some(l) if l.trashed => self.stop(&p, crate::state::LIBRARY_DELETED)?,
+                None => self.stop(&p, Stop::AccessRemoved)?,
+                Some(l) if l.trashed => self.stop(&p, Stop::LibraryDeleted)?,
                 Some(l) => {
                     self.library_there(&p, &l.name, l.writable)?;
                     // A server restored from a backup: its tree is older than
@@ -443,13 +470,14 @@ impl Follower {
         Ok(())
     }
 
-    fn stop(&mut self, p: &Pair, why: &str) -> Result<(), StateError> {
+    fn stop(&mut self, p: &Pair, stop: Stop) -> Result<(), StateError> {
         // Checked again for a resume once what is at its path changes.
         self.stopped_at.insert(p.id, local::root_id(&p.path));
-        if p.stopped.as_deref() != Some(why) {
+        if p.stop.as_ref() != Some(&stop) {
+            let why = stop.reason();
             // Headless, the log is where it shows.
             tracing::error!(pair = p.id, path = %p.path.display(), "stopped syncing: {why}");
-            self.state.set_stopped(p.id, Some(why))?;
+            self.state.set_stopped(p.id, Some(&stop))?;
             self.state
                 .set_activity(p.id, &format!("stopped: {why}"), false)?;
             self.state.notify(
@@ -531,9 +559,10 @@ impl Follower {
                 position: None,
                 position_event: None,
                 paused: false,
-                stopped: None,
+                stop: None,
                 writable: l.writable,
                 activity: String::new(),
+                error: None,
                 synced_at: None,
             })?;
             self.state.notify(
@@ -571,8 +600,8 @@ impl Follower {
                         continue;
                     };
                     match &change.state {
-                        None => self.stop(p, crate::state::ACCESS_REMOVED)?,
-                        Some(s) if s.trashed => self.stop(p, crate::state::LIBRARY_DELETED)?,
+                        None => self.stop(p, Stop::AccessRemoved)?,
+                        Some(s) if s.trashed => self.stop(p, Stop::LibraryDeleted)?,
                         Some(s) => self.library_there(p, &s.name, p.writable)?,
                     }
                 }
@@ -769,7 +798,7 @@ impl Follower {
             let Some(p) = self.state.pair(id)? else {
                 continue;
             };
-            if p.paused || p.stopped.is_some() {
+            if p.paused || p.stop.is_some() {
                 continue;
             }
             let Some(&announced) = self.announced.get(&p.library) else {
@@ -801,7 +830,7 @@ impl Follower {
         let p = match self.root(p).await? {
             Ok(p) => p,
             Err(why) => {
-                self.stop(p, &why)?;
+                self.stop(p, Stop::Folder(why))?;
                 return Ok(());
             }
         };
@@ -821,8 +850,8 @@ impl Follower {
                     Ok(now) if now.path != p.path => {
                         self.dirty.insert(p.id);
                     }
-                    Ok(_) => self.stop(&p, "the folder can't be read")?,
-                    Err(why) => self.stop(&p, &why)?,
+                    Ok(_) => self.stop(&p, Stop::Folder("the folder can't be read".into()))?,
+                    Err(why) => self.stop(&p, Stop::Folder(why))?,
                 }
                 return Ok(());
             }
@@ -1051,7 +1080,7 @@ mod tests {
                 uuid: Uuid::now_v7(),
                 email: "a@x".into(),
                 device: "d".into(),
-                password: "p".into(),
+                password: crate::state::Password::InState("p".into()),
                 default_folder: dir.path().to_owned(),
                 auto_sync_limit: None,
                 signed_out: false,

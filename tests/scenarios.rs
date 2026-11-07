@@ -4,6 +4,7 @@
 mod common;
 
 use common::*;
+use theca::state::Stop;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn two_devices_converge() {
@@ -187,7 +188,9 @@ async fn a_read_only_library_only_comes_down() {
         .await
         .unwrap()
         .password;
-    let mut reader = w.device_with("reader", &w.library, &password, true).await;
+    let mut reader = w
+        .device_with("reader", &w.library, &password, true, true)
+        .await;
     writer.write("doc.txt", "one");
     w.converge(&[&writer, &reader]).await;
 
@@ -289,7 +292,7 @@ async fn the_folder_followed_or_stopped() {
     std::fs::remove_file(moved.join("after.txt")).unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     std::fs::remove_dir(&moved).unwrap();
-    eventually("stopped", || async { a.pair().stopped.is_some() }).await;
+    eventually("stopped", || async { a.pair().stop.is_some() }).await;
     assert_eq!(
         w.remote(&w.library).await.len(),
         2,
@@ -307,12 +310,12 @@ async fn library_trashed_and_device_signed_out() {
     w.converge(&[&a]).await;
     w.admin.delete_library(w.library.id, false).await.unwrap();
     eventually("stopped", || async {
-        a.pair().stopped.as_deref() == Some("library deleted")
+        a.pair().stop == Some(Stop::LibraryDeleted)
     })
     .await;
     assert!(a.path("x.txt").exists());
     w.admin.restore_library(w.library.id).await.unwrap();
-    eventually("resumed", || async { a.pair().stopped.is_none() }).await;
+    eventually("resumed", || async { a.pair().stop.is_none() }).await;
     a.write("y.txt", "y");
     w.converge(&[&a]).await;
 
@@ -361,7 +364,7 @@ async fn small_new_libraries_sync_by_themselves() {
         .unwrap();
     assert_eq!(pair.path, folder);
     assert!(
-        pair.stopped.is_none() && pair.root_file_id.is_some(),
+        pair.stop.is_none() && pair.root_file_id.is_some(),
         "{pair:?}"
     );
     // Big, over the limit, looked at in the same pass: offered only.
@@ -515,13 +518,13 @@ async fn access_removed_and_given_back() {
         .await
         .unwrap()
         .password;
-    let m = w.device_with("m", &w.library, &password, true).await;
+    let m = w.device_with("m", &w.library, &password, true, true).await;
     m.write("x.txt", "x");
     w.converge(&[&m]).await;
 
     w.set_member(&w.library, user, false).await;
     eventually("stopped", || async {
-        m.pair().stopped.as_deref() == Some(theca::state::ACCESS_REMOVED)
+        m.pair().stop == Some(Stop::AccessRemoved)
     })
     .await;
     assert!(m.path("x.txt").exists(), "the files stay");
@@ -529,7 +532,7 @@ async fn access_removed_and_given_back() {
     w.upload(&w.library, "while away.txt", b"away").await;
 
     w.set_member(&w.library, user, true).await;
-    eventually("resumed", || async { m.pair().stopped.is_none() }).await;
+    eventually("resumed", || async { m.pair().stop.is_none() }).await;
     w.converge(&[&m]).await;
     m.write("y.txt", "y");
     w.converge(&[&m]).await;
