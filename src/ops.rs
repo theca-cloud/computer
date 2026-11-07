@@ -38,6 +38,25 @@ fn refused<T>(why: impl Into<String>) -> Result<T> {
     Err(OpError::Refused(why.into()))
 }
 
+/// The oldest server this client works with, as `/api/version` gives it (the
+/// `core` it runs), and the community edition shipping it: `0.2.0` sends
+/// positions with their event's ID, which an older server refuses. Moves with
+/// the client's needs, never with each `core` release.
+const MIN_SERVER: (&str, &str) = ("1.4.0", "1.4.4");
+
+/// Why a server of this version is too old for this client, if it is (a
+/// version it can't read too).
+pub fn too_old(version: &str) -> Option<String> {
+    let (min, ce) = MIN_SERVER;
+    let min = semver::Version::parse(min).expect("a version");
+    match semver::Version::parse(version) {
+        Ok(v) if v >= min => None,
+        _ => Some(format!(
+            "the server runs Theca {version}; this app needs {min} or later: update the server (the community edition {ce} or later)"
+        )),
+    }
+}
+
 /// Libraries up to this size are synced when they appear, by default.
 pub const AUTO_SYNC_LIMIT: i64 = 500 * 1024 * 1024;
 
@@ -88,7 +107,9 @@ pub async fn login(
 ) -> Result<Account> {
     let instance = instance.trim_end_matches('/').to_owned();
     let client = Client::new(&instance)?;
-    client.check_version().await?;
+    if let Some(why) = too_old(&client.check_version().await?) {
+        return refused(why);
+    }
     let password = match token {
         Some(token) => token,
         None => {
@@ -554,6 +575,22 @@ pub fn find_account(state: &State, which: Option<&str>) -> Result<Account> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server older than the minimum, or whose version can't be read, is
+    /// refused; a release candidate of a newer one is not.
+    #[test]
+    fn a_server_too_old_is_refused() {
+        assert!(too_old("1.4.0").is_none());
+        assert!(too_old("1.5.0-rc").is_none());
+        assert!(too_old("2.0.0").is_none());
+        let why = too_old("1.3.3").unwrap();
+        assert!(
+            why.contains("1.3.3") && why.contains("1.4.0") && why.contains("1.4.4"),
+            "{why}"
+        );
+        assert!(too_old("1.4.0-rc").is_some());
+        assert!(too_old("not a version").is_some());
+    }
 
     /// A pair on a real folder holding `a.txt`, synced (its base entry).
     fn synced_pair(dir: &Path) -> (State, Pair) {

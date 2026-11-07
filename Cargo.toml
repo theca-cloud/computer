@@ -26,6 +26,8 @@ renamore = "0.3.2"
 # enough for the only copy of what was synced. Bundled: the same SQLite on
 # every OS, nothing to install.
 rusqlite = { version = "0.41.1", features = ["bundled"] }
+# The server's version against the oldest this client works with.
+semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tauri = { version = "2", features = ["tray-icon", "image-png"], optional = true }
@@ -36,8 +38,8 @@ tauri-plugin-opener = { version = "2", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
 # core's release, from its public mirror (as CE builds it): no credentials
 # anywhere. Working against an unreleased core: CLAUDE.md.
-theca-client = { git = "https://github.com/theca-cloud/core", tag = "1.4.0" }
-theca-common = { git = "https://github.com/theca-cloud/core", tag = "1.4.0" }
+theca-client = { git = "https://github.com/theca-cloud/core", tag = "1.5.0" }
+theca-common = { git = "https://github.com/theca-cloud/core", tag = "1.5.0" }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "fs", "time", "signal", "sync"] }
 tracing = "0.1.44"

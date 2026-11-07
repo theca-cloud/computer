@@ -45,6 +45,8 @@ pub enum EngineError {
     State(#[from] StateError),
     #[error(transparent)]
     Client(#[from] Error),
+    #[error("{0}")]
+    Server(String),
 }
 
 /// What the GUI and the CLI ask the running engine.
@@ -206,6 +208,13 @@ async fn follow(
         return Ok(());
     };
     let client = Client::new(&account.instance)?.with_token(account.password.clone());
+    // A server older than this client works with (or rolled back since the
+    // login): stopped, saying to update it. Unreachable: the feed retries.
+    if let Ok(version) = client.check_version().await
+        && let Some(why) = ops::too_old(&version)
+    {
+        return Err(EngineError::Server(why));
+    }
     let (events, mut changed) = mpsc::unbounded_channel();
     let mut f = Follower {
         state,

@@ -14,6 +14,8 @@ Download it from the [releases](https://github.com/theca-cloud/computer/releases
 
 The app also answers the CLI (`theca --help`). Headless, unpack the archive and put `theca` on your `PATH` (`sudo install theca-headless-*/theca /usr/local/bin/`), then `theca login`. Linux builds run on Ubuntu 22.04 and Debian 12 or newer.
 
+The app needs a Theca server on the community edition 1.4.4 or later (`core` 1.4.0): it says so when logging in to an older one.
+
 ### Opening an unsigned app
 
 The apps aren't signed by Apple or Microsoft yet, so the first time:
