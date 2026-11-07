@@ -23,8 +23,10 @@ export type Pair = {
 	path: string;
 	paused: boolean;
 	stopped: string | null;
+	folder_stop: boolean;
 	writable: boolean;
 	activity: string;
+	error: string | null;
 	synced_at: string | null;
 };
 
@@ -98,7 +100,11 @@ export function follow(): () => void {
 	const unlisten = listen<Update>('update', ({ payload }) => {
 		if (payload.kind === 'activity') {
 			const pair = app.status?.pairs.find((p) => p.id === payload.pair);
-			if (pair) pair.activity = payload.activity;
+			if (pair) {
+				pair.activity = payload.activity;
+				// An activity ends the error the engine stopped on.
+				pair.error = null;
+			}
 			// Its last synced time changed with it.
 			if (payload.activity === 'up to date') void attempt(reload);
 		} else if (payload.kind === 'offered') {

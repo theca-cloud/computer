@@ -86,6 +86,8 @@
 	function status(pair: Pair): { text: string; variant: BadgeVariant } {
 		if (pair.stopped) return { text: m.stopped({ reason: pair.stopped }), variant: 'destructive' };
 		if (pair.paused) return { text: m.paused(), variant: 'secondary' };
+		if (pair.error)
+			return { text: m.activity_error({ reason: pair.error }), variant: 'destructive' };
 		const activities: Record<string, () => { text: string; variant: BadgeVariant }> = {
 			waiting: () => ({ text: m.activity_waiting(), variant: 'secondary' }),
 			syncing: () => ({ text: m.activity_syncing(), variant: 'default' }),
@@ -99,9 +101,6 @@
 
 	const setPaused = (pair: Pair, paused: boolean) =>
 		attempt(() => invoke('set_paused', { pair: pair.id, paused }));
-
-	/** Stopped over its folder (missing, trashed, unreadable): not the library's fault. */
-	const folderStop = (reason: string) => !['library deleted', 'access removed'].includes(reason);
 
 	/** Points a stopped pair at its folder, moved or another one (confirmed). */
 	async function locate(pair: Pair) {
@@ -236,7 +235,7 @@
 									>
 										{pair.paused ? m.resume() : m.pause()}
 									</Button>
-								{:else if folderStop(pair.stopped)}
+								{:else if pair.folder_stop}
 									<Button
 										size="sm"
 										variant="ghost"

@@ -2,30 +2,7 @@
 
 The Theca app for macOS, Windows and Linux: local folders kept identical to Theca libraries, both ways. A tray app with a small window, or a CLI and daemon (`theca`) for servers.
 
-## Install
-
-Download it from the [releases](https://github.com/theca-cloud/computer/releases), for your system and processor (`arm64`: Apple Silicon, ARM servers and Raspberry Pis; `x86_64`: Intel and AMD):
-
-| | The app | Headless (servers) |
-|---|---|---|
-| macOS | `theca-<version>-macos-<arch>.dmg`: open it, drag Theca to Applications | `theca-headless-<version>-macos-<arch>.tar.gz` |
-| Windows | `theca-<version>-windows-x86_64.exe`: installs for you alone, no admin | `theca-headless-<version>-windows-x86_64.zip` |
-| Linux | `theca-<version>-linux-<arch>.deb` (Debian, Ubuntu: `sudo apt install ./theca-….deb`), or the `.AppImage` anywhere else (`chmod +x`, then run it) | `theca-headless-<version>-linux-<arch>.tar.gz` |
-
-The app also answers the CLI (`theca --help`). Headless, unpack the archive and put `theca` on your `PATH` (`sudo install theca-headless-*/theca /usr/local/bin/`), then `theca login`. Linux builds run on Ubuntu 22.04 and Debian 12 or newer.
-
-The app needs a Theca server on the community edition 1.4.4 or later (`core` 1.4.0): it says so when logging in to an older one.
-
-### Opening an unsigned app
-
-The apps aren't signed by Apple or Microsoft yet, so the first time:
-
-- **macOS** says Apple could not verify Theca. Open **System Settings → Privacy & Security**, scroll to Security, click **Open Anyway** next to Theca, and confirm.
-- **Windows** SmartScreen says "Windows protected your PC": click **More info**, then **Run anyway**.
-
-### Checking a download
-
-Each release lists the SHA-256 of every file in `SHA256SUMS`: `shasum -a 256 -c SHA256SUMS --ignore-missing` (macOS), `sha256sum -c SHA256SUMS --ignore-missing` (Linux), `Get-FileHash <file>` (Windows, compared by eye).
+Installing it, the app password and the keychain, headless use (commands, exit codes, environment variables, where it keeps its state): **[USING.md](USING.md)**, also on [theca.rs/computer](https://theca.rs/computer).
 
 ## Development
 

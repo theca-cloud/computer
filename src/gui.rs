@@ -331,7 +331,7 @@ fn notify_stops(app: &AppHandle) {
             continue;
         }
         let path = p.path.display().to_string();
-        let what = if p.stopped.is_none() {
+        let what = if p.stop.is_none() {
             "Theca tries again; the files stay."
         } else if p.stopped_for_its_folder() {
             "Its files stay; it syncs again once the folder is back, or open Theca to locate it."
@@ -366,7 +366,7 @@ fn refresh_tray(app: &AppHandle) {
     };
     let (overall, summary) = if accounts.iter().any(|a| a.signed_out) {
         (Overall::Attention, "Signed out: open Theca".to_owned())
-    } else if pairs.iter().any(|p| p.stopped.is_some()) {
+    } else if pairs.iter().any(|p| p.stop.is_some()) {
         (Overall::Attention, "A folder stopped syncing".to_owned())
     } else if pairs
         .iter()
@@ -417,9 +417,14 @@ struct PairView {
     library_name: String,
     path: PathBuf,
     paused: bool,
+    /// Why it stopped, as the user is told.
     stopped: Option<String>,
+    /// Stopped over its folder: the user locates it, or tries again.
+    folder_stop: bool,
     writable: bool,
     activity: String,
+    /// The account's engine stopped on it, until the pair's next activity.
+    error: Option<String>,
     synced_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -481,15 +486,17 @@ fn status(app: AppHandle) -> Answer<Status> {
             .map_err(err)?
             .into_iter()
             .map(|p| PairView {
+                folder_stop: p.stopped_for_its_folder(),
                 id: p.id,
                 account: p.account,
                 library: p.library,
                 library_name: p.library_name,
                 path: p.path,
                 paused: p.paused,
-                stopped: p.stopped,
+                stopped: p.stop.as_ref().map(|s| s.reason().to_owned()),
                 writable: p.writable,
                 activity: p.activity,
+                error: p.error,
                 synced_at: p.synced_at,
             })
             .collect(),
@@ -571,7 +578,7 @@ async fn login(
     let background = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = state(&background);
-        let result = ops::login(&state, &instance, &device, folder, None, |flow| {
+        let result = ops::login(&state, &instance, &device, folder, None, true, |flow| {
             let _ = shown.send(flow.clone());
         })
         .await;

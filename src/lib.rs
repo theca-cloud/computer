@@ -5,10 +5,26 @@ pub mod engine;
 pub mod exec;
 #[cfg(feature = "gui")]
 pub mod gui;
+pub mod keychain;
 pub mod local;
 pub mod ops;
 pub mod plan;
 pub mod state;
+
+/// The CLI's exit codes besides 0, success. Indications only: what 1.x
+/// promises is 0 or not (`USING.md` lists them).
+pub mod exit {
+    pub const ERROR: u8 = 1;
+    /// Invalid arguments: clap's own.
+    pub const USAGE: u8 = 2;
+    /// `status`: a pair isn't syncing (stopped, or its account's engine on an
+    /// error).
+    pub const NOT_SYNCING: u8 = 3;
+    /// An account is signed out, or its app password is gone from the
+    /// keychain: log in again.
+    pub const SIGNED_OUT: u8 = 4;
+    pub const ALL: [u8; 4] = [ERROR, USAGE, NOT_SYNCING, SIGNED_OUT];
+}
 
 /// Aborts the process at a named point when `THECA_CRASH_AT` names it
 /// (`downloaded`, or `downloaded#2` for its second time): the crash tests'

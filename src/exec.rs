@@ -1248,9 +1248,10 @@ mod tests {
             position: Some(1),
             position_event: None,
             paused: false,
-            stopped: None,
+            stop: None,
             writable: true,
             activity: String::new(),
+            error: None,
             synced_at: None,
         }
     }

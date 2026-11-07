@@ -49,7 +49,7 @@ ui/node_modules/.bin/tauri build --bundles "$bundles" --config '{"build":{"befor
 # Headless: no GUI library linked (ADR 0004).
 cargo build --release --target-dir target/headless
 mkdir "$tmp/$headless"
-cp LICENSE README.md "$tmp/$headless/"
+cp LICENSE README.md USING.md "$tmp/$headless/"
 
 case $os in
 macos)

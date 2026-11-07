@@ -40,4 +40,9 @@ jobs:
         run: |
           if [ "$RUNNER_OS" = Linux ]; then scripts/dev.sh; else ci/postgres.sh; fi
       - run: scripts/ci.sh lint
+      # The tests' app passwords in the real OS keychain where the runner has
+      # one that never prompts (macOS, Windows); Linux runners have no Secret
+      # Service: the in-memory one (tests/common, keychain()).
       - run: scripts/ci.sh test
+        env:
+          THECA_TEST_KEYCHAIN: ${{ runner.os != 'Linux' && 'os' || 'mock' }}

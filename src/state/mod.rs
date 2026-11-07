@@ -1,6 +1,8 @@
-//! The client's state: one SQLite file holding everything it keeps (accounts,
+//! The client state: one SQLite file holding everything it keeps (accounts,
 //! sync pairs, what was last in sync, notices). No config file: settings
-//! change through the CLI or the GUI (docs/decisions.md, Sync).
+//! change through the CLI or the GUI (docs/decisions.md, Sync). Forward-only:
+//! a state an older version wrote is migrated, one step per version
+//! (`migrations/`), a copy kept first.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -8,12 +10,14 @@ use std::sync::{Mutex, MutexGuard};
 use tokio::sync::broadcast;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use theca_common::api;
 use uuid::Uuid;
 
-/// The schema, rewritten in place until the client's 1.0; then forward-only,
-/// one step per `user_version`.
+mod migrations;
+
+/// A fresh state's schema, at `VERSION`. A change to it is a new migration
+/// step building the same (the upgrade test compares them).
 const SCHEMA: &str = r#"
 -- An account on an instance, with this device's app password.
 CREATE TABLE account (
@@ -22,7 +26,10 @@ CREATE TABLE account (
     uuid TEXT NOT NULL,
     email TEXT NOT NULL,
     device TEXT NOT NULL,
-    password TEXT NOT NULL,
+    -- The app password when it's kept here (no keychain, or `--no-keyring`).
+    password TEXT,
+    -- Else the name of its entry in the OS keychain (a random ID).
+    secret TEXT CHECK ((password IS NULL) <> (secret IS NULL)),
     default_folder TEXT NOT NULL,
     -- Libraries up to this size (bytes) are synced when they appear; NULL: never.
     auto_sync_limit INTEGER,
@@ -48,11 +55,17 @@ CREATE TABLE pair (
     -- a backup reuses the numbers past its restore point.
     position_event TEXT,
     paused INTEGER NOT NULL DEFAULT 0,
-    -- Why it stopped (missing folder, library deleted, access removed...).
-    stopped TEXT,
+    -- Why it stopped: its folder (missing, replaced, unreadable...), its
+    -- library deleted, or its access removed. NULL: it runs.
+    stop TEXT CHECK (stop IN ('folder', 'library_deleted', 'access_removed')),
+    -- What the user is told about a stop for its folder.
+    stop_detail TEXT,
     writable INTEGER NOT NULL DEFAULT 1,
     -- What it's doing, for status: written by the engine.
     activity TEXT NOT NULL DEFAULT 'waiting',
+    -- The account's engine stopped on this error (tried again every 30 s),
+    -- until its next activity.
+    error TEXT,
     synced_at INTEGER,
     UNIQUE (account, library)
 );
@@ -113,7 +126,15 @@ CREATE TABLE notice (
 );
 "#;
 
-const VERSION: i32 = 2;
+const VERSION: i32 = 3;
+
+/// The oldest version migrated (`0.2.0`'s): before it, the schema was
+/// rewritten in place, and a state is deleted by hand.
+const OLDEST: i32 = 2;
+
+/// The migration steps, from `OLDEST` + 1 up to `VERSION`: one per version,
+/// never edited once released (`scripts/ci.sh`).
+const STEPS: [fn(&rusqlite::Transaction<'_>) -> Result<()>; 1] = [migrations::v3::migrate];
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
@@ -126,6 +147,8 @@ pub enum StateError {
         .0.display()
     )]
     Older(PathBuf),
+    #[error("the state database's migration failed (it is as it was): {0}")]
+    Migration(String),
 }
 
 pub type Result<T> = std::result::Result<T, StateError>;
@@ -174,29 +197,35 @@ pub fn default_path() -> Option<PathBuf> {
 }
 
 impl State {
-    /// Opens (creating) the database at `path`; only the user can read it (it
-    /// holds app passwords).
+    /// Opens (creating) the database at `path`, migrating one an older
+    /// version wrote; only the user can read it (it may hold app passwords).
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| {
                 rusqlite::Error::InvalidPath(PathBuf::from(format!("{}: {e}", dir.display())))
             })?;
         }
-        let db = Connection::open(path)?;
+        let mut db = Connection::open(path)?;
         restrict(path);
-        db.pragma_update(None, "journal_mode", "wal")?;
-        db.pragma_update(None, "foreign_keys", true)?;
         db.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Refused before anything is written to it.
         let version: i32 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
+        match version {
+            0 | VERSION => {}
+            newer if newer > VERSION => return Err(StateError::Newer(newer)),
+            older if older < OLDEST => return Err(StateError::Older(path.to_owned())),
+            _ => {}
+        }
+        db.pragma_update(None, "journal_mode", "wal")?;
         match version {
             0 => {
                 db.execute_batch(SCHEMA)?;
                 db.pragma_update(None, "user_version", VERSION)?;
             }
             VERSION => {}
-            older if older < VERSION => return Err(StateError::Older(path.to_owned())),
-            newer => return Err(StateError::Newer(newer)),
+            _ => migrate(&mut db, path)?,
         }
+        db.pragma_update(None, "foreign_keys", true)?;
         Ok(Self {
             connection: Mutex::new(db),
             updates: None,
@@ -240,6 +269,66 @@ impl State {
     }
 }
 
+/// Brings an older state up to `VERSION`, every step in one transaction (a
+/// crash leaves it as it was), after keeping a copy of it.
+fn migrate(db: &mut Connection, path: &Path) -> Result<()> {
+    // A step rebuilding a table drops the old one: its foreign keys must not
+    // cascade (checked once the steps are done).
+    db.pragma_update(None, "foreign_keys", false)?;
+    // The write lock first: another process opening it meanwhile (the app, a
+    // `theca status`) waits here, then finds it migrated.
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let from: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    match from {
+        VERSION => return Ok(()),
+        newer if newer > VERSION => return Err(StateError::Newer(newer)),
+        _ => {}
+    }
+    // Through a connection of its own, which reads the state as it was
+    // before this transaction.
+    keep_copy(&Connection::open(path)?, path, from)?;
+    for version in from + 1..=VERSION {
+        STEPS[(version - OLDEST - 1) as usize](&tx)?;
+    }
+    let broken: i64 = tx.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+        r.get(0)
+    })?;
+    if broken > 0 {
+        return Err(StateError::Migration(format!(
+            "{broken} rows lost their parent"
+        )));
+    }
+    tx.pragma_update(None, "user_version", VERSION)?;
+    tx.commit()?;
+    tracing::info!(path = %path.display(), "the state migrated from version {from} to {VERSION}");
+    Ok(())
+}
+
+/// A copy of the state before it's migrated (`state.sqlite.v2`), the latest
+/// only: a migration's bug would otherwise lose the bases, of which the state
+/// holds the only copy. Without the app passwords: the migration may move them
+/// into the keychain, and a copy mustn't keep them in plain text, not even in
+/// the pages SQLite frees (`secure_delete` overwrites them). Restoring it is by
+/// hand, then a login.
+fn keep_copy(db: &Connection, path: &Path, from: i32) -> Result<()> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let copy = |version: i32| path.with_file_name(format!("{name}.v{version}"));
+    for older in OLDEST..=from {
+        let _ = std::fs::remove_file(copy(older));
+    }
+    let to = copy(from);
+    // Readable by the user alone before anything is written into it.
+    std::fs::File::create(&to).map_err(|e| {
+        rusqlite::Error::InvalidPath(PathBuf::from(format!("{}: {e}", to.display())))
+    })?;
+    restrict(&to);
+    db.execute("VACUUM INTO ?1", [to.to_string_lossy()])?;
+    let copied = Connection::open(&to)?;
+    copied.pragma_update(None, "secure_delete", true)?;
+    copied.execute("UPDATE account SET password = ''", [])?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn restrict(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -258,10 +347,19 @@ pub struct Account {
     pub uuid: Uuid,
     pub email: String,
     pub device: String,
-    pub password: String,
+    pub password: Password,
     pub default_folder: PathBuf,
     pub auto_sync_limit: Option<i64>,
     pub signed_out: bool,
+}
+
+/// Where an account's app password is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Password {
+    /// In the OS keychain, under this entry (`keychain`).
+    Keychain(String),
+    /// In the state itself: no keychain, or the login asked for it.
+    InState(String),
 }
 
 /// A sync pair, as stored.
@@ -277,34 +375,69 @@ pub struct Pair {
     pub position: Option<i64>,
     pub position_event: Option<Uuid>,
     pub paused: bool,
-    pub stopped: Option<String>,
+    pub stop: Option<Stop>,
     pub writable: bool,
     /// What the engine is doing with it, and when it last finished a round.
     pub activity: String,
+    /// The account's engine stopped on this error, until its next activity.
+    pub error: Option<String>,
     pub synced_at: Option<DateTime<Utc>>,
 }
 
-/// Why a pair stops for its library (it resumes by itself when the library
-/// comes back); every other stop is about its folder.
-pub const LIBRARY_DELETED: &str = "library deleted";
-pub const ACCESS_REMOVED: &str = "access removed";
+/// Why a pair stopped: stored as a kind, so that rewording what the user is
+/// told never changes what the code does with it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stop {
+    /// Its local folder (missing, replaced, unreadable, in the trash...): the
+    /// user locates it, or it resumes once the folder is back.
+    Folder(String),
+    /// It resumes by itself once the library comes back.
+    LibraryDeleted,
+    AccessRemoved,
+}
+
+impl Stop {
+    /// What the user is told.
+    pub fn reason(&self) -> &str {
+        match self {
+            Stop::Folder(why) => why,
+            Stop::LibraryDeleted => "library deleted",
+            Stop::AccessRemoved => "access removed",
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Stop::Folder(_) => "folder",
+            Stop::LibraryDeleted => "library_deleted",
+            Stop::AccessRemoved => "access_removed",
+        }
+    }
+
+    fn from_columns(kind: Option<String>, detail: Option<String>) -> Option<Stop> {
+        Some(match kind?.as_str() {
+            "library_deleted" => Stop::LibraryDeleted,
+            "access_removed" => Stop::AccessRemoved,
+            _ => Stop::Folder(detail.unwrap_or_default()),
+        })
+    }
+}
 
 impl Pair {
     /// Why it syncs nothing until someone acts, or a retry succeeds: stopped,
     /// or its account's engine stopped on an error (started again within
     /// 30 s, `engine::stopped`).
     pub fn not_syncing(&self) -> Option<&str> {
-        self.stopped
-            .as_deref()
-            .or_else(|| self.activity.strip_prefix("error: "))
+        self.stop
+            .as_ref()
+            .map(Stop::reason)
+            .or(self.error.as_deref())
     }
 
     /// Stopped because of its local folder (missing, in the trash,
     /// unreadable): the user locates it, or tries again.
     pub fn stopped_for_its_folder(&self) -> bool {
-        self.stopped
-            .as_deref()
-            .is_some_and(|why| why != LIBRARY_DELETED && why != ACCESS_REMOVED)
+        matches!(self.stop, Some(Stop::Folder(_)))
     }
 }
 
@@ -335,6 +468,7 @@ pub struct RemoteState {
 #[derive(Debug, Clone)]
 pub struct Notice {
     pub id: i64,
+    pub account: Option<i64>,
     pub pair: Option<i64>,
     pub at: DateTime<Utc>,
     pub level: String,
@@ -351,7 +485,8 @@ impl State {
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let db = self.db();
         let mut query = db.prepare(
-            "SELECT id, instance, uuid, email, device, password, default_folder, auto_sync_limit, signed_out
+            "SELECT id, instance, uuid, email, device, password, secret, default_folder,
+                    auto_sync_limit, signed_out
              FROM account ORDER BY id",
         )?;
         let rows = query.query_map([], |r| {
@@ -361,10 +496,14 @@ impl State {
                 uuid: uuid(r.get(2)?),
                 email: r.get(3)?,
                 device: r.get(4)?,
-                password: r.get(5)?,
-                default_folder: PathBuf::from(r.get::<_, String>(6)?),
-                auto_sync_limit: r.get(7)?,
-                signed_out: r.get(8)?,
+                // The schema holds one or the other.
+                password: match r.get::<_, Option<String>>(5)? {
+                    Some(password) => Password::InState(password),
+                    None => Password::Keychain(r.get(6)?),
+                },
+                default_folder: PathBuf::from(r.get::<_, String>(7)?),
+                auto_sync_limit: r.get(8)?,
+                signed_out: r.get(9)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -377,18 +516,23 @@ impl State {
     /// Adds an account, or replaces the app password of the same account on
     /// the same instance (signing in again). Its ID.
     pub fn save_account(&self, a: &Account) -> Result<i64> {
+        let (password, secret) = match &a.password {
+            Password::InState(password) => (Some(password), None),
+            Password::Keychain(secret) => (None, Some(secret)),
+        };
         self.db().execute(
-            "INSERT INTO account (instance, uuid, email, device, password, default_folder, auto_sync_limit)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO account (instance, uuid, email, device, password, secret, default_folder, auto_sync_limit)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT (instance, uuid) DO UPDATE SET
                 email = excluded.email, device = excluded.device, password = excluded.password,
-                signed_out = 0",
+                secret = excluded.secret, signed_out = 0",
             params![
                 a.instance,
                 a.uuid.to_string(),
                 a.email,
                 a.device,
-                a.password,
+                password,
+                secret,
                 a.default_folder.to_string_lossy(),
                 a.auto_sync_limit
             ],
@@ -437,7 +581,7 @@ impl State {
         let db = self.db();
         let mut query = db.prepare(
             "SELECT id, account, library, root, library_name, path, root_file_id, position,
-                    paused, stopped, writable, activity, synced_at, position_event
+                    paused, stop, writable, activity, synced_at, position_event, stop_detail, error
              FROM pair ORDER BY id",
         )?;
         let rows = query.query_map([], |r| {
@@ -451,9 +595,10 @@ impl State {
                 root_file_id: r.get(6)?,
                 position: r.get(7)?,
                 paused: r.get(8)?,
-                stopped: r.get(9)?,
+                stop: Stop::from_columns(r.get(9)?, r.get(14)?),
                 writable: r.get(10)?,
                 activity: r.get(11)?,
+                error: r.get(15)?,
                 synced_at: r
                     .get::<_, Option<i64>>(12)?
                     .and_then(DateTime::from_timestamp_millis),
@@ -516,10 +661,14 @@ impl State {
         Ok(())
     }
 
-    pub fn set_stopped(&self, pair: i64, why: Option<&str>) -> Result<()> {
+    pub fn set_stopped(&self, pair: i64, stop: Option<&Stop>) -> Result<()> {
+        let detail = match stop {
+            Some(Stop::Folder(why)) => Some(why.as_str()),
+            _ => None,
+        };
         self.db().execute(
-            "UPDATE pair SET stopped = ?2 WHERE id = ?1",
-            params![pair, why],
+            "UPDATE pair SET stop = ?2, stop_detail = ?3 WHERE id = ?1",
+            params![pair, stop.map(Stop::kind), detail],
         )?;
         self.publish(Update::Pairs);
         Ok(())
@@ -534,9 +683,11 @@ impl State {
         Ok(())
     }
 
+    /// What the engine does with the pair now (an error it stopped on is
+    /// over).
     pub fn set_activity(&self, pair: i64, activity: &str, synced: bool) -> Result<()> {
         self.db().execute(
-            "UPDATE pair SET activity = ?2,
+            "UPDATE pair SET activity = ?2, error = NULL,
                     synced_at = CASE WHEN ?3 THEN ?4 ELSE synced_at END
              WHERE id = ?1",
             params![pair, activity, synced, Utc::now().timestamp_millis()],
@@ -545,6 +696,17 @@ impl State {
             pair,
             activity: activity.to_owned(),
         });
+        Ok(())
+    }
+
+    /// The account's engine stopped on `error`: said on the pair until its
+    /// next activity.
+    pub fn set_error(&self, pair: i64, error: &str) -> Result<()> {
+        self.db().execute(
+            "UPDATE pair SET error = ?2 WHERE id = ?1",
+            params![pair, error],
+        )?;
+        self.publish(Update::Pairs);
         Ok(())
     }
 
@@ -789,11 +951,13 @@ impl State {
     pub fn notices(&self) -> Result<Vec<Notice>> {
         let db = self.db();
         let mut query = db.prepare(
-            "SELECT id, pair, at, level, path, message, undo FROM notice ORDER BY at DESC, id DESC LIMIT 500",
+            "SELECT id, pair, at, level, path, message, undo, account
+             FROM notice ORDER BY at DESC, id DESC LIMIT 500",
         )?;
         let rows = query.query_map([], |r| {
             Ok(Notice {
                 id: r.get(0)?,
+                account: r.get(7)?,
                 pair: r.get(1)?,
                 at: DateTime::from_timestamp_millis(r.get(2)?).unwrap_or_default(),
                 level: r.get(3)?,
@@ -889,31 +1053,109 @@ mod tests {
     use super::*;
 
     /// A pair syncs nothing when stopped, or when its account's engine
-    /// stopped on an error (its activity says so until a retry goes through).
+    /// stopped on an error (said until a retry goes through).
     #[test]
     fn not_syncing_when_stopped_or_its_engine_failed() {
         let state = State::memory().unwrap();
         let mut p = state.pair(pair(&state)).unwrap().unwrap();
         assert_eq!(p.not_syncing(), None);
-        p.activity = "error: the state database: disk full".into();
+        p.error = Some("the state database: disk full".into());
         assert_eq!(p.not_syncing(), Some("the state database: disk full"));
-        p.stopped = Some("x is missing".into());
+        p.stop = Some(Stop::Folder("x is missing".into()));
         assert_eq!(p.not_syncing(), Some("x is missing"));
     }
 
-    /// A state an older version wrote is refused, naming the file to delete:
-    /// its schema was rewritten in place since (until the client's 1.0).
+    /// An error the engine stopped on is over at the pair's next activity.
     #[test]
-    fn an_older_state_is_refused() {
+    fn an_error_lasts_until_the_next_activity() {
+        let state = State::memory().unwrap();
+        let p = pair(&state);
+        state.set_error(p, "boom").unwrap();
+        assert_eq!(
+            state.pair(p).unwrap().unwrap().error.as_deref(),
+            Some("boom")
+        );
+        state.set_activity(p, "syncing", false).unwrap();
+        assert_eq!(state.pair(p).unwrap().unwrap().error, None);
+    }
+
+    /// A stop is read back as it was set, its kind and what the user is told.
+    #[test]
+    fn a_stop_round_trips() {
+        let state = State::memory().unwrap();
+        let p = pair(&state);
+        for stop in [
+            Stop::Folder("the folder is missing".into()),
+            Stop::LibraryDeleted,
+            Stop::AccessRemoved,
+        ] {
+            state.set_stopped(p, Some(&stop)).unwrap();
+            assert_eq!(state.pair(p).unwrap().unwrap().stop, Some(stop));
+        }
+        state.set_stopped(p, None).unwrap();
+        assert_eq!(state.pair(p).unwrap().unwrap().stop, None);
+    }
+
+    /// A state from before the first migrated version (`0.1.0`'s) is refused,
+    /// naming the file to delete: its schema was rewritten in place since.
+    #[test]
+    fn a_state_older_than_migrations_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.sqlite");
         Connection::open(&path)
             .unwrap()
-            .pragma_update(None, "user_version", VERSION - 1)
+            .pragma_update(None, "user_version", OLDEST - 1)
             .unwrap();
         let e = State::open(&path).err().expect("refused");
         assert!(matches!(e, StateError::Older(_)), "{e}");
         assert!(e.to_string().contains(&path.display().to_string()), "{e}");
+    }
+
+    /// The copy kept before migrating holds no app password, not even in the
+    /// pages SQLite freed (a long one spills onto pages of its own).
+    #[test]
+    fn the_copy_before_migrating_keeps_no_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        let db = Connection::open(&path).unwrap();
+        let password = "secret-".repeat(1000);
+        db.execute_batch("CREATE TABLE account (id INTEGER PRIMARY KEY, password TEXT NOT NULL)")
+            .unwrap();
+        db.execute("INSERT INTO account (password) VALUES (?1)", [&password])
+            .unwrap();
+        keep_copy(&db, &path, OLDEST).unwrap();
+        let copy = std::fs::read(dir.path().join(format!("state.sqlite.v{OLDEST}"))).unwrap();
+        assert!(
+            !copy
+                .windows(7 * 10)
+                .any(|w| w == &password.as_bytes()[..70])
+        );
+        let kept: String = Connection::open(dir.path().join(format!("state.sqlite.v{OLDEST}")))
+            .unwrap()
+            .query_row("SELECT password FROM account", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, "");
+    }
+
+    /// A state another process migrated meanwhile isn't migrated again, and
+    /// its copy isn't replaced by the migrated state.
+    #[test]
+    fn a_state_migrated_meanwhile_is_left_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        State::open(&path).unwrap();
+        let mut db = Connection::open(&path).unwrap();
+        migrate(&mut db, &path).unwrap();
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            !files
+                .iter()
+                .any(|f| f.to_string_lossy().contains(".sqlite.v")),
+            "{files:?}"
+        );
     }
 
     fn pair(state: &State) -> i64 {
@@ -924,7 +1166,7 @@ mod tests {
                 uuid: Uuid::from_u128(1),
                 email: "a@x".into(),
                 device: "d".into(),
-                password: "p".into(),
+                password: Password::InState("p".into()),
                 default_folder: "/tmp".into(),
                 auto_sync_limit: None,
                 signed_out: false,
@@ -942,9 +1184,10 @@ mod tests {
                 position: None,
                 position_event: None,
                 paused: false,
-                stopped: None,
+                stop: None,
                 writable: true,
                 activity: String::new(),
+                error: None,
                 synced_at: None,
             })
             .unwrap()

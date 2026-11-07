@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.0.0] - 2026-11-07
+
+The first stable release: from now on, what the app keeps only moves forward, and its commands keep working within 1.x.
+
+### Breaking
+
+- `theca add --auto-sync-mb` is gone: `theca account <account> --auto-sync-mb <n>` sets it, and `--folder` an account's default folder.
+- The app's identifier is now `rs.theca.computer`.
+
+### Features
+
+- What the app keeps (its state file) is upgraded by every new version, 0.2.0's included: no more deleting it by hand. A copy of the previous one is kept beside it (`state.sqlite.v2`), without the app password.
+- The app password moves into the system's keychain: the login keychain on macOS, the Credential Manager on Windows, the Secret Service on Linux. Where there is none (most headless servers), it stays in the state file and the login says so; `theca login --no-keyring` (`THECA_NO_KEYRING`) keeps it there. Until the app is signed, each new version asks once on macOS to read it: click Always Allow.
+- `theca account` shows and changes an account's settings.
+- Exit codes: 3 when `theca status` finds a folder not syncing, 4 when an account must log in again. Only 0 or not is promised; the codes are indications.
+- [USING.md](https://github.com/theca-cloud/computer/blob/1.0.0/USING.md): installing it, the app password, headless use.
+
 ## [0.2.0] - 2026-11-07
 
 ### Breaking

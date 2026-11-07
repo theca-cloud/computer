@@ -1,7 +1,8 @@
 #!/usr/bin/env sh
 # Every CI check, run natively: `scripts/ci.sh` runs them all; `scripts/ci.sh
 # <step>` runs one, as the Woodpecker steps do:
-#   lint  formatting, clippy (warnings are errors), the app's page, the app built
+#   lint  released migrations untouched, formatting, clippy (warnings are
+#         errors), the app's page, the app built
 #   test  every test (the end-to-end ones need a Postgres, scripts/dev.sh's or
 #         DATABASE_URL's, and the server, built from the pinned core)
 #   app   the app driven through its window (Linux: tauri-driver, under a
@@ -39,7 +40,30 @@ server() {
     export THECA_SERVER
 }
 
+# The last release's tag (none yet: nothing to guard).
+last_release() {
+    git fetch -q --tags origin 2>/dev/null || true
+    git tag --list | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1
+}
+
+# What a released client state depends on is never edited nor deleted
+# (decisions.md, Sync): its migration steps, and the release states the
+# upgrade test reads back. Against the working tree, so an uncommitted edit
+# fails too; renames count as a deletion.
+released_guard() {
+    last=$(last_release)
+    [ -n "$last" ] || return 0
+    edited=$(git diff --name-only --no-renames --diff-filter=MD "$last" -- \
+        'src/state/migrations/v*.rs' tests/upgrade)
+    if [ -n "$edited" ]; then
+        echo "released migration steps or states edited or deleted since $last: add a new step instead" >&2
+        echo "$edited" >&2
+        exit 1
+    fi
+}
+
 if [ "$step" = all ] || [ "$step" = lint ]; then
+    released_guard
     cargo fmt --check
     cargo clippy --features crash-points --all-targets -- -D warnings
     # The app: its page (formatting, lint, types), built, then embedded in the
