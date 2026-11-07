@@ -253,6 +253,7 @@ pub async fn add(
         path,
         root_file_id: None,
         position: None,
+        position_event: None,
         paused: false,
         stopped: None,
         writable: found.writable,
@@ -260,7 +261,7 @@ pub async fn add(
         synced_at: None,
     };
     pair.id = state.add_pair(&pair)?;
-    state.set_pair_path(pair.id, &pair.path, local::file_id(&pair.path).as_deref())?;
+    state.set_pair_path(pair.id, &pair.path, local::root_id(&pair.path).as_deref())?;
     Ok(pair)
 }
 
@@ -366,39 +367,36 @@ pub fn has_room(path: &Path, size: i64) -> bool {
 pub fn delete_synced_files(pair: &Pair, entries: &[crate::state::Entry]) -> usize {
     // Not the pair's folder any more (replaced, a disk unmounted): what is
     // there now was never synced.
-    if local::file_id(&pair.path) != pair.root_file_id {
+    if local::root_id(&pair.path) != pair.root_file_id {
         return entries.iter().filter(|e| e.is_file).count();
     }
     let by_node: std::collections::HashMap<Uuid, &crate::state::Entry> =
         entries.iter().map(|e| (e.node, e)).collect();
-    let names = |mut node: Uuid| {
-        let mut names = Vec::new();
+    // A node's names and file IDs from the root.
+    let steps = |mut node: Uuid| {
+        let mut steps = Vec::new();
         while node != pair.root {
             let e = by_node.get(&node)?;
-            names.push(e.name.clone());
+            steps.push((e.name.as_str(), e.file_id.as_deref()));
             node = e.parent;
         }
-        names.reverse();
-        Some(names)
+        steps.reverse();
+        Some(steps)
     };
     for e in entries.iter().filter(|e| e.is_file) {
-        let Some(names) = names(e.node) else { continue };
-        let path = local::resolve(&pair.path, &names);
+        let Some(steps) = steps(e.node) else { continue };
+        let path = local::resolve(&pair.path, &steps);
         // The engine's whole fingerprint: another file with the same size
         // and mtime (a copy restoring times, an atomic save) was never synced.
-        if let Ok(meta) = std::fs::symlink_metadata(&path)
-            && meta.len() as i64 == e.size
-            && local::mtime(&meta) == e.mtime
-            && local::file_id(&path) == e.file_id
-        {
+        if local::unchanged(&path, e.size, e.mtime, e.file_id.as_deref()) {
             let _ = std::fs::remove_file(&path);
         }
     }
     // Folders, deepest first, if empty.
-    let mut folders: Vec<Vec<String>> = entries
+    let mut folders: Vec<Vec<(&str, Option<&str>)>> = entries
         .iter()
         .filter(|e| !e.is_file)
-        .filter_map(|e| names(e.node))
+        .filter_map(|e| steps(e.node))
         .collect();
     folders.sort_by_key(|f| std::cmp::Reverse(f.len()));
     for folder in folders {
@@ -478,7 +476,7 @@ pub fn locate(state: &State, pair: &Pair, path: &Path, confirm: bool) -> Result<
         return refused(format!("{} isn't a folder", path.display()));
     }
     check_path(state, path, Some(pair.id))?;
-    let id = local::file_id(path);
+    let id = local::root_id(path);
     let same = id.is_some() && id == pair.root_file_id;
     if !same && !confirm {
         return Ok(Located::Different);
@@ -581,8 +579,9 @@ mod tests {
             root,
             library_name: "Docs".into(),
             path: dir.to_owned(),
-            root_file_id: local::file_id(dir),
+            root_file_id: local::root_id(dir),
             position: Some(1),
+            position_event: None,
             paused: false,
             stopped: None,
             writable: true,
@@ -593,7 +592,9 @@ mod tests {
         state
             .set_pair_path(pair.id, dir, pair.root_file_id.as_deref())
             .unwrap();
-        state.record_remote(pair.id, &[], Some(1)).unwrap();
+        state
+            .record_remote(pair.id, &[], Some(theca_common::api::Position::Seq(1)))
+            .unwrap();
         std::fs::write(dir.join("a.txt"), "synced").unwrap();
         let meta = std::fs::metadata(dir.join("a.txt")).unwrap();
         let entry = crate::state::Entry {

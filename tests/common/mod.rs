@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -100,10 +100,27 @@ pub fn free_port() -> u16 {
 /// to: API calls pass, a chunk of a bigger file never does.
 const CUT_AFTER: usize = 256 * 1024;
 
-/// A TCP proxy on `listen` to the server on `upstream`; `cut` set, every
-/// connection is cut after `CUT_AFTER` bytes either way (a transfer cut mid-
-/// stream, as a network would).
-fn proxy(listen: u16, upstream: u16, cut: Arc<AtomicBool>) {
+/// What the proxy does to connections.
+pub struct Wire {
+    /// Cut each past `CUT_AFTER` bytes either way (a transfer cut mid-stream,
+    /// as a network would).
+    pub cut: AtomicBool,
+    /// Bytes all of them may still carry before stalling, until raised (a
+    /// transfer stalled once some of it went through).
+    pub budget: AtomicUsize,
+}
+
+impl Default for Wire {
+    fn default() -> Self {
+        Self {
+            cut: AtomicBool::new(false),
+            budget: AtomicUsize::new(usize::MAX),
+        }
+    }
+}
+
+/// A TCP proxy on `listen` to the server on `upstream`, as `wire` says.
+fn proxy(listen: u16, upstream: u16, wire: Arc<Wire>) {
     let listener = TcpListener::bind(("127.0.0.1", listen)).unwrap();
     std::thread::spawn(move || {
         for client in listener.incoming().flatten() {
@@ -115,14 +132,21 @@ fn proxy(listen: u16, upstream: u16, cut: Arc<AtomicBool>) {
                 (server, client),
             ];
             for (mut from, mut to) in pumps {
-                let cut = cut.clone();
+                let wire = wire.clone();
                 std::thread::spawn(move || {
                     let mut buffer = [0u8; 16 * 1024];
                     let mut carried = 0;
                     while let Ok(n) = from.read(&mut buffer) {
                         carried += n;
-                        if n == 0 || (cut.load(Ordering::SeqCst) && carried > CUT_AFTER) {
+                        if n == 0 || (wire.cut.load(Ordering::SeqCst) && carried > CUT_AFTER) {
                             break;
+                        }
+                        while wire
+                            .budget
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |b| b.checked_sub(n))
+                            .is_err()
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
                         }
                         if to.write_all(&buffer[..n]).is_err() {
                             break;
@@ -142,8 +166,8 @@ pub async fn server() -> Server {
     server_with(None).await
 }
 
-/// The server, behind a proxy that `cut` breaks connections with when set.
-pub async fn server_with(cut: Option<Arc<AtomicBool>>) -> Server {
+/// The server, behind a proxy doing what `wire` says.
+pub async fn server_with(wire: Option<Arc<Wire>>) -> Server {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_test_writer()
@@ -163,10 +187,10 @@ pub async fn server_with(cut: Option<Arc<AtomicBool>>) -> Server {
     };
     let port = free_port();
     // Behind the proxy, its public address (presigned URLs too) is the proxy's.
-    let public = match cut {
-        Some(cut) => {
+    let public = match wire {
+        Some(wire) => {
             let listen = free_port();
-            proxy(listen, port, cut);
+            proxy(listen, port, wire);
             listen
         }
         None => port,
@@ -228,10 +252,11 @@ pub async fn world() -> World {
     world_on(server().await).await
 }
 
-/// A world whose every connection goes through a proxy `cut` breaks.
-pub async fn world_cut() -> (World, Arc<AtomicBool>) {
-    let cut = Arc::new(AtomicBool::new(false));
-    (world_on(server_with(Some(cut.clone())).await).await, cut)
+/// A world whose every connection goes through a proxy its `Wire` cuts or
+/// stalls.
+pub async fn world_cut() -> (World, Arc<Wire>) {
+    let wire = Arc::new(Wire::default());
+    (world_on(server_with(Some(wire.clone())).await).await, wire)
 }
 
 async fn world_on(server: Server) -> World {

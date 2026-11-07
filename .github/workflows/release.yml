@@ -79,7 +79,7 @@ jobs:
           0.*)
               pre=--prerelease
               # shellcheck disable=SC2016 # the backticks are Markdown, not a command
-              printf '\nA pre-release: keep a backup of the folders you sync. An upgrade may need `theca reset` (the state is rewritten until 1.0).\n' >> notes.md
+              printf '\nA pre-release: keep a backup of the folders you sync. An upgrade may refuse the state an earlier version wrote (it is rewritten until 1.0): delete the file it names, then log in and add your folders again (their files stay, and are adopted).\n' >> notes.md
               ;;
           esac
           gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md --verify-tag $pre

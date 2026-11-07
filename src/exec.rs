@@ -49,6 +49,10 @@ pub struct Executor<'a> {
     client: &'a Client,
     state: &'a State,
     pair: &'a Pair,
+    /// The transfers', cancelled when the process stops.
+    cancel: &'a Cancel,
+    /// The stop: no action starts once set.
+    stopping: &'a tokio::sync::watch::Receiver<bool>,
     base: HashMap<Uuid, Entry>,
     /// Folders this round created on the server, by local path.
     created: HashMap<Vec<String>, Uuid>,
@@ -65,7 +69,13 @@ pub struct Executor<'a> {
 }
 
 impl<'a> Executor<'a> {
-    pub fn new(client: &'a Client, state: &'a State, pair: &'a Pair) -> crate::state::Result<Self> {
+    pub fn new(
+        client: &'a Client,
+        state: &'a State,
+        pair: &'a Pair,
+        cancel: &'a Cancel,
+        stopping: &'a tokio::sync::watch::Receiver<bool>,
+    ) -> crate::state::Result<Self> {
         let base = state
             .entries(pair.id)?
             .into_iter()
@@ -75,6 +85,8 @@ impl<'a> Executor<'a> {
             client,
             state,
             pair,
+            cancel,
+            stopping,
             base,
             created: HashMap::new(),
             unmoved: HashSet::new(),
@@ -85,29 +97,70 @@ impl<'a> Executor<'a> {
         })
     }
 
-    /// A node's names from the root, as the base knows them.
-    fn names(&self, mut node: Uuid) -> Option<Vec<String>> {
-        let mut names = Vec::new();
+    /// A node's base entries from the root down to it (none for the root).
+    fn chain(&self, mut node: Uuid) -> Option<Vec<&Entry>> {
+        let mut chain = Vec::new();
         while node != self.pair.root {
             let e = self.base.get(&node)?;
-            names.push(e.name.clone());
+            chain.push(e);
             node = e.parent;
-            if names.len() > 10_000 {
+            if chain.len() > 10_000 {
                 return None;
             }
         }
-        names.reverse();
-        Some(names)
+        chain.reverse();
+        Some(chain)
     }
 
-    /// A node's local path (the spelling on disk where it differs).
+    /// A node's names from the root, as the base knows them.
+    fn names(&self, node: Uuid) -> Option<Vec<String>> {
+        Some(self.chain(node)?.iter().map(|e| e.name.clone()).collect())
+    }
+
+    /// A node's local path (the spelling on disk where it differs), found by
+    /// the base's names and file IDs.
     fn path(&self, node: Uuid) -> Option<PathBuf> {
-        self.names(node)
-            .map(|n| local::resolve(&self.pair.path, &n))
+        let steps: Vec<_> = self
+            .chain(node)?
+            .iter()
+            .map(|e| (e.name.as_str(), e.file_id.as_deref()))
+            .collect();
+        Some(local::resolve(&self.pair.path, &steps))
     }
 
     fn local(&self, names: &[String]) -> PathBuf {
-        local::resolve(&self.pair.path, names)
+        let steps: Vec<_> = names.iter().map(|n| (n.as_str(), None)).collect();
+        local::resolve(&self.pair.path, &steps)
+    }
+
+    /// An item a first sync matched with a server node spelled otherwise
+    /// (only by case: the key matched, and NFC isn't a difference) is renamed
+    /// to the server's spelling: the folder joining a library takes its
+    /// names. Otherwise the next scan would see a rename of its own, and send
+    /// it to the server for every device. Never over another file (a variant
+    /// beside it on ext4).
+    fn spell_as_server(&self, names: &[String], name: &str) {
+        let Some(own) = names.last() else { return };
+        if Name::new(own).is_ok_and(|n| n.as_str() == name) {
+            return;
+        }
+        let from = self.local(names);
+        let to = from.with_file_name(name);
+        // The same file under another case (a disk ignoring case): renamed
+        // onto itself. Anything else there is never replaced.
+        let same_file = local::file_id(&from).is_some_and(|f| local::file_id(&to) == Some(f));
+        let renamed = if same_file {
+            std::fs::rename(&from, &to)
+        } else {
+            local::rename_new(&from, &to)
+        };
+        if let Err(e) = renamed {
+            self.report(
+                &names.join("/"),
+                &format!("not renamed to the library's {name:?}: {e}"),
+                Level::Error,
+            );
+        }
     }
 
     fn parent(&self, parent: &Parent) -> Option<Uuid> {
@@ -133,7 +186,10 @@ impl<'a> Executor<'a> {
     }
 
     fn fail(&mut self, path: &str, e: &Error) {
-        if e.transient() {
+        if matches!(e, Error::Cancelled) {
+            // The process stopping: nothing failed, the next start goes on.
+            self.outcome.again = true;
+        } else if e.transient() {
             // Retried, and said: a failure that never ends (a storage's
             // certificate gone bad, a server down) must show. Cleared with the
             // path's other notices once it goes through.
@@ -217,6 +273,11 @@ impl<'a> Executor<'a> {
         }
         let mut actions = plan.actions.into_iter().peekable();
         while let Some(first) = actions.next() {
+            // Stopping: what is done is recorded; the rest waits for the next
+            // start.
+            if *self.stopping.borrow() {
+                break;
+            }
             let k = kind(&first);
             if k == 0 {
                 self.one(first).await?;
@@ -252,7 +313,7 @@ impl<'a> Executor<'a> {
         // disk unmounted meanwhile would make the empty mount point the root,
         // and the next round would read it as everything deleted.
         if self.pair.root_file_id.is_none()
-            && let Some(root) = local::file_id(&self.pair.path)
+            && let Some(root) = local::root_id(&self.pair.path)
         {
             self.state
                 .set_pair_path(self.pair.id, &self.pair.path, Some(&root))?;
@@ -304,7 +365,14 @@ impl<'a> Executor<'a> {
         if let Some(dir) = to_path.parent() {
             let _ = create_in(self.pair, dir);
         }
-        match std::fs::rename(&from, &to_path) {
+        // Never over a file put there since the check: the same file only (a
+        // case-only rename on a disk ignoring case).
+        let moved = if same_file {
+            std::fs::rename(&from, &to_path)
+        } else {
+            local::rename_new(&from, &to_path)
+        };
+        match moved {
             Ok(()) => {
                 crate::crash_point("moved-unrecorded");
                 match self.base.get(&node).cloned() {
@@ -370,6 +438,7 @@ impl<'a> Executor<'a> {
         match action {
             Action::Adopt { node, path, state } => {
                 // A folder, or a read-only library's file as downloaded.
+                self.spell_as_server(&path, &state.name);
                 let full = self.local(&path);
                 let meta = std::fs::metadata(&full).ok().filter(|_| state.is_file);
                 self.put(
@@ -498,7 +567,7 @@ impl<'a> Executor<'a> {
             Action::KeepAside { node } => {
                 if let Some(path) = self.path(node) {
                     let aside = aside(&path);
-                    if let Err(e) = std::fs::rename(&path, &aside) {
+                    if let Err(e) = local::rename_new(&path, &aside) {
                         self.report(
                             &path.to_string_lossy(),
                             &format!("not kept aside: {e}"),
@@ -519,8 +588,8 @@ impl<'a> Executor<'a> {
                 };
                 let removed = if e.is_file {
                     match std::fs::symlink_metadata(&path) {
-                        // Still the synced content: deleted.
-                        Ok(m) if m.len() as i64 == e.size && local::mtime(&m) == e.mtime => {
+                        // Still the synced file: deleted.
+                        Ok(_) if local::unchanged(&path, e.size, e.mtime, e.file_id.as_deref()) => {
                             std::fs::remove_file(&path).is_ok()
                         }
                         Ok(_) => false,
@@ -572,10 +641,11 @@ impl<'a> Executor<'a> {
         if actions.is_empty() {
             return Ok(());
         }
-        // (source, target, local names, fingerprint, the entry's place)
+        // (source, target, local names, fingerprint, the entry's place, its
+        // node, a merge)
         let mut jobs = Vec::new();
         for action in actions {
-            let (names, target, place, node) = match action {
+            let (names, target, place, node, merge) = match action {
                 Action::Upload { path, to } => match to {
                     UploadTo::New { parent, name } => {
                         let Some(p) = self.parent(&parent) else {
@@ -589,7 +659,7 @@ impl<'a> Executor<'a> {
                             parent: p,
                             name: valid,
                         };
-                        (path, target, (p, name), None)
+                        (path, target, (p, name), None, false)
                     }
                     UploadTo::Version { node, base } => {
                         let Some(e) = self.base.get(&node) else {
@@ -601,7 +671,7 @@ impl<'a> Executor<'a> {
                             file: node,
                             base,
                         };
-                        (path, target, place, Some(node))
+                        (path, target, place, Some(node), false)
                     }
                 },
                 Action::Merge { node, path, state } => {
@@ -610,7 +680,7 @@ impl<'a> Executor<'a> {
                         file: node,
                         base: state.version,
                     };
-                    (path, target, (state.parent, state.name), Some(node))
+                    (path, target, (state.parent, state.name), Some(node), true)
                 }
                 _ => continue,
             };
@@ -646,12 +716,12 @@ impl<'a> Executor<'a> {
                 local::mtime(&meta),
                 local::file_id(&full),
             );
-            jobs.push((source, target, names, fingerprint, place, node));
+            jobs.push((source, target, names, fingerprint, place, node, merge));
         }
         let options = UploadOptions::default();
-        let cancel = Cancel::default();
+        let cancel = self.cancel;
         let client = self.client;
-        let (uploader, run) = Uploader::new(client, &options, &cancel, |_| {});
+        let (uploader, run) = Uploader::new(client, &options, cancel, |_| {});
         let mut submitted: futures::stream::FuturesUnordered<_> = jobs
             .iter()
             .enumerate()
@@ -666,7 +736,10 @@ impl<'a> Executor<'a> {
         let record = async {
             use futures::StreamExt;
             while let Some((i, result)) = submitted.next().await {
-                let (_, _, names, fingerprint, place, node) = &jobs[i];
+                let (_, _, names, fingerprint, place, node, merge) = &jobs[i];
+                if *merge && result.is_ok() {
+                    self.spell_as_server(names, &place.1);
+                }
                 self.uploaded(result, names, fingerprint.clone(), place.clone(), *node)?;
             }
             Ok::<_, crate::state::StateError>(())
@@ -750,10 +823,11 @@ impl<'a> Executor<'a> {
             let Some(mut names) = self.names(parent) else {
                 continue;
             };
-            // Where it is locally now (a known node), else where it goes.
+            // Where it is locally now (a known node), else where it goes: in
+            // its folder found by file ID too.
             let target = match self.base.get(&node) {
                 Some(_) => self.path(node),
-                None => None,
+                None => self.path(parent).map(|folder| folder.join(&name)),
             }
             .unwrap_or_else(|| {
                 names.push(name.clone());
@@ -763,7 +837,7 @@ impl<'a> Executor<'a> {
                 .base
                 .get(&node)
                 .filter(|e| e.is_file)
-                .map(|e| (e.size, e.mtime));
+                .map(|e| (e.size, e.mtime, e.file_id.clone()));
             // A new file where something local already has the name: never
             // replaced, so not fetched either (it would be, every few seconds).
             if expected.is_none() && target.symlink_metadata().is_ok() {
@@ -808,8 +882,8 @@ impl<'a> Executor<'a> {
             jobs.push((sink, node, state));
         }
         let options = DownloadOptions::default();
-        let cancel = Cancel::default();
-        let (downloader, run) = Downloader::new(self.client, &options, &cancel, |_| {});
+        let cancel = self.cancel;
+        let (downloader, run) = Downloader::new(self.client, &options, cancel, |_| {});
         let fetched: Vec<_> = jobs
             .iter()
             .map(|(sink, node, state)| downloader.submit(*node, state.version, sink))
@@ -881,7 +955,7 @@ impl<'a> Executor<'a> {
 /// The pair's folder is still the one it synced (a disk unmounted mid-round
 /// leaves an empty mount point, or nothing).
 fn pair_there(pair: &Pair) -> bool {
-    let now = local::file_id(&pair.path);
+    let now = local::root_id(&pair.path);
     now.is_some() && (pair.root_file_id.is_none() || now == pair.root_file_id)
 }
 
@@ -922,9 +996,9 @@ fn aside(path: &Path) -> PathBuf {
         .expect("a free name")
 }
 
-/// A download written as `.<name>.<random>.theca-part`, then renamed over the real name
-/// only if what's there is still what the base knew (or nothing, for a new
-/// file): a local edit made meanwhile is never overwritten.
+/// A download written as `.<name>.<random>.theca-part`, then moved into place
+/// only over the base's file (or nothing, for a new file): a local edit made
+/// meanwhile is never overwritten (`place`).
 struct SyncSink<'a> {
     /// The pair's folder and file ID: never recreated if it's gone.
     pair: Pair,
@@ -933,14 +1007,19 @@ struct SyncSink<'a> {
     record: Record<'a>,
     target: PathBuf,
     part: PathBuf,
-    /// The size and modification time the target may have to be replaced.
-    expected: Option<(i64, i64)>,
+    /// The fingerprint (size, mtime, file ID) of the base's file the target
+    /// may replace; none for a new file.
+    expected: Option<(i64, i64, Option<String>)>,
     modified: Option<DateTime<Utc>>,
     file: Mutex<Option<std::fs::File>>,
     /// What was renamed into place (size, mtime, file ID), taken from the part
     /// before the rename: the target itself may be edited a moment later, and
     /// that edit must look like one.
     done: Mutex<Option<Entry>>,
+    /// Tests: runs where a save could land unseen, before the download is in
+    /// place.
+    #[cfg(test)]
+    meanwhile: Option<Box<dyn Fn() + Send + Sync>>,
 }
 
 /// What a download records once in place: its entry (the fingerprint filled
@@ -959,7 +1038,7 @@ impl<'a> SyncSink<'a> {
         pair: &Pair,
         record: Record<'a>,
         target: &Path,
-        expected: Option<(i64, i64)>,
+        expected: Option<(i64, i64, Option<String>)>,
         modified: Option<DateTime<Utc>>,
     ) -> Self {
         // A name nobody picks (hidden, random), created new: a user's own
@@ -979,14 +1058,65 @@ impl<'a> SyncSink<'a> {
             modified,
             file: Mutex::new(None),
             done: Mutex::new(None),
+            #[cfg(test)]
+            meanwhile: None,
         }
     }
 
-    fn unchanged_target(&self) -> bool {
-        match (std::fs::symlink_metadata(&self.target), self.expected) {
-            (Err(_), _) => true,
-            (Ok(m), Some((size, mtime))) => m.len() as i64 == size && local::mtime(&m) == mtime,
-            (Ok(_), None) => false,
+    /// The part moved into place, never over anything but the base's file.
+    /// The target is moved aside first, atomically: whatever was saved until
+    /// then moves with it. Still the base's file, the part is renamed in
+    /// without replacing, and the aside file deleted (the server has it).
+    /// Edited, it goes back: the local edit wins, next round. A save
+    /// creating the target meanwhile makes the rename fail: it wins too.
+    /// Nothing is ever overwritten; a crash in between leaves the old file
+    /// as a visible `(local)` copy, never a hidden one.
+    fn place(&self) -> io::Result<()> {
+        let changed = || {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "changed locally during the download",
+            )
+        };
+        let Some((size, mtime, id)) = &self.expected else {
+            // A new file: nothing may be replaced.
+            return local::rename_new(&self.part, &self.target).map_err(|_| changed());
+        };
+        let aside = aside(&self.target);
+        match local::rename_new(&self.target, &aside) {
+            Ok(()) => {}
+            // Deleted meanwhile: in place as a new file.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return local::rename_new(&self.part, &self.target).map_err(|_| changed());
+            }
+            Err(e) => return Err(e),
+        }
+        #[cfg(test)]
+        if let Some(meanwhile) = &self.meanwhile {
+            meanwhile();
+        }
+        if !local::unchanged(&aside, *size, *mtime, id.as_deref()) {
+            // Back where it was (unless a save took the name meanwhile: then
+            // both stay, the old one as a `(local)` copy).
+            let _ = local::rename_new(&aside, &self.target);
+            return Err(changed());
+        }
+        match local::rename_new(&self.part, &self.target) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&aside);
+                Ok(())
+            }
+            // Saved meanwhile under its name: the save wins; the base's
+            // content, which the server has, goes.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(&aside);
+                Err(changed())
+            }
+            // Anything else: the old file back in its place.
+            Err(e) => {
+                let _ = local::rename_new(&aside, &self.target);
+                Err(e)
+            }
         }
     }
 }
@@ -1028,13 +1158,6 @@ impl Sink for SyncSink<'_> {
         // empty file in its place would go up as the current version.
         file.sync_all()?;
         drop(file);
-        if !self.unchanged_target() {
-            let _ = std::fs::remove_file(&self.part);
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "changed locally during the download",
-            ));
-        }
         // From the closed part (a rename keeps all three), not from the target
         // once the batch ends: by then the user may have edited it.
         let meta = std::fs::metadata(&self.part)?;
@@ -1042,7 +1165,10 @@ impl Sink for SyncSink<'_> {
         entry.size = meta.len() as i64;
         entry.mtime = local::mtime(&meta);
         entry.file_id = local::file_id(&self.part);
-        std::fs::rename(&self.part, &self.target)?;
+        if let Err(e) = self.place() {
+            let _ = std::fs::remove_file(&self.part);
+            return Err(e);
+        }
         // The rename too (Windows has no handle on a folder to flush).
         #[cfg(unix)]
         if let Some(dir) = self.target.parent() {
@@ -1118,8 +1244,9 @@ mod tests {
             root: Uuid::nil(),
             library_name: "Docs".into(),
             path: path.to_owned(),
-            root_file_id: local::file_id(path),
+            root_file_id: local::root_id(path),
             position: Some(1),
+            position_event: None,
             paused: false,
             stopped: None,
             writable: true,
@@ -1177,6 +1304,95 @@ mod tests {
         let e = sink.done.lock().unwrap().clone().unwrap();
         assert_eq!(e.size, 10);
         assert_eq!(e.file_id, local::file_id(&target), "the same file, renamed");
+    }
+
+    /// A save landing while a download moves into place, in place or by an
+    /// atomic save, is never overwritten.
+    #[test]
+    fn a_save_while_a_download_lands_is_never_lost() {
+        for atomic in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("x.txt");
+            std::fs::write(&target, "synced").unwrap();
+            let meta = std::fs::metadata(&target).unwrap();
+            let expected = (
+                meta.len() as i64,
+                local::mtime(&meta),
+                local::file_id(&target),
+            );
+            let state = State::memory().unwrap();
+            let mut sink = SyncSink::new(
+                &pair(dir.path()),
+                record(&state),
+                &target,
+                Some(expected),
+                None,
+            );
+            let (at, folder) = (target.clone(), dir.path().to_owned());
+            sink.meanwhile = Some(Box::new(move || {
+                if atomic {
+                    let saved = folder.join(".x.txt.tmp");
+                    std::fs::write(&saved, "saved meanwhile").unwrap();
+                    std::fs::rename(&saved, &at).unwrap();
+                } else {
+                    std::fs::write(&at, "saved meanwhile").unwrap();
+                }
+            }));
+            sink.write_at(0, b"downloaded").unwrap();
+            let _ = sink.finish();
+            let contents: Vec<String> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                .collect();
+            assert!(
+                contents.iter().any(|c| c == "saved meanwhile"),
+                "atomic: {atomic}, {contents:?}"
+            );
+        }
+    }
+
+    /// A download replaces the base's file, and only it: a file edited
+    /// before the download lands keeps its edit (uploaded on its base next
+    /// round), and nothing is left beside either.
+    #[test]
+    fn a_download_replaces_only_the_synced_file() {
+        for edited in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("x.txt");
+            std::fs::write(&target, "synced").unwrap();
+            let meta = std::fs::metadata(&target).unwrap();
+            let expected = (
+                meta.len() as i64,
+                local::mtime(&meta),
+                local::file_id(&target),
+            );
+            if edited {
+                std::fs::write(&target, "edited, longer").unwrap();
+            }
+            let state = State::memory().unwrap();
+            let sink = SyncSink::new(
+                &pair(dir.path()),
+                record(&state),
+                &target,
+                Some(expected),
+                None,
+            );
+            sink.write_at(0, b"downloaded").unwrap();
+            assert_eq!(sink.finish().is_ok(), !edited);
+            let want = if edited {
+                "edited, longer"
+            } else {
+                "downloaded"
+            };
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), want);
+            let names: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            assert_eq!(names, ["x.txt"], "edited: {edited}");
+        }
     }
 
     #[test]

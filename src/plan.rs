@@ -168,6 +168,32 @@ pub fn plan(input: &Input) -> Plan {
     Planner::new(input).run()
 }
 
+/// Whether a pair's folder, its root back on another device number (an
+/// external disk remounted), is the disk it synced: at least one of the
+/// base's files found by its file ID, and none of those found with another
+/// size or mtime. Another disk mounted at the same place has the same root
+/// inode (2 on ext4) but never the base's files; the same disk edited on
+/// another computer meanwhile doesn't vouch either.
+pub fn same_disk(base: &[Entry], scan: &Scan) -> bool {
+    let found: HashMap<&str, &Item> = scan
+        .items
+        .iter()
+        .filter(|i| i.is_file)
+        .filter_map(|i| i.file_id.as_deref().map(|id| (id, i)))
+        .collect();
+    let mut vouched = false;
+    for e in base.iter().filter(|e| e.is_file) {
+        let Some(item) = e.file_id.as_deref().and_then(|id| found.get(id)) else {
+            continue;
+        };
+        if item.size != e.size || item.mtime != e.mtime {
+            return false;
+        }
+        vouched = true;
+    }
+    vouched
+}
+
 struct Planner<'a> {
     input: &'a Input<'a>,
     base: HashMap<Uuid, &'a Entry>,
@@ -1077,6 +1103,41 @@ mod tests {
             mtime: e.map_or(7, |e| e.mtime),
             file_id: e.and_then(|e| e.file_id.clone()),
         }
+    }
+
+    /// A disk remounted (the root's inode on another device): its files, by
+    /// file ID with the size and mtime synced, vouch for it; one of them
+    /// changed, or none of them there (another disk at the same place, or
+    /// nothing synced yet), it doesn't.
+    #[test]
+    fn a_disk_is_the_same_when_its_files_vouch() {
+        let root = id(0);
+        let base = [
+            entry(1, root, "a.txt", v(10)),
+            entry(2, root, "b.txt", v(20)),
+        ];
+        let scan = |items: Vec<Item>| Scan {
+            items,
+            ..Scan::default()
+        };
+        let same = |items| same_disk(&base, &scan(items));
+        assert!(same(vec![item("a.txt", Some(&base[0]), true)]));
+        assert!(same(vec![
+            item("a.txt", Some(&base[0]), true),
+            item("moved.txt", Some(&base[1]), true),
+        ]));
+        let mut edited = item("b.txt", Some(&base[1]), true);
+        edited.size += 1;
+        assert!(!same(vec![item("a.txt", Some(&base[0]), true), edited]));
+        let mut touched = item("a.txt", Some(&base[0]), true);
+        touched.mtime += 1;
+        assert!(!same(vec![touched]));
+        // Another disk: the same names, other files.
+        assert!(!same(vec![
+            item("a.txt", None, true),
+            item("b.txt", None, true)
+        ]));
+        assert!(!same_disk(&[], &scan(vec![item("a.txt", None, true)])));
     }
 
     fn remote(parent: Uuid, name: &str, version: Option<Uuid>) -> Option<RemoteState> {

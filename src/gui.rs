@@ -25,6 +25,10 @@ struct App {
     state_path: PathBuf,
     engine: Handle,
     stop: watch::Sender<bool>,
+    /// The pairs whose stop was notified (once per stop).
+    notified: Mutex<std::collections::HashSet<i64>>,
+    /// The engine's task, while it runs: Quit waits for it to stop.
+    running: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     /// The tray and the menu items it updates, when the desktop has one
     /// (stock GNOME doesn't).
     tray: Mutex<Option<Tray>>,
@@ -51,10 +55,13 @@ pub fn run(state_path: PathBuf, background: bool) -> Result<(), tauri::Error> {
         ))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .manage(App {
             state_path: state_path.clone(),
             engine: engine.clone(),
             stop,
+            notified: Mutex::default(),
+            running: Mutex::new(None),
             tray: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
@@ -78,17 +85,19 @@ pub fn run(state_path: PathBuf, background: bool) -> Result<(), tauri::Error> {
             // forward) instead of failing on the lock.
             app.manage(Lock(crate::lock(&state_path)?));
             let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
+            let running = tauri::async_runtime::spawn(async move {
                 if let Err(e) = engine::run(state_path, engine, stopped).await {
                     tracing::error!("the engine stopped: {e}");
                 }
             });
+            *app.state::<App>().running.lock().expect("running") = Some(running);
             forward_updates(&handle);
             match tray(&handle) {
                 Ok(tray) => *app.state::<App>().tray.lock().expect("tray") = Some(tray),
                 Err(e) => tracing::info!("no tray ({e}): closing the window asks"),
             }
             refresh_tray(&handle);
+            notify_stops(&handle);
             let first_launch = state(&handle).accounts().map_or(true, |a| a.is_empty());
             if !background || first_launch {
                 open_window(&handle);
@@ -105,6 +114,24 @@ pub fn run(state_path: PathBuf, background: bool) -> Result<(), tauri::Error> {
         RunEvent::ExitRequested {
             code: None, api, ..
         } => api.prevent_exit(),
+        // Quit: the engine stops first (its transfers cancelled, what finished
+        // recorded, within seconds), then the app exits.
+        RunEvent::ExitRequested {
+            code: Some(code),
+            api,
+            ..
+        } => {
+            let running = app.state::<App>().running.lock().expect("running").take();
+            if let Some(running) = running {
+                api.prevent_exit();
+                let _ = app.state::<App>().stop.send(true);
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = running.await;
+                    app.exit(code);
+                });
+            }
+        }
         RunEvent::Exit => {
             let _ = app.state::<App>().stop.send(true);
         }
@@ -132,11 +159,13 @@ fn forward_updates(app: &AppHandle) {
                 Ok(update) => {
                     if !matches!(update, Update::Offered { .. }) {
                         refresh_tray(&app);
+                        notify_stops(&app);
                     }
                     let _ = app.emit("update", update);
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     refresh_tray(&app);
+                    notify_stops(&app);
                     let _ = app.emit("update", serde_json::json!({ "kind": "lagged" }));
                 }
                 Err(broadcast::error::RecvError::Closed) => return,
@@ -277,6 +306,50 @@ fn tray_icon(overall: Overall) -> tauri::image::Image<'static> {
         (Overall::Paused, false) => include_bytes!("../icons/tray/tray-paused.png"),
     };
     tauri::image::Image::from_bytes(bytes).expect("a bundled PNG")
+}
+
+/// An OS notification for each pair that stops syncing (stopped, or its
+/// account's engine stopped on an error), and at launch for one still
+/// stopped: its files stop syncing, and a tray's icon is easy to miss, or
+/// missing (stock GNOME). Once until it syncs again: an engine failing every
+/// 30 s says it once.
+fn notify_stops(app: &AppHandle) {
+    use tauri_plugin_notification::NotificationExt;
+    let Ok(pairs) = state(app).pairs() else {
+        return;
+    };
+    let a = app.state::<App>();
+    let mut notified = a.notified.lock().expect("notified");
+    notified.retain(|id| {
+        pairs
+            .iter()
+            .any(|p| p.id == *id && !p.paused && p.activity != "up to date")
+    });
+    for p in pairs.iter().filter(|p| !p.paused) {
+        let Some(why) = p.not_syncing() else { continue };
+        if !notified.insert(p.id) {
+            continue;
+        }
+        let path = p.path.display().to_string();
+        let what = if p.stopped.is_none() {
+            "Theca tries again; the files stay."
+        } else if p.stopped_for_its_folder() {
+            "Its files stay; it syncs again once the folder is back, or open Theca to locate it."
+        } else {
+            "Its files stay."
+        };
+        let body = if why.contains(&path) {
+            format!("{why}. {what}")
+        } else {
+            format!("{path}: {why}. {what}")
+        };
+        let _ = app
+            .notification()
+            .builder()
+            .title(format!("{} stopped syncing", p.library_name))
+            .body(body)
+            .show();
+    }
 }
 
 /// The tray's icon and summary from the state: attention first (an account
