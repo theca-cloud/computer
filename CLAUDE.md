@@ -22,7 +22,7 @@ Theca on computers (desktops, laptops, servers): one crate and binary, `theca` (
 
 ## Workflow differences
 
-- **CI in two systems** (ADR 0005): Woodpecker checks Linux on every push; GitHub Actions tests macOS, Windows and Linux arm64 from `dev`, and builds the packages and the release on a tag. Check GitHub with `gh run list -R theca-cloud/computer` (`ci/README.md`), not only `woodpecker-cli`.
+- **CI in two systems** (ADR 0005): Woodpecker checks Linux on every push; GitHub Actions tests macOS, Windows and Linux arm64 from `dev`, and, on a tag, runs those tests again, then builds the packages and the release. Check GitHub with `gh run list -R theca-cloud/computer` (`ci/README.md`), not only `woodpecker-cli`.
 - **`dev` is mirrored to GitHub** (public) once Woodpecker's checks pass; feature branches stay on Gitea.
 - **`scripts/release.sh`** also checks GitHub's latest `dev` test run; the release itself (packages, GitHub release) happens on GitHub after the tag is pushed. No Gitea release.
 

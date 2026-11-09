@@ -88,7 +88,7 @@ if [ "$branch" = dev ]; then
     [ -z "$untested" ] || die "dev changed since GitHub's tests ($tested): push dev, wait for its run"
     echo "GitHub's tests passed: $run"
 fi
-[ -x scripts/ci.sh ] && { scripts/ci.sh || die "scripts/ci.sh failed: nothing released"; }
+scripts/ci.sh || die "scripts/ci.sh failed: nothing released"
 
 if [ "$branch" = dev ]; then
     git checkout -q prod

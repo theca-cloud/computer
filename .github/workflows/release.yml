@@ -1,9 +1,9 @@
 # The release (ADR 0005): on a version tag, which Woodpecker's release.yaml
-# pushes here with prod, every package built natively on its runner and
-# checked (ci/package.sh), then one GitHub release with them all, created only
-# once every package passed. No tests: the tag's code is dev's, tested on
-# every platform, plus the version bump. By hand (workflow_dispatch), it builds
-# and checks the packages without releasing: they stay on the run.
+# pushes here with prod once its checks passed: the tests on the other
+# platforms (test.yml), on this very commit, then every package built natively
+# on its runner and checked (ci/package.sh), then one GitHub release with them
+# all, created only once every package passed. By hand (workflow_dispatch), it
+# tests, builds and checks the packages without releasing: they stay on the run.
 name: release
 
 on:
@@ -12,7 +12,11 @@ on:
   workflow_dispatch:
 
 jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
   package:
+    needs: test
     strategy:
       fail-fast: false
       matrix:

@@ -1,11 +1,14 @@
 # The release, on the version tag that scripts/release.sh creates and pushes
 # with prod (`git push origin prod dev 1.2.3`): prod to GitHub's main, with the
 # tag, where .github/workflows/release.yml builds the packages and the GitHub
-# release (ADR 0005). No checks here: the code is what dev tested, plus the
-# version bump. No Gitea release: the packages are downloaded from one place.
+# release (ADR 0005).
+# Only once the checks (linux.yaml) passed on this very commit.
+# No Gitea release: the packages are downloaded from one place.
 when:
   - event: tag
     ref: refs/tags/[0-9]*
+
+depends_on: [linux]
 
 # The mirror pushes to GitHub, which refuses a shallow or partial clone.
 clone:

@@ -7,8 +7,8 @@
 | Woodpecker, `.woodpecker/linux.yaml` (the CI server's Docker agents) | `scripts/ci.sh` on Linux amd64: deny, lint, the tests, the app driven through its window | every push, any branch |
 | the same workflow, its `mirror` step | `dev` force-pushed to `theca-cloud/computer` on GitHub | on `dev`, once those checks passed |
 | GitHub, `.github/workflows/test.yml` | `scripts/ci.sh lint` and `test` on `macos-15`, `windows-2025`, `ubuntu-22.04-arm` | every `dev` reaching GitHub; by hand |
-| Woodpecker, `.woodpecker/release.yaml` | `prod` pushed as GitHub's `main`, with the version tag | the tag `scripts/release.sh` creates |
-| GitHub, `.github/workflows/release.yml` | the packages on five runners (`ci/package.sh`), then the GitHub release | that tag; by hand, without releasing |
+| Woodpecker, `.woodpecker/release.yaml` | `prod` pushed as GitHub's `main`, with the version tag | the tag `scripts/release.sh` creates, once `linux.yaml` passed on it |
+| GitHub, `.github/workflows/release.yml` | the tests (`test.yml`), then the packages on five runners (`ci/package.sh`), then the GitHub release | that tag; by hand, without releasing |
 
 Feature branches never reach GitHub. GitHub's standard runners are free for public
 repositories. Every test builds and runs its own server from the pinned `core`, on every
