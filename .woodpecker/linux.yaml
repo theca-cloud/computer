@@ -8,9 +8,12 @@ when:
     # Nothing built or tested changed: docs, repo housekeeping.
     path:
       exclude: ["**/*.md", "LICENSE", ".gitignore", "cliff.toml"]
-    # Not a version commit (scripts/release.sh, `1.2.3`): it only bumps the
-    # version on code dev already tested, on prod and coming back into dev.
-    evaluate: 'not (trim(CI_COMMIT_MESSAGE) matches "^[0-9]+[.][0-9]+[.][0-9]+$")'
+  # prod and the version tags, whatever changed: Woodpecker can't reuse a
+  # commit's earlier run, and release.yaml waits on this one.
+  - event: push
+    branch: prod
+  - event: tag
+    ref: refs/tags/[0-9]*
   - event: manual
 
 # The mirror pushes to GitHub, which refuses a shallow or partial clone. The

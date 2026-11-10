@@ -11,3 +11,6 @@ TODOs.md
 .tags
 # Tauri writes its permission schemas here at build.
 /gen/
+# A core dump: the crash tests abort a child `theca` on purpose, and a
+# container with core dumps on writes it here.
+/core

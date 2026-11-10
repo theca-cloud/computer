@@ -11,6 +11,8 @@ on:
     # As Woodpecker: nothing built or tested changed.
     paths-ignore: ["**/*.md", LICENSE, .gitignore, cliff.toml]
   workflow_dispatch:
+  # release.yml, on the version tag.
+  workflow_call:
 
 jobs:
   test:

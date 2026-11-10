@@ -216,6 +216,7 @@ impl World {
                 size: if l.is_file { l.content as i64 } else { 0 },
                 mtime: if l.is_file { l.content as i64 } else { 0 },
                 file_id: Some(format!("f{}", l.fid)),
+                ignored: false,
             })
             .collect();
         Scan {

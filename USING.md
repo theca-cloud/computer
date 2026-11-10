@@ -33,6 +33,20 @@ Logging in creates an app password for this computer, revocable from the web app
 
 On macOS, until the app is signed, each new version asks once for your password to read its keychain entry: click **Always Allow**.
 
+## Ignore files
+
+A file named `.thecaignore` keeps what it names from being uploaded, in its folder and every folder below it. Its patterns are `.gitignore`'s, with git's rules:
+
+```
+node_modules/
+build/
+*.log
+```
+
+It syncs like any other file, so every device follows it, and the web app and WebDAV too. What it names never goes up from this computer: not a new file, an edit, a folder, a move or a deletion. What the server already holds there still comes down onto the copies you haven't changed: new files and new versions, and a deletion on the server removes the local copy. A copy you changed stays as it is. Deleting a folder that isn't ignored still moves everything in it to the trash, what it names included. An ignore file that names itself stays on this computer only. A line that isn't text (UTF-8) is skipped and shown in `theca status` and the app's window.
+
+One limitation: an ignore file arriving after the files it names (a copy still in progress, or a move from another disk) lets those that came first be uploaded. A move within the same disk is fine. More, with examples: [theca.rs/features](https://theca.rs/features#ignored-files).
+
 ## Headless use
 
 ```sh

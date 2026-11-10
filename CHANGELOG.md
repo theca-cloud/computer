@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.1.0] - 2026-11-10
+
+### Features
+
+- Ignore files (.thecaignore): what they name is never uploaded
+
+### Fixes
+
+- **ci**: Run the checks on prod and version tags, before any release
+
+### Documentation
+
+- USING.md is theca.rs/computer: sprints keep it current
+
 ## [1.0.0] - 2026-11-07
 
 The first stable release: from now on, what the app keeps only moves forward, and its commands keep working within 1.x.
