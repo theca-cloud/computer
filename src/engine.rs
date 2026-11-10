@@ -199,6 +199,9 @@ struct Follower {
     /// round deciding whether to trash sees the events that came during it
     /// (an `rm -rf` started mid-scan), not only those before it.
     heard_at: Heard,
+    /// The ignored folders each pair's last scan skipped: what the watcher
+    /// hears below them starts no round.
+    skipped: Skipped,
     /// Pairs whose deletions wait for their folder to be quiet, since when.
     deletions_held: HashMap<i64, Instant>,
     /// Nodes this client changed lately, per pair.
@@ -264,6 +267,7 @@ async fn follow(
         retry_at: None,
         full_at: HashMap::new(),
         heard_at: Heard::default(),
+        skipped: Skipped::default(),
         deletions_held: HashMap::new(),
         recent: HashMap::new(),
         roots: HashMap::new(),
@@ -410,6 +414,7 @@ impl Follower {
             if !self.watchers.contains_key(&p.id) {
                 let events = self.events.clone();
                 let heard_at = self.heard_at.clone();
+                let skipped = self.skipped.clone();
                 let id = p.id;
                 // Events only mark the pair dirty: the next round (within a
                 // second) scans, and files still being written wait for it.
@@ -420,7 +425,11 @@ impl Follower {
                 // would wake the pair again.
                 let watcher =
                     notify::recommended_watcher(move |e: notify::Result<notify::Event>| {
-                        if e.is_err() || e.is_ok_and(|e| changes(&e.kind)) {
+                        let relevant = match &e {
+                            Err(_) => true,
+                            Ok(e) => changes(&e.kind) && !below_skipped(&skipped, id, &e.paths),
+                        };
+                        if relevant {
                             heard(&heard_at, id);
                             let _ = events.send(id);
                         }
@@ -839,32 +848,66 @@ impl Follower {
         }
         self.full_at.insert(p.id, Instant::now() + FULL_SCAN);
         self.state.set_activity(p.id, "syncing", false)?;
-        let path = p.path.clone();
-        let scan = match tokio::task::spawn_blocking(move || local::scan(&path)).await {
-            Ok(Ok(scan)) => scan,
-            _ => {
-                // Renamed or removed during this round: the root check says
-                // which (followed, or stopped as missing); the next round
-                // runs from there. Unreadable where it is: stopped as such.
-                match self.root(&p).await? {
-                    Ok(now) if now.path != p.path => {
-                        self.dirty.insert(p.id);
-                    }
-                    Ok(_) => self.stop(&p, Stop::Folder("the folder can't be read".into()))?,
-                    Err(why) => self.stop(&p, Stop::Folder(why))?,
-                }
-                return Ok(());
-            }
-        };
         let base = self.state.entries(p.id)?;
         let remote = self.state.remote(p.id)?;
-        let mut plan = plan(&Input {
-            root: p.root,
-            base: &base,
-            scan: &scan,
-            remote: &remote,
-            writable: p.writable,
-        });
+        let path = p.path.clone();
+        // An ignored folder is scanned only where the server has something.
+        let known = crate::plan::known_paths(p.root, &base, &remote);
+        let mut scan =
+            match tokio::task::spawn_blocking(move || local::scan_entering(&path, &known)).await {
+                Ok(Ok(scan)) => scan,
+                _ => {
+                    // Renamed or removed during this round: the root check says
+                    // which (followed, or stopped as missing); the next round
+                    // runs from there. Unreadable where it is: stopped as such.
+                    match self.root(&p).await? {
+                        Ok(now) if now.path != p.path => {
+                            self.dirty.insert(p.id);
+                        }
+                        Ok(_) => self.stop(&p, Stop::Folder("the folder can't be read".into()))?,
+                        Err(why) => self.stop(&p, Stop::Folder(why))?,
+                    }
+                    return Ok(());
+                }
+            };
+        let real = p.path.canonicalize().unwrap_or_else(|_| p.path.clone());
+        self.skipped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                p.id,
+                scan.not_entered
+                    .iter()
+                    .map(|path| real.join(path.replace('/', std::path::MAIN_SEPARATOR_STR)))
+                    .collect(),
+            );
+        let planned = |scan: &local::Scan| {
+            plan(&Input {
+                root: p.root,
+                base: &base,
+                scan,
+                remote: &remote,
+                writable: p.writable,
+            })
+        };
+        let mut plan = planned(&scan);
+        // Something to trash, and ignored folders the scan didn't enter: what
+        // was synced may have moved in there (no deletion). Their file IDs,
+        // read now only.
+        let trashes = |plan: &crate::plan::Plan| {
+            plan.actions
+                .iter()
+                .any(|a| matches!(a, Action::RemoteTrash { .. }))
+        };
+        if trashes(&plan) && !scan.not_entered.is_empty() {
+            let (root, folders) = (p.path.clone(), scan.not_entered.clone());
+            if let Ok(ids) =
+                tokio::task::spawn_blocking(move || local::ids_below(&root, &folders)).await
+            {
+                scan.hidden_ids = ids;
+                plan = planned(&scan);
+            }
+        }
         let held = !self.may_trash(p.id)
             && plan
                 .actions
@@ -1012,6 +1055,23 @@ impl Follower {
 /// When each pair's watcher last reported a change.
 type Heard = Arc<std::sync::Mutex<HashMap<i64, Instant>>>;
 
+/// Each pair's ignored folders its last scan skipped, as the watcher reports
+/// paths (below the folder's real path).
+type Skipped = Arc<std::sync::Mutex<HashMap<i64, Vec<PathBuf>>>>;
+
+/// Whether every path of an event is at or below an ignored folder the
+/// pair's last scan skipped: nothing there is synced.
+fn below_skipped(skipped: &Skipped, pair: i64, paths: &[PathBuf]) -> bool {
+    let skipped = skipped.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(folders) = skipped.get(&pair) else {
+        return false;
+    };
+    !paths.is_empty()
+        && paths
+            .iter()
+            .all(|p| folders.iter().any(|f| p.starts_with(f)))
+}
+
 fn heard(heard_at: &Heard, pair: i64) {
     heard_at
         .lock()
@@ -1066,6 +1126,30 @@ fn open_dir(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Watcher events below an ignored folder the last scan skipped start no
+    /// round; one with any path elsewhere does, and so does any before a scan.
+    #[test]
+    fn events_below_skipped_folders_start_no_round() {
+        let skipped = Skipped::default();
+        let root = PathBuf::from("/pair");
+        let paths = |ps: &[&str]| ps.iter().map(|p| root.join(p)).collect::<Vec<_>>();
+        assert!(!below_skipped(&skipped, 1, &paths(&["node_modules/x.js"])));
+        skipped
+            .lock()
+            .unwrap()
+            .insert(1, vec![root.join("node_modules")]);
+        assert!(below_skipped(&skipped, 1, &paths(&["node_modules/x.js"])));
+        assert!(below_skipped(&skipped, 1, &paths(&["node_modules"])));
+        assert!(!below_skipped(
+            &skipped,
+            1,
+            &paths(&["node_modules/x.js", "a.txt"])
+        ));
+        assert!(!below_skipped(&skipped, 1, &paths(&["node_modules2/x.js"])));
+        assert!(!below_skipped(&skipped, 1, &[]));
+        assert!(!below_skipped(&skipped, 2, &paths(&["node_modules/x.js"])));
+    }
 
     /// C16: an engine stopped by an error says so, once however often.
     #[test]

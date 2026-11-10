@@ -257,6 +257,10 @@ impl<'a> Executor<'a> {
         for (path, why) in &scan.unreadable {
             self.report(path, &format!("not synced: {why}"), Level::Error);
         }
+        for (path, problem) in &scan.ignore_problems {
+            self.report(path, &format!("ignore file: {problem}"), Level::Error);
+        }
+        self.outcome.again |= plan.wait;
         // The plan is ordered: uploads, downloads and trashing come in runs,
         // each run one batch.
         let kind = |a: &Action| match a {

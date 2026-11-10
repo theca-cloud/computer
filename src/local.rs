@@ -1,10 +1,12 @@
 //! The local side: scanning a pair's folder (one `stat` per entry, no reads),
 //! names compared like the server's, file IDs (docs/decisions.md, Sync).
 
+use std::collections::HashSet;
 use std::fs::Metadata;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
+use theca_common::ignore::{self as ignore_file, Ignores, Problem};
 use theca_common::name::is_ignored;
 
 /// What a download writes before moving it into place.
@@ -41,6 +43,9 @@ pub struct Item {
     /// Nanoseconds since the epoch.
     pub mtime: i64,
     pub file_id: Option<String>,
+    /// Named by an ignore file (`.thecaignore`): never uploaded, read-only
+    /// for the plan.
+    pub ignored: bool,
 }
 
 impl Item {
@@ -64,11 +69,29 @@ pub struct Scan {
     /// Folders on another disk than the pair's (a disk mounted inside it):
     /// skipped, so unmounting it deletes nothing.
     pub elsewhere: Vec<String>,
+    /// Ignored folders not entered: nothing of the server's is there. Unseen,
+    /// like an unreadable folder.
+    pub not_entered: Vec<String>,
+    /// The file IDs found in them, read only when a round would trash on the
+    /// server (`ids_below`): a synced file moved in there is no deletion.
+    pub hidden_ids: HashSet<String>,
+    /// The ignore files read, by folder from the pair's root.
+    pub ignores: Ignores,
+    /// What in them doesn't apply, by the ignore file's path.
+    pub ignore_problems: Vec<(String, Problem)>,
 }
 
-/// Walks the pair's folder. Ignored files (what operating systems leave) and
-/// unfinished downloads are skipped.
+/// Walks the pair's folder, every ignored folder skipped.
 pub fn scan(root: &Path) -> io::Result<Scan> {
+    scan_entering(root, &HashSet::new())
+}
+
+/// Walks the pair's folder. What operating systems leave and unfinished
+/// downloads are skipped; each folder's ignore file is read as the
+/// walk enters it, its items marked ignored, and an ignored folder entered
+/// only when `known` has its path (by key: the server has something there,
+/// to download or delete), skipped whole otherwise.
+pub fn scan_entering(root: &Path, known: &HashSet<Vec<String>>) -> io::Result<Scan> {
     let mut scan = Scan::default();
     #[cfg(unix)]
     let device = std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(root)?);
@@ -124,6 +147,19 @@ pub fn scan(root: &Path) -> io::Result<Scan> {
         }
         // Parents first, and a stable order.
         children.sort_by(|a, b| a.0.cmp(&b.0));
+        // The folder's ignore file first: it applies to its siblings.
+        if let Some((path, _, full)) = children.iter().find(|(path, meta, _)| {
+            meta.is_file() && ignore_file::is_ignore_file(&path[path.len() - 1])
+        }) {
+            match read_ignore_file(full) {
+                Ok(content) => {
+                    for problem in scan.ignores.add(&prefix, &content) {
+                        scan.ignore_problems.push((path.join("/"), problem));
+                    }
+                }
+                Err(e) => scan.unreadable.push((path.join("/"), e.to_string())),
+            }
+        }
         for (path, meta, full) in children {
             let is_file = meta.is_file();
             // ponytail: Unix only; on Windows a volume mounted in a folder is a
@@ -133,7 +169,17 @@ pub fn scan(root: &Path) -> io::Result<Scan> {
                 scan.elsewhere.push(path.join("/"));
                 continue;
             }
-            scan.items.push(item(path.clone(), &meta, &full, is_file));
+            let ignored = scan.ignores.is_ignored(&path, !is_file);
+            if ignored
+                && !is_file
+                && !known.contains(&path.iter().map(|n| key(n)).collect::<Vec<_>>())
+            {
+                scan.not_entered.push(path.join("/"));
+                continue;
+            }
+            let mut item = item(path.clone(), &meta, &full, is_file);
+            item.ignored = ignored;
+            scan.items.push(item);
             if !is_file {
                 pending.push((path, full));
             }
@@ -141,6 +187,7 @@ pub fn scan(root: &Path) -> io::Result<Scan> {
     }
     // A depth-first walk with a stack: sort so parents still come first.
     scan.items.sort_by(|a, b| a.path.cmp(&b.path));
+    scan.not_entered.sort();
     Ok(scan)
 }
 
@@ -151,7 +198,44 @@ fn item(path: Vec<String>, meta: &Metadata, full: &Path, is_file: bool) -> Item 
         size: if is_file { meta.len() as i64 } else { 0 },
         mtime: mtime(meta),
         file_id: file_id(full),
+        ignored: false,
     }
+}
+
+/// The file IDs of everything below `folders` (paths below `root`), links
+/// not followed, nothing read: where a synced file moved into an ignored
+/// folder the scan didn't enter is found.
+pub fn ids_below(root: &Path, folders: &[String]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    let mut pending: Vec<PathBuf> = folders
+        .iter()
+        .map(|f| f.split('/').fold(root.to_path_buf(), |p, n| p.join(n)))
+        .collect();
+    while let Some(folder) = pending.pop() {
+        for entry in std::fs::read_dir(&folder).into_iter().flatten().flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            ids.extend(file_id(&entry.path()));
+            if kind.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    ids
+}
+
+/// An ignore file's content, as much as applies (and a byte more, which tells
+/// it was longer).
+fn read_ignore_file(path: &Path) -> io::Result<Vec<u8>> {
+    let mut content = Vec::new();
+    std::fs::File::open(path)?
+        .take(ignore_file::MAX_LEN as u64 + 1)
+        .read_to_end(&mut content)?;
+    Ok(content)
 }
 
 pub fn mtime(meta: &Metadata) -> i64 {
@@ -273,6 +357,80 @@ mod tests {
     fn keys_ignore_case_and_normalization() {
         assert_eq!(key("Café.TXT"), key("cafe\u{301}.txt"));
         assert_ne!(key("a.txt"), key("b.txt"));
+    }
+
+    /// Each folder's ignore file read as the scan enters it: its items and
+    /// those below marked ignored (a deeper file adding its own); an ignored
+    /// folder skipped whole unless the server has something there; a
+    /// malformed line said, the rest applied.
+    #[test]
+    fn scan_reads_ignore_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("build/deep")).unwrap();
+        std::fs::create_dir_all(root.join("src/gen")).unwrap();
+        std::fs::write(root.join(".thecaignore"), b"build/\n*.log\n\xff\n").unwrap();
+        std::fs::write(root.join("build/deep/x.o"), "x").unwrap();
+        std::fs::write(root.join("a.log"), "l").unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        std::fs::write(root.join("src/.thecaignore"), "gen/\n").unwrap();
+        std::fs::write(root.join("src/gen/y.rs"), "y").unwrap();
+        std::fs::write(root.join("src/main.rs"), "m").unwrap();
+
+        let scan = scan(root).unwrap();
+        let items: Vec<(String, bool)> = scan
+            .items
+            .iter()
+            .map(|i| (i.display(), i.ignored))
+            .collect();
+        let expected = [
+            (".thecaignore", false),
+            ("a.log", true),
+            ("a.txt", false),
+            ("src", false),
+            ("src/.thecaignore", false),
+            ("src/main.rs", false),
+        ];
+        assert_eq!(items, expected.map(|(p, i)| (p.to_owned(), i)));
+        assert_eq!(scan.not_entered, ["build", "src/gen"]);
+        assert_eq!(scan.ignore_problems.len(), 1, "{:?}", scan.ignore_problems);
+        assert_eq!(scan.ignore_problems[0].0, ".thecaignore");
+
+        // The server has `build`, and something in `build/deep`: both entered,
+        // their content marked; `build/deep`'s own folders only if known too.
+        let known = HashSet::from([
+            vec!["build".to_owned()],
+            vec!["build".to_owned(), "deep".to_owned()],
+        ]);
+        let scan = scan_entering(root, &known).unwrap();
+        let ignored: Vec<String> = scan
+            .items
+            .iter()
+            .filter(|i| i.ignored)
+            .map(Item::display)
+            .collect();
+        assert_eq!(ignored, ["a.log", "build", "build/deep", "build/deep/x.o"]);
+        assert_eq!(scan.not_entered, ["src/gen"]);
+        let known = HashSet::from([vec!["build".to_owned()]]);
+        assert_eq!(
+            scan_entering(root, &known).unwrap().not_entered,
+            ["build/deep", "src/gen"]
+        );
+    }
+
+    /// The file IDs below folders, links not followed: where a synced file
+    /// moved into a folder the scan didn't enter is found.
+    #[test]
+    fn ids_below_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("build/deep")).unwrap();
+        std::fs::write(root.join("build/deep/a.txt"), "a").unwrap();
+        std::fs::write(root.join("b.txt"), "b").unwrap();
+        let ids = ids_below(root, &["build".into()]);
+        assert!(ids.contains(&file_id(&root.join("build/deep/a.txt")).unwrap()));
+        assert!(ids.contains(&file_id(&root.join("build/deep")).unwrap()));
+        assert!(!ids.contains(&file_id(&root.join("b.txt")).unwrap()));
     }
 
     #[test]

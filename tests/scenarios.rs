@@ -668,3 +668,298 @@ async fn removing_a_pair_or_an_account() {
 
     assert_eq!(w.remote(&w.library).await.len(), 4, "nothing deleted");
 }
+
+/// A file's node in a device's base.
+fn node(device: &Device, name: &str) -> uuid::Uuid {
+    device
+        .state()
+        .entries(device.pair().id)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == name)
+        .unwrap()
+        .node
+}
+
+/// Waits until `marker` is on the server: the rounds that saw it ran, and
+/// what they left is what they decided.
+async fn marked(w: &World, marker: &str) {
+    eventually(marker, || async {
+        w.remote(&w.library).await.contains_key(marker)
+    })
+    .await;
+}
+
+/// An ignore file synced from one device stops uploads on both: what it names
+/// never goes up, a stored file it names is read-only (a local edit or
+/// deletion stays local, the server's deletion comes down); removing the
+/// pattern resumes everything.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ignore_file_stops_uploads_on_every_device() {
+    let w = world().await;
+    let a = w.device("a").await;
+    let b = w.device("b").await;
+    a.write("keep.log", "stored before");
+    a.write("old.log", "stored before");
+    w.converge(&[&a, &b]).await;
+    a.write(".thecaignore", "*.log\nbuild/\n");
+    w.converge(&[&a, &b]).await;
+
+    a.write("a.log", "never up");
+    a.write("build/x.o", "never up");
+    a.write("keep.log", "edited on a");
+    std::fs::remove_file(b.path("old.log")).unwrap();
+    b.write("b.log", "never up");
+    a.write("marker-a.txt", "a's round ran");
+    b.write("marker-b.txt", "b's round ran");
+    marked(&w, "marker-a.txt").await;
+    marked(&w, "marker-b.txt").await;
+    let remote = w.remote(&w.library).await;
+    let names: Vec<&str> = remote.keys().map(String::as_str).collect();
+    assert_eq!(
+        names,
+        [
+            ".thecaignore",
+            "keep.log",
+            "marker-a.txt",
+            "marker-b.txt",
+            "old.log"
+        ]
+    );
+    assert_eq!(remote["keep.log"].as_deref(), Some(&b"stored before"[..]));
+    assert!(
+        w.admin
+            .library_trash(w.library.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing trashed"
+    );
+    assert!(
+        !a.notices()
+            .iter()
+            .chain(&b.notices())
+            .any(|n| n.contains("read-only")),
+        "silent: {:?}",
+        a.notices()
+    );
+
+    // A new version on the server comes down: onto a's unchanged old.log,
+    // and back onto b, which had deleted it.
+    let old = node(&a, "old.log");
+    let base = w.admin.versions(old).await.unwrap()[0].id;
+    theca_client::upload(
+        &w.admin,
+        &theca_client::MemorySource(b"from the server".to_vec()),
+        theca_client::Target::Version {
+            library: w.library.id,
+            file: old,
+            base: Some(base),
+        },
+        &theca_client::UploadOptions::default(),
+        |_| {},
+        &theca_client::Cancel::default(),
+    )
+    .await
+    .unwrap();
+    for device in [&a, &b] {
+        eventually("the server's version down", || async {
+            std::fs::read_to_string(device.path("old.log"))
+                .ok()
+                .as_deref()
+                == Some("from the server")
+        })
+        .await;
+    }
+
+    // Changed on the server and edited on a: b gets it; a keeps its edit,
+    // and no copy aside (its name could escape the pattern).
+    let keep = node(&a, "keep.log");
+    let base = w.admin.versions(keep).await.unwrap()[0].id;
+    theca_client::upload(
+        &w.admin,
+        &theca_client::MemorySource(b"keep, from the server".to_vec()),
+        theca_client::Target::Version {
+            library: w.library.id,
+            file: keep,
+            base: Some(base),
+        },
+        &theca_client::UploadOptions::default(),
+        |_| {},
+        &theca_client::Cancel::default(),
+    )
+    .await
+    .unwrap();
+    eventually("b has the server's keep.log", || async {
+        std::fs::read_to_string(b.path("keep.log")).ok().as_deref() == Some("keep, from the server")
+    })
+    .await;
+    a.write("marker-a2.txt", "a's round ran");
+    marked(&w, "marker-a2.txt").await;
+    assert_eq!(
+        std::fs::read_to_string(a.path("keep.log")).unwrap(),
+        "edited on a"
+    );
+    assert!(!a.path("keep (local).log").exists());
+
+    // Deleted on the server: deleted where unchanged (old.log), kept where
+    // edited (a's keep.log).
+    let (keep, old) = (node(&a, "keep.log"), node(&a, "old.log"));
+    w.admin.trash_nodes(&[keep, old], false).await.unwrap();
+    eventually("old.log deleted on a", || async {
+        !a.path("old.log").exists()
+    })
+    .await;
+    eventually("keep.log deleted on b", || async {
+        !b.path("keep.log").exists()
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(a.path("keep.log")).unwrap(),
+        "edited on a"
+    );
+
+    // The patterns removed: everything goes up.
+    a.write(".thecaignore", "# nothing\n");
+    eventually("everything up", || async {
+        let remote = w.remote(&w.library).await;
+        ["a.log", "b.log", "build/x.o", "keep.log"]
+            .iter()
+            .all(|p| remote.contains_key(*p))
+    })
+    .await;
+    w.converge(&[&a, &b]).await;
+}
+
+/// A folder paired with a library whose ignore file names some of its
+/// content: nothing of it goes up, not even before the ignore file is down.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_sync_waits_for_the_library_s_ignore_file() {
+    let w = world().await;
+    w.upload(&w.library, ".thecaignore", b"node_modules/\n*.tmp\n")
+        .await;
+    let mut a = w.device_for("a", &w.library, false).await;
+    a.write("node_modules/x/index.js", "never up");
+    a.write("scratch.tmp", "never up");
+    a.write("src.txt", "up");
+    a.restart();
+    marked(&w, "src.txt").await;
+    eventually("the ignore file down", || async {
+        a.path(".thecaignore").exists()
+    })
+    .await;
+    let remote = w.remote(&w.library).await;
+    let names: Vec<&str> = remote.keys().map(String::as_str).collect();
+    assert_eq!(names, [".thecaignore", "src.txt"]);
+}
+
+/// A tree moved into the pair from the same disk (one rename) arrives with
+/// its nested ignore file: the first scan sees it, nothing it names goes up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tree_moved_in_uploads_nothing_its_ignore_file_names() {
+    let w = world().await;
+    let a = w.device("a").await;
+    w.converge(&[&a]).await;
+    let outside = a.folder.parent().unwrap().join("outside");
+    for (path, content) in [
+        ("proj/sub/.thecaignore", "*.tmp\ncache/\n"),
+        ("proj/sub/x.tmp", "never up"),
+        ("proj/sub/cache/y", "never up"),
+        ("proj/sub/kept.txt", "up"),
+    ] {
+        let full = outside.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, content).unwrap();
+        settle(&full);
+    }
+    std::fs::rename(outside.join("proj"), a.path("proj")).unwrap();
+    marked(&w, "proj/sub/kept.txt").await;
+    let remote = w.remote(&w.library).await;
+    let names: Vec<&str> = remote.keys().map(String::as_str).collect();
+    assert_eq!(
+        names,
+        [
+            "proj",
+            "proj/sub",
+            "proj/sub/.thecaignore",
+            "proj/sub/kept.txt"
+        ]
+    );
+}
+
+/// A synced file moved into an ignored folder that was never stored (the
+/// scan doesn't enter it) isn't a deletion: it stays where it was on the
+/// server.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_moved_into_an_ignored_folder_stays_on_the_server() {
+    let w = world().await;
+    let a = w.device("a").await;
+    a.write(".thecaignore", "build/\n");
+    a.write("d/a.txt", "synced");
+    w.converge(&[&a]).await;
+    std::fs::create_dir_all(a.path("build")).unwrap();
+    std::fs::rename(a.path("d/a.txt"), a.path("build/a.txt")).unwrap();
+    a.write("marker.txt", "a's round ran");
+    marked(&w, "marker.txt").await;
+    // Past the quiet time deletions wait for, and a round after it.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    a.write("marker2.txt", "a's next round ran");
+    marked(&w, "marker2.txt").await;
+    assert!(w.remote(&w.library).await.contains_key("d/a.txt"));
+    assert!(
+        w.admin
+            .library_trash(w.library.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A folder deleted on the server, holding ignored files never stored: what
+/// was synced is deleted, the ignored files stay with their folder (never
+/// on the server), and the folder isn't uploaded again for them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_folder_deleted_on_the_server_keeps_its_ignored_files() {
+    let w = world().await;
+    let a = w.device("a").await;
+    a.write(".thecaignore", "*.log\n");
+    a.write("d/k.txt", "synced");
+    w.converge(&[&a]).await;
+    a.write("d/x.log", "only here");
+    let d = node(&a, "d");
+    w.admin.trash_nodes(&[d], false).await.unwrap();
+    eventually("k.txt deleted", || async { !a.path("d/k.txt").exists() }).await;
+    eventually("said", || async {
+        a.notices()
+            .iter()
+            .any(|n| n.contains("holds what isn't synced"))
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(a.path("d/x.log")).unwrap(),
+        "only here"
+    );
+    a.write("marker.txt", "a's round ran");
+    marked(&w, "marker.txt").await;
+    assert!(!w.remote(&w.library).await.contains_key("d"));
+}
+
+/// An ignore file's line that isn't UTF-8 is said on the pair; the rest
+/// applies.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ignore_file_s_bad_line_is_said() {
+    let w = world().await;
+    let a = w.device("a").await;
+    std::fs::write(a.path(".thecaignore"), b"\xff\n*.log\n").unwrap();
+    settle(&a.path(".thecaignore"));
+    a.write("a.log", "never up");
+    eventually("said", || async {
+        a.notices()
+            .iter()
+            .any(|n| n.starts_with(".thecaignore: ignore file: line 1 skipped"))
+    })
+    .await;
+    a.write("marker.txt", "a's round ran");
+    marked(&w, "marker.txt").await;
+    assert!(!w.remote(&w.library).await.contains_key("a.log"));
+}

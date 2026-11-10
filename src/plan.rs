@@ -10,6 +10,8 @@
 //! - Deletes go to the server's trash; a folder whose content changed
 //!   remotely is kept.
 //! - Names that can't go up are reported, never renamed.
+//! - What an ignore file names is read-only, silently: the server's changes
+//!   come down, nothing goes up (the local path decides).
 //!
 //! Actions name nodes, not paths: the executor finds a node's local path from
 //! the base as it updates it, so earlier actions (a move) are taken into
@@ -17,6 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use theca_common::ignore::is_ignore_file;
 use theca_common::name::Name;
 use uuid::Uuid;
 
@@ -130,6 +133,9 @@ pub struct Plan {
     /// Remote states needing nothing (the same as the base, gone on both
     /// sides): cleared at once. The others are cleared by their action.
     pub settled: Vec<Uuid>,
+    /// Uploads left for a later round: below a folder whose ignore file is
+    /// new or changed on the server, until that version is on disk.
+    pub wait: bool,
 }
 
 pub struct Input<'a> {
@@ -166,6 +172,35 @@ enum Local {
 
 pub fn plan(input: &Input) -> Plan {
     Planner::new(input).run()
+}
+
+/// The paths (by key) where the base or the server has a node: an ignored
+/// folder there is scanned (what's in it can still come down or be deleted),
+/// any other skipped whole.
+pub fn known_paths(
+    root: Uuid,
+    base: &[Entry],
+    remote: &[(Uuid, Option<RemoteState>)],
+) -> HashSet<Vec<String>> {
+    let scan = Scan::default();
+    let input = Input {
+        root,
+        base,
+        scan: &scan,
+        remote,
+        writable: true,
+    };
+    let planner = Planner::new(&input);
+    let mut known: HashSet<Vec<String>> = base
+        .iter()
+        .filter_map(|e| planner.base_keys(e.node))
+        .collect();
+    for &node in planner.remote.keys() {
+        if let Some(path) = planner.remote_path(node) {
+            known.insert(path.iter().map(|n| key(n)).collect());
+        }
+    }
+    known
 }
 
 /// Whether a pair's folder, its root back on another device number (an
@@ -277,6 +312,7 @@ impl<'a> Planner<'a> {
             .map(|(path, _)| path)
             .chain(&scan.links)
             .chain(&scan.elsewhere)
+            .chain(&scan.not_entered)
             .map(|path| path.split('/').map(key).collect())
             .collect();
         Planner {
@@ -301,8 +337,64 @@ impl<'a> Planner<'a> {
         self.base_nodes();
         self.remote_new();
         self.local_new();
+        self.wait_for_ignore_files();
         self.order();
         self.plan
+    }
+
+    /// Whether the plan may change the server for the local item `i`: the
+    /// library writable, and the item not ignored (read-only, silently).
+    fn writable(&self, i: usize) -> bool {
+        self.input.writable && !self.items()[i].ignored
+    }
+
+    /// Whether a base node the scan didn't find was at an ignored place.
+    fn ignored_base(&self, node: Uuid) -> bool {
+        let is_dir = !self.base[&node].is_file;
+        self.input
+            .scan
+            .ignores
+            .is_ignored(&self.base_path(node), is_dir)
+    }
+
+    /// Below a folder whose ignore file is new or changed on the server,
+    /// nothing goes up until that version is on disk (downloaded this round,
+    /// after the uploads): the folder may ignore what would go. Its ignore
+    /// file itself goes (a local edit wins).
+    fn wait_for_ignore_files(&mut self) {
+        let waiting: Vec<Vec<String>> = self
+            .pending
+            .iter()
+            .filter_map(|(&node, state)| {
+                let s = (*state)?;
+                let changed = self.base.get(&node).is_none_or(|e| e.version != s.version);
+                // One ignored and edited here never comes down: nothing to
+                // wait for.
+                let stays = matches!(self.local.get(&node),
+                    Some(Local::Present { item, modified: true, .. }) if self.items()[*item].ignored);
+                (s.is_file && is_ignore_file(&s.name) && changed && !stays).then_some(s.parent)
+            })
+            .filter_map(|folder| self.remote_path(folder))
+            .map(|path| path.iter().map(|n| key(n)).collect())
+            .collect();
+        if waiting.is_empty() {
+            return;
+        }
+        let before = self.plan.actions.len();
+        self.plan.actions.retain(|a| {
+            let path = match a {
+                Action::Upload { path, .. }
+                | Action::RemoteMkdir { path, .. }
+                | Action::Merge { path, .. } => path,
+                _ => return true,
+            };
+            let keys: Vec<String> = path.iter().map(|n| key(n)).collect();
+            path.last().is_some_and(|n| is_ignore_file(n))
+                || !waiting
+                    .iter()
+                    .any(|w| keys.len() > w.len() && keys.starts_with(w))
+        });
+        self.plan.wait = self.plan.actions.len() < before;
     }
 
     /// Which local items are which base nodes: by name within their parent
@@ -403,8 +495,12 @@ impl<'a> Planner<'a> {
         let claimed_at: HashMap<Uuid, usize> = self.claimed.iter().map(|(i, n)| (*n, *i)).collect();
         for e in self.input.base {
             // A name the scan skips is never seen either (an ignored file
-            // downloaded before: never trashed for being absent).
+            // downloaded before: never trashed for being absent); nor is a
+            // synced file moved into an ignored folder the scan didn't enter.
             let unseen = local::skipped(&e.name)
+                || e.file_id
+                    .as_ref()
+                    .is_some_and(|id| self.input.scan.hidden_ids.contains(id))
                 || self.base_keys(e.node).is_some_and(|k| self.is_unseen(&k))
                 || self
                     .local_keys(&claimed_at, e.node)
@@ -503,7 +599,8 @@ impl<'a> Planner<'a> {
         // The folder itself too: renamed locally, it's a modification (it wins
         // over the remote delete).
         items.iter().enumerate().any(|(i, it)| {
-            it.path.len() >= prefix.len()
+            !it.ignored
+                && it.path.len() >= prefix.len()
                 && it.path.starts_with(prefix)
                 && match self.claimed.get(&i) {
                     None => true,
@@ -558,14 +655,15 @@ impl<'a> Planner<'a> {
                     if content || (!r.is_file && self.remote_news_below(node)) {
                         // The modification wins: back locally.
                         self.restore_locally(node, &r);
-                    } else if !writable {
+                    } else if !writable || self.ignored_base(node) {
                         // Neither uploaded nor reverted: listed, once for a
-                        // folder deleted with its content. Out of the base, so
-                        // that a role made writable later trashes nothing; it
-                        // comes back if it changes on the server.
+                        // folder deleted with its content (an ignored one
+                        // silently). Out of the base, so that a role made
+                        // writable later trashes nothing; it comes back if it
+                        // changes on the server.
                         let parent_deleted =
                             matches!(self.local.get(&e.parent), Some(Local::Deleted));
-                        if !parent_deleted {
+                        if !parent_deleted && !self.ignored_base(node) {
                             let path = self.remote_path(node).unwrap_or_default().join("/");
                             self.report(path, "not uploaded: read-only library", Level::Error);
                         }
@@ -585,6 +683,7 @@ impl<'a> Planner<'a> {
                 ) => {
                     let keep =
                         (e.is_file && modified) || (!e.is_file && self.local_news_below(node));
+                    let writable = self.writable(item);
                     if keep && writable {
                         // The modification wins: uploaded again, as new.
                         let path = self.items()[item].path.clone();
@@ -603,11 +702,13 @@ impl<'a> Planner<'a> {
                         }
                         self.plan.actions.push(Action::Forget { node });
                     } else if keep {
-                        self.report(
-                            self.items()[item].display(),
-                            "not uploaded: read-only library",
-                            Level::Error,
-                        );
+                        if !self.items()[item].ignored {
+                            self.report(
+                                self.items()[item].display(),
+                                "not uploaded: read-only library",
+                                Level::Error,
+                            );
+                        }
                     } else {
                         self.plan.actions.push(Action::LocalDelete { node });
                     }
@@ -624,6 +725,7 @@ impl<'a> Planner<'a> {
                     // The remote view is the base where nothing changed.
                     let content = r.is_file && r.version != e.version;
                     let path = self.items()[item].path.clone();
+                    let (writable, ignored) = (self.writable(item), self.items()[item].ignored);
                     // The place: a local move goes up (it wins over a remote
                     // one), a remote one comes down.
                     match (&moved, writable) {
@@ -644,6 +746,7 @@ impl<'a> Planner<'a> {
                                 Level::Error,
                             ),
                         },
+                        (Some(_), false) if ignored => {}
                         (Some(_), false) => {
                             self.report(
                                 self.items()[item].display(),
@@ -678,6 +781,10 @@ impl<'a> Planner<'a> {
                                 base: e.version,
                             },
                         }),
+                        // Ignored: the local copy stays, nothing comes over it
+                        // (a copy kept aside under another name could escape
+                        // the pattern, and go up).
+                        (true, true, false) if ignored => {}
                         (true, true, false) => {
                             self.plan.actions.push(Action::KeepAside { node });
                             self.plan.actions.push(Action::Download {
@@ -687,6 +794,7 @@ impl<'a> Planner<'a> {
                                 state,
                             });
                         }
+                        (true, false, false) if ignored => {}
                         (true, false, false) => self.report(
                             self.items()[item].display(),
                             "not uploaded: read-only library",
@@ -807,7 +915,7 @@ impl<'a> Planner<'a> {
                 // adopted; anything else stays, listed, never replaced.
                 // ponytail: different bytes with the same size and time to the
                 // nanosecond pass for the same.
-                Some(i) if r.is_file && items[i].is_file && !self.input.writable => {
+                Some(i) if r.is_file && items[i].is_file && !self.writable(i) => {
                     self.claimed.insert(i, node);
                     let item = &items[i];
                     let same = item.size == state.size
@@ -815,7 +923,7 @@ impl<'a> Planner<'a> {
                     if same {
                         let path = item.path.clone();
                         self.plan.actions.push(Action::Adopt { node, path, state });
-                    } else {
+                    } else if !item.ignored {
                         self.report(
                             item.display(),
                             "not synced: another file has this name (read-only library)",
@@ -953,7 +1061,8 @@ impl<'a> Planner<'a> {
             .map(|r| (Parent::Node(r.parent), key(&r.name)))
             .collect();
         for (i, item) in items.iter().enumerate() {
-            if self.claimed.contains_key(&i) {
+            // An ignored item never goes up (its content is ignored with it).
+            if self.claimed.contains_key(&i) || item.ignored {
                 continue;
             }
             if rejected.iter().any(|r| item.path.starts_with(r)) {
@@ -1102,6 +1211,7 @@ mod tests {
             size: e.map_or(3, |e| e.size),
             mtime: e.map_or(7, |e| e.mtime),
             file_id: e.and_then(|e| e.file_id.clone()),
+            ignored: false,
         }
     }
 
@@ -1978,5 +2088,307 @@ mod tests {
         let (base, items) = synced();
         let plan = run(&base, items[..1].to_vec(), &[(id(2), None)]);
         assert_eq!(plan.actions, [Action::Forget { node: id(2) }]);
+    }
+
+    /// A scan as `local::scan` makes it: the root's ignore file `content`,
+    /// each item marked by it.
+    fn ignoring(mut items: Vec<Item>, content: &str) -> Scan {
+        let mut ignores = theca_common::ignore::Ignores::new();
+        ignores.add(&[] as &[&str], content.as_bytes());
+        for item in &mut items {
+            item.ignored = ignores.is_ignored(&item.path, !item.is_file);
+        }
+        Scan {
+            items,
+            ignores,
+            ..Scan::default()
+        }
+    }
+
+    fn modified(mut item: Item) -> Item {
+        item.size += 1;
+        item
+    }
+
+    /// I1: what an ignore file names never goes up, silently: a new file, a
+    /// new folder and what's in it; the rest goes.
+    #[test]
+    fn ignored_items_never_go_up() {
+        let scan = ignoring(
+            vec![
+                item("a.log", None, true),
+                item("b.txt", None, true),
+                item("build", None, false),
+                item("build/out.o", None, true),
+            ],
+            "*.log\nbuild/\n",
+        );
+        let plan = plan_scan(&[], scan, &[]);
+        assert!(
+            matches!(&plan.actions[..], [Action::Upload { path, .. }] if path == &["b.txt"]),
+            "{:?}",
+            plan.actions
+        );
+        assert!(plan.reports.is_empty(), "{:?}", plan.reports);
+        assert!(!plan.wait);
+    }
+
+    /// I2: a stored file an ignore file names is read-only, silently: a local
+    /// edit stays; the server's version comes down; both changed, the local
+    /// copy stays and nothing comes over it (no copy kept aside: its other
+    /// name could escape the pattern).
+    #[test]
+    fn a_stored_ignored_file_is_read_only() {
+        let a = entry(1, ROOT, "a.log", v(1));
+        let edited = || ignoring(vec![modified(item("a.log", Some(&a), true))], "*.log\n");
+        let plan = plan_scan(std::slice::from_ref(&a), edited(), &[]);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert!(plan.reports.is_empty(), "{:?}", plan.reports);
+
+        let newer = [(id(1), remote(ROOT, "a.log", v(2)))];
+        let plan = plan_scan(std::slice::from_ref(&a), edited(), &newer);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert!(plan.reports.is_empty(), "{:?}", plan.reports);
+        let unchanged = ignoring(vec![item("a.log", Some(&a), true)], "*.log\n");
+        let plan = plan_scan(std::slice::from_ref(&a), unchanged, &newer);
+        assert!(
+            matches!(&plan.actions[..], [Action::Download { .. }]),
+            "{:?}",
+            plan.actions
+        );
+    }
+
+    /// I3: deleted locally, a stored ignored file is forgotten, never
+    /// trashed on the server (silently); deleted on the server, it's
+    /// deleted locally if unchanged, kept (silently) if edited.
+    #[test]
+    fn deletions_of_ignored_files_come_down_only() {
+        let a = entry(1, ROOT, "a.log", v(1));
+        let base = std::slice::from_ref(&a);
+        let plan = plan_scan(base, ignoring(vec![], "*.log\n"), &[]);
+        assert_eq!(plan.actions, [Action::Forget { node: id(1) }]);
+        assert!(plan.reports.is_empty(), "{:?}", plan.reports);
+
+        let gone = [(id(1), None)];
+        let unchanged = ignoring(vec![item("a.log", Some(&a), true)], "*.log\n");
+        let plan = plan_scan(base, unchanged, &gone);
+        assert_eq!(plan.actions, [Action::LocalDelete { node: id(1) }]);
+        let edited = ignoring(vec![modified(item("a.log", Some(&a), true))], "*.log\n");
+        let plan = plan_scan(base, edited, &gone);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert!(plan.reports.is_empty(), "{:?}", plan.reports);
+    }
+
+    /// I4: what's new on the server at an ignored path comes down; at a
+    /// first sync, a local file differing from it stays, silently, and one
+    /// identical (as downloaded) is adopted.
+    #[test]
+    fn the_server_s_ignored_files_come_down() {
+        let new = [
+            (id(1), remote(ROOT, "build", None)),
+            (id(2), remote(id(1), "x.o", v(1))),
+        ];
+        let plan = plan_scan(&[], ignoring(vec![], "build/\n"), &new);
+        assert!(
+            matches!(
+                &plan.actions[..],
+                [Action::LocalMkdir { .. }, Action::Download { .. }]
+            ),
+            "{:?}",
+            plan.actions
+        );
+        let there = [(id(2), remote(ROOT, "a.log", v(1)))];
+        let plan = plan_scan(
+            &[],
+            ignoring(vec![item("a.log", None, true)], "*.log\n"),
+            &there,
+        );
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert!(plan.reports.is_empty(), "{:?}", plan.reports);
+        let mut downloaded = item("a.log", None, true);
+        downloaded.size = 20;
+        downloaded.mtime = 9;
+        let mut state = remote(ROOT, "a.log", v(1)).unwrap();
+        state.modified = chrono::DateTime::from_timestamp_nanos(9).into();
+        let plan = plan_scan(
+            &[],
+            ignoring(vec![downloaded], "*.log\n"),
+            &[(id(2), Some(state))],
+        );
+        assert!(
+            matches!(&plan.actions[..], [Action::Adopt { .. }]),
+            "{:?}",
+            plan.actions
+        );
+    }
+
+    /// I5: the local path decides: a synced file moved into an ignored
+    /// folder isn't moved on the server (silently); a stored ignored file
+    /// moved out to a path not ignored goes up as a move.
+    #[test]
+    fn the_local_path_decides() {
+        let d = entry(1, ROOT, "d", None);
+        let a = entry(2, id(1), "a.txt", v(1));
+        let build = entry(3, ROOT, "build", None);
+        let base = [d.clone(), a.clone(), build.clone()];
+        let into = ignoring(
+            vec![
+                item("build", Some(&build), false),
+                item("build/a.txt", Some(&a), true),
+                item("d", Some(&d), false),
+            ],
+            "build/\n",
+        );
+        let plan = plan_scan(&base, into, &[]);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert!(plan.reports.is_empty(), "{:?}", plan.reports);
+
+        let b = entry(4, id(3), "b.o", v(2));
+        let base = [d.clone(), build.clone(), b.clone()];
+        let out = ignoring(
+            vec![
+                item("build", Some(&build), false),
+                item("d", Some(&d), false),
+                item("d/b.o", Some(&b), true),
+            ],
+            "build/\n",
+        );
+        let plan = plan_scan(&base, out, &[]);
+        assert!(
+            matches!(&plan.actions[..], [Action::RemoteMove { node, .. }] if *node == id(4)),
+            "{:?}",
+            plan.actions
+        );
+    }
+
+    /// I6: ignored items never count as new in their folder: a folder gone
+    /// on the server isn't uploaded again for them, it's deleted locally
+    /// (the executor keeps what's left in it).
+    #[test]
+    fn ignored_items_keep_no_folder_alive() {
+        let d = entry(1, ROOT, "d", None);
+        let scan = ignoring(
+            vec![item("d", Some(&d), false), item("d/x.log", None, true)],
+            "*.log\n",
+        );
+        let plan = plan_scan(std::slice::from_ref(&d), scan, &[(id(1), None)]);
+        assert_eq!(plan.actions, [Action::LocalDelete { node: id(1) }]);
+    }
+
+    /// I7: below a folder whose ignore file is new or changed on the server,
+    /// nothing goes up until it's on disk: the round downloads it and asks
+    /// for another. The ignore file's own local edit still goes.
+    #[test]
+    fn uploads_wait_for_the_server_s_ignore_file() {
+        let d = entry(1, ROOT, "d", None);
+        let i = entry(2, id(1), ".thecaignore", v(1));
+        let base = [d.clone(), i.clone()];
+        let changed = [(id(2), remote(id(1), ".thecaignore", v(2)))];
+        let items = vec![
+            item("d", Some(&d), false),
+            item("d/.thecaignore", Some(&i), true),
+            item("d/new.txt", None, true),
+            item("top.txt", None, true),
+        ];
+        let plan = plan_scan(&base, ignoring(items.clone(), ""), &changed);
+        assert!(plan.wait);
+        let uploads: Vec<&Vec<String>> = plan
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Upload { path, .. } => Some(path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uploads, [&vec!["top.txt".to_owned()]]);
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| matches!(a, Action::Download { node, .. } if *node == id(2)))
+        );
+
+        let mut edited = items;
+        edited[1] = modified(edited[1].clone());
+        let plan = plan_scan(&base, ignoring(edited.clone(), ""), &changed);
+        assert!(plan.actions.iter().any(
+            |a| matches!(a, Action::Upload { path, .. } if path.last().unwrap() == ".thecaignore")
+        ));
+        // One that ignores itself, edited here: it never comes down, nothing
+        // waits for it.
+        let plan = plan_scan(&base, ignoring(edited, "d/.thecaignore\n"), &changed);
+        assert!(!plan.wait);
+        assert!(plan.actions.iter().any(
+            |a| matches!(a, Action::Upload { path, .. } if path.last().unwrap() == "new.txt")
+        ));
+        // A new one at the root holds the whole pair.
+        let new = [(id(3), remote(ROOT, ".thecaignore", v(3)))];
+        let plan = plan_scan(&[], ignoring(vec![item("top.txt", None, true)], ""), &new);
+        assert!(plan.wait);
+        assert!(
+            !plan
+                .actions
+                .iter()
+                .any(|a| matches!(a, Action::Upload { .. }))
+        );
+        // Once on disk (in the base), uploads go.
+        let synced = entry(3, ROOT, ".thecaignore", v(3));
+        let items = vec![
+            item(".thecaignore", Some(&synced), true),
+            item("top.txt", None, true),
+        ];
+        let plan = plan_scan(&[synced], ignoring(items, ""), &[]);
+        assert!(!plan.wait);
+        assert!(
+            plan.actions
+                .iter()
+                .any(|a| matches!(a, Action::Upload { .. }))
+        );
+    }
+
+    /// I8: an ignored folder the scan skipped is unseen: nothing below it is
+    /// trashed, and what arrives there waits for a scan that enters it.
+    #[test]
+    fn a_skipped_ignored_folder_is_unseen() {
+        let nm = entry(1, ROOT, "node_modules", None);
+        let x = entry(2, id(1), "x.js", v(1));
+        let scan = Scan {
+            not_entered: vec!["node_modules".into()],
+            ..ignoring(vec![], "node_modules/\n")
+        };
+        let new = [(id(3), remote(id(1), "y.js", v(2)))];
+        let plan = plan_scan(&[nm, x], scan, &new);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+    }
+
+    /// I9: a synced file moved into an ignored folder the scan didn't enter
+    /// is no deletion once its file ID is found there (the engine looks
+    /// before trashing); unfound, it would be trashed.
+    #[test]
+    fn a_file_moved_into_a_folder_not_entered_is_no_deletion() {
+        let a = entry(1, ROOT, "a.txt", v(1));
+        let scan = |hidden: &[&str]| Scan {
+            not_entered: vec!["build".into()],
+            hidden_ids: hidden.iter().map(|s| s.to_string()).collect(),
+            ..ignoring(vec![], "build/\n")
+        };
+        let plan = plan_scan(std::slice::from_ref(&a), scan(&[]), &[]);
+        assert_eq!(plan.actions, [Action::RemoteTrash { node: id(1) }]);
+        let plan = plan_scan(std::slice::from_ref(&a), scan(&["f1"]), &[]);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+    }
+
+    /// The paths the scan enters ignored folders at: the base's and the
+    /// server's, by key.
+    #[test]
+    fn known_paths_are_the_base_s_and_the_server_s() {
+        let d = entry(1, ROOT, "D", None);
+        let a = entry(2, id(1), "a.txt", v(1));
+        let pending = [(id(3), remote(id(1), "New", None)), (id(2), None)];
+        let known = known_paths(ROOT, &[d, a], &pending);
+        let keys = |p: &[&str]| p.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert!(known.contains(&keys(&["d"])));
+        assert!(known.contains(&keys(&["d", "a.txt"])));
+        assert!(known.contains(&keys(&["d", "new"])));
+        assert!(!known.contains(&keys(&["x"])));
     }
 }
