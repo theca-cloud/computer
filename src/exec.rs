@@ -1317,6 +1317,21 @@ impl<'a> SyncSink<'a> {
                 "changed locally during the download",
             )
         };
+        // A drive (FUSE): the part and the target exchanged in one step,
+        // then the target checked. Moved aside, it showed as `<name> (local)`
+        // for a moment, and a round scanning beside the fetch took it for a
+        // rename and renamed the file on the server. Where the file system
+        // can't exchange, as below.
+        #[cfg(target_os = "linux")]
+        if self.pair.mode == crate::state::Mode::Drive {
+            #[cfg(test)]
+            if let Some(meanwhile) = &self.meanwhile {
+                meanwhile();
+            }
+            if let Some(swapped) = self.swap_in() {
+                return swapped;
+            }
+        }
         // A new file: nothing may be replaced, but a drive's placeholder.
         if self.expected.is_none() && !is_placeholder(&self.pair, &self.target) {
             return local::rename_new(&self.part, &self.target).map_err(|_| changed());
@@ -1360,6 +1375,49 @@ impl<'a> SyncSink<'a> {
                 let _ = local::rename_new(&aside, &self.target);
                 Err(e)
             }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SyncSink<'_> {
+    /// The part and the target exchanged atomically (the file is always
+    /// there, under its name); what was there, now at the part's hidden
+    /// name, removed if it may be replaced, else swapped back. `None`: not
+    /// exchanged (no target, or a file system without it).
+    fn swap_in(&self) -> Option<io::Result<()>> {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        let exchange = || renameat_with(CWD, &self.part, CWD, &self.target, RenameFlags::EXCHANGE);
+        exchange().ok()?;
+        if self.replaceable(&self.part) {
+            let _ = std::fs::remove_file(&self.part);
+            return Some(Ok(()));
+        }
+        // Back: what is there stays, the download is dropped. Not back: kept
+        // beside, visible, never left under the part's hidden name.
+        if exchange().is_err() {
+            let _ = local::rename_new(&self.part, &aside(&self.target));
+        }
+        let _ = std::fs::remove_file(&self.part);
+        Some(Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "changed locally during the download",
+        )))
+    }
+
+    /// What a download may replace: the base's file as synced, or a
+    /// placeholder, the one it was for (a placeholder renamed over it
+    /// meanwhile is another file: it stays).
+    fn replaceable(&self, old: &Path) -> bool {
+        match &self.expected {
+            Some((size, mtime, id)) => {
+                local::unchanged(old, *size, *mtime, id.as_deref())
+                    || (is_placeholder(&self.pair, old)
+                        && id
+                            .as_deref()
+                            .is_none_or(|id| local::file_id(old).as_deref() == Some(id)))
+            }
+            None => is_placeholder(&self.pair, old),
         }
     }
 }
@@ -1653,6 +1711,111 @@ mod tests {
                 "atomic: {atomic}, {contents:?}"
             );
         }
+    }
+
+    /// A drive's file fetched over its placeholder is there under its name
+    /// at every moment: a scan never sees it gone, nor under another name
+    /// (the `(local)` name it once stepped aside to read as a rename, and
+    /// the round renamed it on the server).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fetched_placeholder_is_never_seen_elsewhere() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("x.txt");
+        let state = State::memory().unwrap();
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let seen = s.spawn(|| {
+                let mut wrong = Vec::new();
+                while !done.load(Ordering::Acquire) {
+                    let names: Vec<String> = std::fs::read_dir(dir.path())
+                        .unwrap()
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|n| !local::skipped(n))
+                        .collect();
+                    if names != ["x.txt"] {
+                        wrong.push(names);
+                    }
+                }
+                wrong
+            });
+            for _ in 0..300 {
+                let file = std::fs::File::create(&target).unwrap();
+                crate::drive::placeholder::write(&file, 10).unwrap();
+                drop(file);
+                let sink = SyncSink::new(&drive(dir.path()), record(&state), &target, None, None);
+                sink.write_at(0, b"downloaded").unwrap();
+                sink.finish().unwrap();
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "downloaded");
+            }
+            done.store(true, Ordering::Release);
+            let wrong = seen.join().unwrap();
+            assert!(wrong.is_empty(), "seen: {:?}", &wrong[..wrong.len().min(3)]);
+        });
+    }
+
+    /// Another placeholder renamed over the one being fetched (FUSE's rename
+    /// holds only its source): it isn't replaced; the fetch fails, the
+    /// round follows the rename.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fetch_never_lands_over_another_placeholder() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.txt");
+        let file = std::fs::File::create(&target).unwrap();
+        crate::drive::placeholder::write(&file, 10).unwrap();
+        drop(file);
+        let expected = fingerprint(&target);
+        let state = State::memory().unwrap();
+        let mut sink = SyncSink::new(
+            &drive(dir.path()),
+            record(&state),
+            &target,
+            Some(expected),
+            None,
+        );
+        let (at, other) = (target.clone(), dir.path().join("c.txt"));
+        sink.meanwhile = Some(Box::new(move || {
+            let file = std::fs::File::create(&other).unwrap();
+            crate::drive::placeholder::write(&file, 3).unwrap();
+            drop(file);
+            std::fs::rename(&other, &at).unwrap();
+        }));
+        sink.write_at(0, b"downloaded").unwrap();
+        assert!(sink.finish().is_err());
+        assert!(
+            crate::drive::is_placeholder(&target),
+            "c's placeholder stays"
+        );
+        assert_eq!(std::fs::metadata(&target).unwrap().len(), 3);
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().collect();
+        assert_eq!(names.len(), 1, "no part left");
+    }
+
+    /// Edited through the mount just before the fetch lands: the edit stays,
+    /// the download is dropped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_fetch_never_lands_over_an_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("x.txt");
+        let file = std::fs::File::create(&target).unwrap();
+        crate::drive::placeholder::write(&file, 10).unwrap();
+        drop(file);
+        let state = State::memory().unwrap();
+        let mut sink = SyncSink::new(&drive(dir.path()), record(&state), &target, None, None);
+        let at = target.clone();
+        sink.meanwhile = Some(Box::new(move || {
+            std::fs::remove_file(&at).unwrap();
+            std::fs::write(&at, "edited").unwrap();
+        }));
+        sink.write_at(0, b"downloaded").unwrap();
+        assert!(sink.finish().is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "edited");
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().flatten().collect();
+        assert_eq!(names.len(), 1, "no part left");
     }
 
     /// A drive's pair (Linux: placeholders in its folder).

@@ -1384,6 +1384,14 @@ impl Follower {
                 return Ok(());
             }
         };
+        // A drive's fetch recorded between the base and the scan: the scan
+        // shows the file downloaded, the base still a placeholder, and the
+        // plan would read that as an edit (sent up, a pending remote delete
+        // undone). The next round plans from both after it.
+        if drive && self.state.entries(p.id)? != base {
+            self.dirty.insert(p.id);
+            return Ok(());
+        }
         let real = p.path.canonicalize().unwrap_or_else(|_| p.path.clone());
         self.skipped
             .lock()
