@@ -1,26 +1,23 @@
 <script lang="ts">
-	// An account's settings: its default folder (where new libraries go) and
-	// its auto-sync limit (new libraries under it sync by themselves).
+	// An account's settings: its default folder (where new libraries go),
+	// what libraries new to it do, and the size up to which they sync.
 	import { invoke } from '@tauri-apps/api/core';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import { Input } from '#lib/components/ui/input/index.js';
 	import { Label } from '#lib/components/ui/label/index.js';
-	import { Switch } from '#lib/components/ui/switch/index.js';
-	import { attempt, type Account } from '#lib/app.svelte.js';
+	import { attempt, type Account, type NewLibraries } from '#lib/app.svelte.js';
 	import { m } from '#lib/paraglide/messages.js';
 
 	let { account }: { account: Account } = $props();
 
 	// The engine's unit (ops::AUTO_SYNC_LIMIT is 500 MiB), shown as "MB".
 	const MB = 1024 * 1024;
-	let mb = $derived(
-		account.auto_sync_limit === null ? 500 : Math.round(account.auto_sync_limit / MB)
-	);
+	let mb = $derived(Math.round(account.auto_sync_limit / MB));
 
-	function save(defaultFolder: string, autoSyncLimit: number | null) {
+	function save(defaultFolder: string, newLibraries: NewLibraries, autoSyncLimit: number) {
 		return attempt(() =>
-			invoke('set_account', { account: account.id, defaultFolder, autoSyncLimit })
+			invoke('set_account', { account: account.id, defaultFolder, newLibraries, autoSyncLimit })
 		);
 	}
 
@@ -28,7 +25,8 @@
 		const picked = await attempt(() =>
 			open({ directory: true, defaultPath: account.default_folder })
 		);
-		if (typeof picked === 'string') await save(picked, account.auto_sync_limit);
+		if (typeof picked === 'string')
+			await save(picked, account.new_libraries, account.auto_sync_limit);
 	}
 </script>
 
@@ -50,28 +48,41 @@
 			</Button>
 		</div>
 	</div>
-	<div class="flex flex-wrap items-center gap-3">
-		<div class="flex items-center gap-2">
-			<Switch
-				id="limit-on-{account.id}"
-				checked={account.auto_sync_limit !== null}
-				onCheckedChange={(on) => save(account.default_folder, on ? mb * MB : null)}
+	<div class="flex flex-wrap items-center gap-2">
+		<Label for="new-libraries-{account.id}">{m.first_new()}</Label>
+		<select
+			id="new-libraries-{account.id}"
+			class="h-8 rounded-md border bg-background px-2 text-sm"
+			value={account.new_libraries}
+			onchange={(e) =>
+				save(
+					account.default_folder,
+					e.currentTarget.value as NewLibraries,
+					account.auto_sync_limit
+				)}
+		>
+			<option value="notify">{m.new_notify()}</option>
+			<option value="silent">{m.new_silent()}</option>
+			<option value="sync">{m.new_sync()}</option>
+			<option value="drive">{m.new_drive()}</option>
+		</select>
+		{#if account.new_libraries === 'sync'}
+			<Label for="limit-{account.id}" class="text-xs">{m.new_limit()}</Label>
+			<Input
+				id="limit-{account.id}"
+				type="number"
+				min="0"
+				class="w-24"
+				bind:value={mb}
+				onchange={() =>
+					typeof mb === 'number' &&
+					mb >= 0 &&
+					save(account.default_folder, 'sync', Math.round(mb) * MB)}
 			/>
-			<Label for="limit-on-{account.id}">{m.auto_sync()}</Label>
-		</div>
-		{#if account.auto_sync_limit !== null}
-			<div class="flex items-center gap-2">
-				<Label for="limit-{account.id}" class="sr-only">{m.auto_sync_limit()}</Label>
-				<Input
-					id="limit-{account.id}"
-					type="number"
-					min="1"
-					class="w-24"
-					bind:value={mb}
-					onchange={() => mb >= 1 && save(account.default_folder, Math.round(mb) * MB)}
-				/>
-				<span class="text-sm text-muted-foreground">{m.auto_sync_unit()}</span>
-			</div>
+			<span class="text-sm text-muted-foreground">{m.auto_sync_unit()}</span>
 		{/if}
 	</div>
+	{#if account.new_libraries === 'sync'}
+		<p class="text-xs text-muted-foreground">{m.new_limit_hint()}</p>
+	{/if}
 </div>

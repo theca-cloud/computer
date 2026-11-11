@@ -4,7 +4,8 @@
 #   lint  released migrations untouched, formatting, clippy (warnings are
 #         errors), the app's page, the app built
 #   test  every test (the end-to-end ones need a Postgres, scripts/dev.sh's or
-#         DATABASE_URL's, and the server, built from the pinned core)
+#         DATABASE_URL's, and the server, built from the pinned core);
+#         `test <filter>`: only those whose names match
 #   app   the app driven through its window (Linux: tauri-driver, under a
 #         virtual screen; the CI image has them)
 #   deny  licenses, advisories, sources (Rust and the page's npm packages)
@@ -12,10 +13,11 @@ set -eu
 cd "$(dirname "$0")/.."
 
 step=${1:-all}
+filter=${2:-}
 case "$step" in
     all | lint | test | app | deny) ;;
     *)
-        echo "usage: scripts/ci.sh [lint|test|app|deny]" >&2
+        echo "usage: scripts/ci.sh [lint|test [<filter>]|app|deny]" >&2
         exit 2
         ;;
 esac
@@ -64,8 +66,11 @@ released_guard() {
 
 if [ "$step" = all ] || [ "$step" = lint ]; then
     released_guard
-    cargo fmt --check
+    cargo fmt --all --check
     cargo clippy --features crash-points --all-targets -- -D warnings
+    # macOS's File Provider extension and calls (a stub elsewhere: its
+    # protocol is still checked).
+    cargo clippy -p theca-fileprovider --all-targets -- -D warnings
     # The app: its page (formatting, lint, types), built, then embedded in the
     # `gui` build, linted too (needs WebKitGTK on Linux).
     [ -d ui/node_modules ] || npm --prefix ui ci
@@ -83,7 +88,13 @@ if [ "$step" = all ] || [ "$step" = test ]; then
     server
     # The crash tests' named points (tests/crash.rs) built in: inert unless
     # THECA_CRASH_AT names one.
-    cargo test --features crash-points
+    if [ -n "$filter" ]; then
+        cargo test --features crash-points -- "$filter"
+        cargo test -p theca-fileprovider -- "$filter"
+    else
+        cargo test --features crash-points
+        cargo test -p theca-fileprovider
+    fi
 fi
 # Only Linux has a WebDriver for WebKit: elsewhere, `all` skips it, and the app
 # is checked by hand (the sprint's checklist).

@@ -1,8 +1,8 @@
 # Theca for computers
 
-The Theca app for macOS, Windows and Linux: local folders kept identical to Theca libraries, both ways. A tray app with a small window, or a CLI and daemon (`theca`) for servers.
+The Theca app for macOS, Windows and Linux: local folders kept identical to Theca libraries, both ways, or libraries as drives (all shown, a file downloaded when opened). A tray app with a small window, or a CLI and daemon (`theca`) for servers.
 
-Installing it, the app password and the keychain, headless use (commands, exit codes, environment variables, where it keeps its state): **[USING.md](USING.md)**, also on [theca.rs/computer](https://theca.rs/computer).
+Installing it, the app password and the keychain, drives, headless use (commands, exit codes, environment variables, where it keeps its state): **[USING.md](USING.md)**, also on [theca.rs/computer](https://theca.rs/computer).
 
 ## Development
 
@@ -14,6 +14,7 @@ npm --prefix ui ci             # the app's page, once
 cargo run -- --help            # the CLI (no app in this build)
 npm --prefix ui run build && cargo run --features gui,custom-protocol   # the app
 scripts/ci.sh [lint|test|app|deny]   # every CI check, or one step (app: Linux only)
+scripts/ci.sh test mac_drive         # the tests whose names match (the server built too)
 cargo fmt && npm --prefix ui run format   # fix formatting
 ```
 

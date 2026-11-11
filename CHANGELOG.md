@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.2.0] - 2026-11-11
+
+### Features
+
+- **drive**: Libraries as drives on Linux, Windows and macOS
+- **logs**: Logs to files, a day each, with their context
+- **libraries**: A first step to choose them, and what new ones do
+
+### Fixes
+
+- Core 1.6.2, a network error without its URL's query
+- **drive**: A download never shows a drive's file under another name
+
 ## [1.1.0] - 2026-11-10
 
 ### Features

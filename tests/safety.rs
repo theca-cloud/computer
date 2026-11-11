@@ -187,6 +187,7 @@ async fn a_pair_is_never_inside_or_around_another() {
             &notes.id.to_string(),
             Some(path.clone()),
             true,
+            theca::state::Mode::Sync,
         )
         .await;
         assert!(
@@ -205,7 +206,6 @@ async fn two_accounts_never_share_a_folder() {
     let a = w.device("a").await;
     w.converge(&[&a]).await;
     let (member, user) = w.member("m@test.theca").await;
-    w.set_member(&w.library, user, true).await;
     let created = member
         .create_app_password(&theca_common::api::CreateAppPassword {
             name: "a".into(),
@@ -223,11 +223,14 @@ async fn two_accounts_never_share_a_folder() {
         Some(a.folder.parent().unwrap().to_owned()),
         Some(created.password),
         true,
+        Some(theca::state::NewLibraries::Sync),
+        theca::state::NewLibraries::Sync,
         |_| panic!("a token needs no browser"),
     )
     .await
     .unwrap();
-    state.set_auto_sync_limit(b.id, Some(1 << 30)).unwrap();
+    // Shared once it is logged in: new to it, synced by itself.
+    w.set_member(&w.library, user, true).await;
     a.handle.wake();
     eventually("the second account's pair", || async {
         state.pairs().unwrap().iter().any(|p| p.account == b.id)
@@ -527,7 +530,15 @@ async fn an_ambiguous_library_name_is_refused() {
         .unwrap();
     w.admin.create_library(other, "Notes").await.unwrap();
     let folder = a.folder.parent().unwrap().join("Notes");
-    let added = theca::ops::add(&a.state(), &a.account, "Notes", Some(folder.clone()), false).await;
+    let added = theca::ops::add(
+        &a.state(),
+        &a.account,
+        "Notes",
+        Some(folder.clone()),
+        false,
+        theca::state::Mode::Sync,
+    )
+    .await;
     assert!(
         matches!(&added, Err(theca::ops::OpError::Refused(why)) if why.contains("several")),
         "{added:?}"
@@ -538,6 +549,7 @@ async fn an_ambiguous_library_name_is_refused() {
         &ours.id.to_string(),
         Some(folder),
         false,
+        theca::state::Mode::Sync,
     )
     .await
     .unwrap();
@@ -819,6 +831,7 @@ async fn a_folder_moved_into_another_pair_stops() {
         &notes.id.to_string(),
         Some(other.clone()),
         false,
+        theca::state::Mode::Sync,
     )
     .await
     .unwrap();

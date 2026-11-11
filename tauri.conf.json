@@ -17,7 +17,20 @@
   },
   "bundle": {
     "active": true,
+    "linux": {
+      "deb": {
+        "depends": ["fuse3"]
+      }
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "ci/installer.nsh"
+      }
+    },
     "macOS": {
+      "files": {
+        "PlugIns/ThecaDrive.appex": "target/appex/ThecaDrive.appex"
+      },
       "signingIdentity": "-"
     },
     "icon": [

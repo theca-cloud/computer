@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f5eb40d3d155b958b0132d3f5ea3aa96c4e03baac3969c6e3261d5d43f4da584 # shrinks to files = ["d/b"], phases = [[(false, Evict(0, true))]], writable = true, drive = true
+cc 520753356ed7fcd954a4ea3c08675146c560118cd43d03f08d3c259907b34190 # shrinks to files = ["a", "d/b"], phases = [[(false, Evict(1, true)), (false, Create(2))], [(true, Rename(3, 1))]], writable = true, drive = true

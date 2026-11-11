@@ -30,21 +30,45 @@ jobs:
         with:
           node-version-file: ui/.nvmrc
       - uses: Swatinem/rust-cache@v2.9.3
-      # Tauri's Linux prerequisites, as in ci/Dockerfile and release.yml.
+      # Tauri's Linux prerequisites, as in ci/Dockerfile and release.yml;
+      # fuse3 for the drive's scenarios (fusermount3; /dev/fuse is the
+      # runner's user's).
       - name: Linux packages
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
           sudo apt-get install -yq --no-install-recommends \
-            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev fuse3
       # The tests' Postgres: Docker on Linux, a native one elsewhere.
       - name: Postgres
         run: |
           if [ "$RUNNER_OS" = Linux ]; then scripts/dev.sh; else ci/postgres.sh; fi
       - run: scripts/ci.sh lint
+      # macOS's drive: a minimal Theca.app with its extension, installed and
+      # registered, for tests/mac_drive.rs (ci/mac-app.sh).
+      - name: Theca.app with its drive extension
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --bin theca
+          cargo build -p theca-fileprovider --bins
+          ci/mac-app.sh app target/debug/theca target/debug/theca-drive /Applications/Theca.app
+          /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f -R -trusted /Applications/Theca.app
+          pluginkit -a /Applications/Theca.app/Contents/PlugIns/ThecaDrive.appex
+          pluginkit -e use -i rs.theca.computer.drive
       # The tests' app passwords in the real OS keychain where the runner has
       # one that never prompts (macOS, Windows); Linux runners have no Secret
       # Service: the in-memory one (tests/common, keychain()).
       - run: scripts/ci.sh test
         env:
           THECA_TEST_KEYCHAIN: ${{ runner.os != 'Linux' && 'os' || 'mock' }}
+          # Every OS's drive backend is there: its scenarios fail rather than
+          # skip (Linux FUSE, Windows Cloud Files, macOS's installed app).
+          THECA_TEST_DRIVE: "1"
+          THECA_TEST_MAC_APP: ${{ runner.os == 'macOS' && '/Applications/Theca.app' || '' }}
+          THECA_TEST_MATERIALIZE: ${{ runner.os == 'macOS' && format('{0}/target/debug/theca-materialize', github.workspace) || '' }}
+      # Why the macOS drive failed: its extension's and the system's logs.
+      - name: The drive's logs
+        if: failure() && runner.os == 'macOS'
+        run: |
+          cat "$HOME/Library/Containers/rs.theca.computer.drive/Data/drive.log" || true
+          log show --last 15m --style compact --predicate 'process == "theca-drive" OR process == "fileproviderd" OR subsystem == "com.apple.FileProvider"' | tail -300

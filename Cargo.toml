@@ -1,6 +1,11 @@
+# The app and macOS's File Provider extension (fileprovider/: every unsafe
+# call there).
+[workspace]
+members = ["fileprovider"]
+
 [package]
 name = "theca"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
@@ -10,7 +15,9 @@ name = "theca"
 path = "src/main.rs"
 
 [dependencies]
+bytesize = "2.7.0"
 chrono = "0.4.45"
+flate2 = "1.1.10"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 directories = "6.0.0"
 file-id = "0.2.3"
@@ -42,23 +49,32 @@ tauri-plugin-opener = { version = "2", optional = true }
 tauri-plugin-single-instance = { version = "2", optional = true }
 # core's release, from its public mirror (as CE builds it): no credentials
 # anywhere. Working against an unreleased core: CLAUDE.md.
-theca-client = { git = "https://github.com/theca-cloud/core", tag = "1.6.1" }
-theca-common = { git = "https://github.com/theca-cloud/core", tag = "1.6.1" }
+theca-client = { git = "https://github.com/theca-cloud/core", tag = "1.6.2" }
+theca-common = { git = "https://github.com/theca-cloud/core", tag = "1.6.2" }
+theca-fileprovider = { version = "1.1.0", path = "fileprovider" }
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "fs", "time", "signal", "sync"] }
+tempfile = "3.27.0"
 tracing = "0.1.44"
+tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-uuid = { version = "1.29.0", features = ["v4"] }
+uuid = { version = "1.29.0", features = ["v4", "serde"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 
 [target.'cfg(windows)'.dependencies]
+cloud-filter = "0.0.7"
+nt-time = "0.15"
 windows-native-keyring-store = "1.1.0"
 
 # Secret Service over zbus: pure Rust.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 zbus-secret-service-keyring-store = { version = "1.0.1", features = ["crypto-rust"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = "0.18.0"
+rustix = { version = "1.1.6", features = ["fs"] }
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -71,7 +87,6 @@ all = { level = "warn", priority = -1 }
 uuid = { version = "1.29.0", features = ["v7"] }
 dotenvy = "0.15.7"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres"] }
-tempfile = "3.27.0"
 reqwest = { version = "0.13", default-features = false }
 fantoccini = { version = "0.22", default-features = false }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }

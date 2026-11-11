@@ -4,7 +4,10 @@
 //! what each action records: a failure here is checked against `exec.rs`
 //! before it counts. Its reach is the model's: two names at the root and in
 //! one folder; case, normalization, timing, `reset` and disk errors are the
-//! unit tests' and the scenarios'. `PROPTEST_CASES` for more cases.
+//! unit tests' and the scenarios'. A drive too: files evicted to
+//! placeholders (as the drive limit does, outside the plan) and kept; a
+//! placeholder holds no content, and nothing is ever uploaded from one.
+//! `PROPTEST_CASES` for more cases.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -29,8 +32,12 @@ struct SNode {
 #[derive(Clone, Debug)]
 struct LFile {
     is_file: bool,
+    /// A placeholder's: the content its size shows, not held.
     content: u32,
     fid: u32,
+    downloaded: bool,
+    /// Evicted, its mtime not restored (the eviction interrupted).
+    torn: bool,
 }
 
 #[derive(Default, Debug)]
@@ -41,6 +48,8 @@ struct World {
     local: BTreeMap<Vec<String>, LFile>,
     base: Vec<Entry>,
     next: u32,
+    drive: bool,
+    kept: HashSet<Uuid>,
 }
 
 fn p(s: &str) -> Vec<String> {
@@ -170,6 +179,8 @@ impl World {
                         is_file: false,
                         content: 0,
                         fid: 0,
+                        downloaded: true,
+                        torn: false,
                     },
                 );
                 w.put(d, ROOT, "d", false, None, &p("d"));
@@ -199,6 +210,8 @@ impl World {
                     is_file: true,
                     content: c,
                     fid,
+                    downloaded: true,
+                    torn: false,
                 },
             );
             w.put(n, parent, path.last().unwrap(), true, Some(v), &path);
@@ -214,9 +227,15 @@ impl World {
                 path: path.clone(),
                 is_file: l.is_file,
                 size: if l.is_file { l.content as i64 } else { 0 },
-                mtime: if l.is_file { l.content as i64 } else { 0 },
+                mtime: if l.is_file {
+                    l.content as i64 + i64::from(l.torn)
+                } else {
+                    0
+                },
                 file_id: Some(format!("f{}", l.fid)),
                 ignored: false,
+                downloaded: l.downloaded,
+                kept: false,
             })
             .collect();
         Scan {
@@ -267,7 +286,9 @@ impl World {
 
     fn fingerprint_matches(&self, path: &[String], e: &Entry) -> bool {
         match self.local.get(path) {
-            Some(l) => l.content as i64 == e.size && l.content as i64 == e.mtime,
+            Some(l) => {
+                l.content as i64 == e.size && l.content as i64 + i64::from(l.torn) == e.mtime
+            }
             None => true,
         }
     }
@@ -320,6 +341,7 @@ impl World {
                 let Some(l) = self.local.get(path).cloned() else {
                     return;
                 };
+                assert!(l.downloaded, "uploaded from a placeholder: {a:?}");
                 match to {
                     UploadTo::New { parent, name } => {
                         let Some(par) = self.parent_node(parent, made) else {
@@ -405,12 +427,20 @@ impl World {
                             is_file: false,
                             content: 0,
                             fid,
+                            downloaded: true,
+                            torn: false,
                         },
                     );
                 }
                 self.put(*node, *parent, name, false, None, &at);
             }
             Action::Download {
+                node,
+                parent,
+                name,
+                state,
+            }
+            | Action::Placeholder {
                 node,
                 parent,
                 name,
@@ -424,8 +454,10 @@ impl World {
                     }),
                 };
                 let Some(target) = target else { return };
+                // Over a placeholder, nothing to lose: no check.
+                let placeholder = self.local.get(&target).is_some_and(|l| !l.downloaded);
                 let ok = match self.base_entry(*node) {
-                    Some(e) => self.fingerprint_matches(&target, &e.clone()),
+                    Some(e) => placeholder || self.fingerprint_matches(&target, &e.clone()),
                     None => !self.local.contains_key(&target),
                 };
                 if !ok || target.len() > 1 && !self.local.contains_key(&target[..target.len() - 1])
@@ -440,6 +472,8 @@ impl World {
                         is_file: true,
                         content,
                         fid,
+                        downloaded: matches!(a, Action::Download { .. }),
+                        torn: false,
                     },
                 );
                 let e = self.base_entry(*node).cloned();
@@ -450,6 +484,7 @@ impl World {
                 let Some(l) = self.local.get(path).cloned() else {
                     return;
                 };
+                assert!(l.downloaded, "merged from a placeholder: {a:?}");
                 let cur = state.version.map(|v| self.versions[&v]);
                 let v = if cur == Some(l.content) {
                     state.version.unwrap()
@@ -534,6 +569,8 @@ impl World {
             scan: &scan,
             remote: &pending,
             writable,
+            drive: self.drive,
+            kept: &self.kept,
         });
         let mut made = BTreeMap::new();
         for a in &plan.actions {
@@ -541,10 +578,11 @@ impl World {
         }
     }
 
+    /// What only this computer may hold: placeholders hold nothing.
     fn local_contents(&self) -> HashSet<u32> {
         self.local
             .values()
-            .filter(|l| l.is_file)
+            .filter(|l| l.is_file && l.downloaded)
             .map(|l| l.content)
             .collect()
     }
@@ -556,6 +594,9 @@ enum Op {
     Delete(usize),
     Rename(usize, usize),
     Create(usize),
+    /// A drive's: a file evicted (the drive limit), or a node kept or freed.
+    Evict(usize, bool),
+    Keep(usize),
 }
 
 fn op() -> impl Strategy<Value = (bool, Op)> {
@@ -565,6 +606,8 @@ fn op() -> impl Strategy<Value = (bool, Op)> {
         1 => (0..5usize).prop_map(Op::Delete),
         1 => (0..5usize, 0..5usize).prop_map(|(a, b)| Op::Rename(a, b)),
         1 => (0..5usize).prop_map(Op::Create),
+        1 => (0..5usize, any::<bool>()).prop_map(|(i, torn)| Op::Evict(i, torn)),
+        1 => (0..5usize).prop_map(Op::Keep),
     ];
     (any::<bool>(), o)
 }
@@ -576,8 +619,11 @@ fn local_op(w: &mut World, op: &Op) {
         Op::Edit(i) => {
             if let Some(k) = pick(*i) {
                 let c = w.fresh();
+                // A placeholder is fetched when opened, then edited.
                 if let Some(l) = w.local.get_mut(&k).filter(|l| l.is_file) {
                     l.content = c;
+                    l.downloaded = true;
+                    l.torn = false;
                 }
             }
         }
@@ -620,10 +666,51 @@ fn local_op(w: &mut World, op: &Op) {
                         is_file: PATHS[*t] != "d",
                         content: c,
                         fid,
+                        downloaded: true,
+                        torn: false,
                     },
                 );
             }
         }
+        Op::Evict(..) | Op::Keep(_) => unreachable!("drive_op's"),
+    }
+}
+
+fn drive_op(w: &mut World, op: &Op) {
+    if !w.drive {
+        return;
+    }
+    match op {
+        // Only a file uploaded, as synced (the limit leaves edits not yet
+        // uploaded alone).
+        Op::Evict(i, torn) => {
+            let files: Vec<(Vec<String>, u32)> = w
+                .base
+                .iter()
+                .filter(|e| e.is_file)
+                .filter_map(|e| {
+                    let path = w.base_path(e.node)?;
+                    let l = w.local.get(&path)?;
+                    let uploaded = e.version.map(|v| w.versions[&v]) == Some(l.content);
+                    (l.downloaded && uploaded && w.fingerprint_matches(&path, e))
+                        .then_some((path, l.content))
+                })
+                .collect();
+            if let Some((path, _)) = files.get(i % files.len().max(1)) {
+                let l = w.local.get_mut(path).unwrap();
+                l.downloaded = false;
+                l.torn = *torn;
+            }
+        }
+        Op::Keep(i) => {
+            let nodes: Vec<Uuid> = w.base.iter().map(|e| e.node).collect();
+            if let Some(n) = nodes.get(i % nodes.len().max(1))
+                && !w.kept.remove(n)
+            {
+                w.kept.insert(*n);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -698,6 +785,7 @@ fn remote_op(w: &mut World, op: &Op) {
                 );
             }
         }
+        Op::Evict(..) | Op::Keep(_) => unreachable!("drive_op's"),
     }
 }
 
@@ -719,11 +807,17 @@ proptest! {
     #[test]
     fn no_local_content_lost(files in proptest::sample::subsequence(vec!["a", "b", "d/a", "d/b"], 0..=4),
                              phases in proptest::collection::vec(proptest::collection::vec(op(), 0..4), 1..6),
-                             writable in any::<bool>()) {
+                             writable in any::<bool>(),
+                             drive in any::<bool>()) {
         let mut w = World::synced(&files);
+        w.drive = drive;
         for ops in &phases {
             for (local, o) in ops {
-                if *local { local_op(&mut w, o) } else { remote_op(&mut w, o) }
+                match o {
+                    Op::Evict(..) | Op::Keep(_) => drive_op(&mut w, o),
+                    _ if *local => local_op(&mut w, o),
+                    _ => remote_op(&mut w, o),
+                }
             }
             for round in 0..3 {
                 let before = w.local_contents();

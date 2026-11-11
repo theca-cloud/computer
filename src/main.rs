@@ -3,11 +3,15 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use theca::engine::{self, Handle, plural};
 use theca::keychain::KeychainError;
 use theca::state::{self, State};
 use theca::{exit, ops};
+
+/// Where a Mac's drive is switched on: macOS adds it switched off.
+#[cfg(target_os = "macos")]
+const SWITCH_ON: &str = "Switch it on in System Settings → General → Login Items & Extensions → File Providers → Theca.";
 
 /// What a command fails with: said on stderr, with its exit code (`exit`).
 #[derive(Debug, thiserror::Error)]
@@ -90,6 +94,11 @@ enum Command {
         /// `THECA_NO_KEYRING`: anything but empty, 0, false, no or off.
         #[arg(long, env = "THECA_NO_KEYRING", value_parser = clap::builder::FalseyValueParser::new())]
         no_keyring: bool,
+        /// What libraries new to the account do: sync (up to the size
+        /// limit), drive, or silent (listed only: `theca libraries`).
+        /// Default: silent. Its libraries now are added with `theca add`.
+        #[arg(long, value_parser = headless_new_libraries)]
+        new_libraries: Option<state::NewLibraries>,
     },
     /// The accounts on this device.
     Accounts,
@@ -99,9 +108,17 @@ enum Command {
         /// Where its libraries go by default.
         #[arg(long)]
         folder: Option<PathBuf>,
-        /// Libraries up to this many MB appearing later are synced by
-        /// themselves (0: never).
-        #[arg(long)]
+        /// What libraries new to the account do: sync (up to the size
+        /// limit), drive, notify (the app shows it), or silent (listed only).
+        #[arg(long, value_parser = clap::value_parser!(state::NewLibraries))]
+        new_libraries: Option<state::NewLibraries>,
+        /// New libraries up to this size sync (`--new-libraries sync`):
+        /// 500MB, 2GiB, or 0 for no limit.
+        #[arg(long, value_parser = limit_value)]
+        auto_sync_limit: Option<LimitValue>,
+        /// 1.0's flag, kept: libraries up to this many MB sync by
+        /// themselves, 0 none (`--new-libraries silent`).
+        #[arg(long, hide = true)]
         auto_sync_mb: Option<i64>,
     },
     /// Remove an account from this device.
@@ -124,6 +141,10 @@ enum Command {
         /// The folder already holds files: merge them with the library.
         #[arg(long)]
         merge: bool,
+        /// A drive: the whole library shown, each file downloaded when
+        /// opened, kept within the drive limit.
+        #[arg(long)]
+        drive: bool,
         #[arg(long)]
         account: Option<String>,
     },
@@ -148,21 +169,83 @@ enum Command {
     },
     /// What is synced, what it's doing, errors and notices.
     Status,
+    /// Keep files or folders of a drive on this computer, downloaded (what
+    /// arrives later in a folder kept too), outside the drive limit.
+    Keep {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// Free the space files or folders of a drive take, now: they stay
+    /// listed, downloaded again when opened (not while an edit isn't
+    /// uploaded).
+    Free {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// How much downloaded content drives keep, shown, or set: 20GB (10^9
+    /// bytes) or 20GiB (2^30). Kept files and edits not yet uploaded don't
+    /// count.
+    DriveLimit {
+        /// 20GB, 20GiB, or `default` (10 GiB, or a tenth of the disk).
+        #[arg(value_parser = limit_value)]
+        size: Option<LimitValue>,
+    },
+    /// Where the logs are and their settings, shown, or set (each applies
+    /// at the next start of the app or `theca run`; `default` resets one).
+    Logs {
+        /// error, warn, info, debug, trace (default: info).
+        #[arg(long, value_parser = reset::<LogLevel>)]
+        level: Option<Reset<LogLevel>>,
+        /// Days of logs kept (default: 14).
+        #[arg(long, value_parser = reset::<u32>)]
+        days: Option<Reset<u32>>,
+        /// Their size in all, the oldest removed past it: 100MB, 1GiB
+        /// (default: 100 MB).
+        #[arg(long, value_parser = limit_value)]
+        max_size: Option<LimitValue>,
+        /// Their folder (default: `logs` beside the state).
+        #[arg(long, value_parser = reset::<PathBuf>)]
+        path: Option<Reset<PathBuf>>,
+    },
     /// Restore what the last deletion moved to the trash.
     Undo,
     /// Run the sync engine in the foreground (what a service runs).
     Run,
+    /// Every drive removed, as `remove` does (the Windows uninstaller runs
+    /// it: no sync root stays registered).
+    #[command(hide = true)]
+    RemoveDrives {
+        /// On a Mac, also every other Theca drive macOS has, whatever state
+        /// added it (an earlier one's, a test's): the checks' clean start.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "theca=info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+    // Its name only: an argument may be a token (`login --token`).
+    let name = matches.subcommand_name().unwrap_or("app").to_owned();
+    // Every command logs to the day's file, as the state's settings say (no
+    // state: stderr only); the app and `theca run` keep the folder pruned.
+    // Read before the state is opened: its migration, if any, is logged.
+    let settings = state_path(cli.state.clone())
+        .ok()
+        .map(|path| theca::logs::settings_at(&path));
+    let _logging = theca::logs::init(settings.as_ref());
+    let long_running = matches!(cli.command, None | Some(Command::Run));
+    if long_running && let Some(settings) = &settings {
+        theca::logs::keep(settings);
+    }
+    let span = tracing::info_span!("command", name);
+    let _entered = span.enter();
+    if long_running {
+        tracing::info!(version = env!("CARGO_PKG_VERSION"), "started");
+    }
     if cli.command.is_none() {
         // The app runs its own runtime, on the main thread (the OS's windows
         // want it).
@@ -174,8 +257,13 @@ fn main() -> ExitCode {
 
 fn exit(result: Result<()>) -> ExitCode {
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            tracing::info!(target: theca::logs::EXIT, "done");
+            ExitCode::SUCCESS
+        }
         Err(e) => {
+            // In the file too (the terminal has it from the line below).
+            tracing::warn!(target: theca::logs::EXIT, code = e.code(), "{e}");
             eprintln!("theca: {e}");
             ExitCode::from(e.code())
         }
@@ -200,6 +288,7 @@ async fn command(cli: Cli) -> Result<()> {
             folder,
             token,
             no_keyring,
+            new_libraries,
         } => {
             let name = name.unwrap_or_else(ops::device_name);
             let account = ops::login(
@@ -209,7 +298,9 @@ async fn command(cli: Cli) -> Result<()> {
                 folder,
                 token,
                 !no_keyring,
-                |flow| {
+                new_libraries,
+                state::NewLibraries::Silent,
+                |flow: &theca_common::api::LoginFlow| {
                     println!("Open this page to allow \"{name}\": {}", flow.url);
                     println!("Check it shows the code {}", flow.code);
                 },
@@ -227,7 +318,39 @@ async fn command(cli: Cli) -> Result<()> {
                 account.instance,
                 account.default_folder.display()
             );
-            println!("Next: theca libraries, then theca add <library>");
+            println!(
+                "Libraries new to it later: {}.",
+                new_libraries_said(account.new_libraries, account.auto_sync_limit)
+            );
+            // Nothing added by the login: each chosen with `theca add` (the
+            // login worked even if this list can't be had).
+            match ops::libraries(&state, &account).await {
+                Ok(libraries) => {
+                    let unsynced: Vec<_> = libraries.iter().filter(|l| l.pair.is_none()).collect();
+                    if !unsynced.is_empty() {
+                        println!("Its libraries, to add as a synced folder or a drive:");
+                    }
+                    for l in &unsynced {
+                        let size = l.size.map_or_else(|| "?".into(), size);
+                        // Two of one name: by its ID (`add` refuses the name).
+                        let twins = libraries
+                            .iter()
+                            .filter(|o| {
+                                theca::local::key(&o.library.name)
+                                    == theca::local::key(&l.library.name)
+                            })
+                            .count();
+                        let which = if twins > 1 {
+                            l.library.id.to_string()
+                        } else {
+                            format!("{:?}", l.library.name)
+                        };
+                        let organization = l.organization.as_deref().unwrap_or("?");
+                        println!("  theca add {which}  (or --drive)  # {size}, {organization}");
+                    }
+                }
+                Err(e) => println!("Its libraries: theca libraries ({e})."),
+            }
         }
         Command::Accounts => {
             for a in state.accounts()? {
@@ -245,6 +368,8 @@ async fn command(cli: Cli) -> Result<()> {
         Command::Account {
             account,
             folder,
+            new_libraries,
+            auto_sync_limit,
             auto_sync_mb,
         } => {
             let account = ops::find_account(&state, Some(&account))?;
@@ -253,19 +378,32 @@ async fn command(cli: Cli) -> Result<()> {
                 let folder = std::path::absolute(&folder).unwrap_or(folder);
                 state.set_default_folder(account.id, &folder)?;
             }
+            // 1.0's meaning: MB synced by themselves, 0 none.
             if let Some(mb) = auto_sync_mb {
-                state.set_auto_sync_limit(account.id, (mb > 0).then_some(mb * 1024 * 1024))?;
+                if mb > 0 {
+                    state.set_new_libraries(account.id, state::NewLibraries::Sync)?;
+                    state.set_auto_sync_limit(account.id, mb * 1024 * 1024)?;
+                } else {
+                    state.set_new_libraries(account.id, state::NewLibraries::Silent)?;
+                }
+            }
+            if let Some(new) = new_libraries {
+                state.set_new_libraries(account.id, new)?;
+            }
+            if let Some(limit) = auto_sync_limit {
+                let bytes = match limit {
+                    LimitValue::Bytes(b) => i64::try_from(b).unwrap_or(i64::MAX),
+                    LimitValue::Default => ops::AUTO_SYNC_LIMIT,
+                };
+                state.set_auto_sync_limit(account.id, bytes)?;
             }
             let a = state.account(account.id)?.unwrap_or(account);
             println!("{} on {}", a.email, a.instance);
             println!("  libraries go into {}", a.default_folder.display());
-            match a.auto_sync_limit {
-                Some(limit) => println!(
-                    "  new libraries up to {} are synced by themselves",
-                    size(limit)
-                ),
-                None => println!("  new libraries are offered, never synced by themselves"),
-            }
+            println!(
+                "  new libraries: {}",
+                new_libraries_said(a.new_libraries, a.auto_sync_limit)
+            );
         }
         Command::RemoveAccount {
             account,
@@ -294,15 +432,26 @@ async fn command(cli: Cli) -> Result<()> {
             library,
             path,
             merge,
+            drive,
             account,
         } => {
             let account = ops::find_account(&state, account.as_deref())?;
-            let pair = ops::add(&state, &account, &library, path, merge).await?;
+            let mode = if drive {
+                state::Mode::Drive
+            } else {
+                state::Mode::Sync
+            };
+            let pair = ops::add(&state, &account, &library, path, merge, mode).await?;
+            let what = if drive { "is a drive in" } else { "syncs into" };
             println!(
-                "{} syncs into {} (theca run, or the app, does it).",
+                "{} {what} {} (theca run, or the app, does it).",
                 pair.library_name,
                 pair.path.display()
             );
+            #[cfg(target_os = "macos")]
+            if drive {
+                println!("{SWITCH_ON}");
+            }
         }
         Command::Remove { pair, delete_files } => {
             let pair = ops::find_pair(&state, &pair)?;
@@ -335,6 +484,128 @@ async fn command(cli: Cli) -> Result<()> {
             }
         }
         Command::Status => status(&state)?,
+        Command::RemoveDrives { all } => {
+            for pair in state.pairs()? {
+                if pair.mode == state::Mode::Drive {
+                    let kept = ops::remove(&state, &pair, false)?;
+                    println!("{} isn't a drive anymore.", pair.path.display());
+                    if kept > 0 {
+                        println!("Kept {} that weren't uploaded.", plural(kept, "file"));
+                    }
+                }
+            }
+            #[cfg(target_os = "macos")]
+            if all {
+                let domains = theca_fileprovider::host::domains().map_err(ops::OpError::Refused)?;
+                let mut refused = Vec::new();
+                for d in domains {
+                    match theca_fileprovider::host::remove(&d.id) {
+                        Ok(left) => {
+                            println!("The drive {} is removed from this Mac.", d.name);
+                            if let Some(left) = left {
+                                println!("What wasn't uploaded is in {}.", left.display());
+                            }
+                        }
+                        Err(e) => refused.push(format!("{}: {e}", d.name)),
+                    }
+                }
+                if !refused.is_empty() {
+                    return Err(ops::OpError::Refused(format!(
+                        "macOS didn't remove: {}",
+                        refused.join("; ")
+                    ))
+                    .into());
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = all;
+        }
+        Command::Free { paths } => {
+            for path in paths {
+                let pair = ops::free(&state, &path)?;
+                println!("{} is freed ({}).", path.display(), pair.library_name);
+            }
+        }
+        Command::Keep { paths } => {
+            for path in paths {
+                let pair = ops::keep(&state, &path, true)?;
+                println!(
+                    "{} is kept on this computer ({}).",
+                    path.display(),
+                    pair.library_name
+                );
+            }
+        }
+        Command::DriveLimit { size: set } => {
+            match set {
+                Some(LimitValue::Bytes(bytes)) => state.set_drive_limit(bytes)?,
+                Some(LimitValue::Default) => state.clear_drive_limit()?,
+                None => {}
+            }
+            let limit = theca::drive::limit(&state)?;
+            let default = state.drive_limit()?.is_none();
+            let default = if default {
+                " (the default: 10 GiB, or a tenth of the disk if smaller)"
+            } else {
+                ""
+            };
+            println!(
+                "Drives keep up to {} downloaded{default}.",
+                limit_size(limit)
+            );
+        }
+        Command::Logs {
+            level,
+            days,
+            max_size,
+            path,
+        } => {
+            use theca::logs::Change;
+            let changes = [
+                level.map(|l| Change::Level(l.value().map(|l| l.0))),
+                days.map(|d| Change::Days(d.value())),
+                max_size.map(|s| {
+                    Change::MaxSize(match s {
+                        LimitValue::Bytes(b) => Some(b),
+                        LimitValue::Default => None,
+                    })
+                }),
+                path.map(|p| {
+                    Change::Folder(p.value().map(|p| std::path::absolute(&p).unwrap_or(p)))
+                }),
+            ];
+            let changed = changes.iter().any(Option::is_some);
+            for change in changes.into_iter().flatten() {
+                theca::logs::set(&state, change)?;
+            }
+            let s = theca::logs::settings(&state)?;
+            let folder = s
+                .folder
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), |f| f.display().to_string());
+            let default = if s.default_folder {
+                " (the default)"
+            } else {
+                ""
+            };
+            println!("Logs: {folder}{default}");
+            println!(
+                "  level {}, {} days kept, up to {} in all",
+                s.level,
+                s.days,
+                limit_size(s.max_size)
+            );
+            #[cfg(target_os = "macos")]
+            if let Some(container) = theca_fileprovider::host::container() {
+                println!(
+                    "The drive extension's: {}",
+                    container.join("drive.log").display()
+                );
+            }
+            if changed {
+                println!("Applies at the next start of the app or `theca run`.");
+            }
+        }
         Command::Undo => {
             let Some(notice) = state.latest_undo()? else {
                 println!("Nothing to undo.");
@@ -422,6 +693,30 @@ fn status(state: &State) -> Result<()> {
                 })
                 .unwrap_or_default();
             println!("  {}  {}  {what}{when}", p.library_name, p.path.display());
+            #[cfg(target_os = "macos")]
+            if p.mode == state::Mode::Drive {
+                let domain = theca::drive::provider::domain_of(p);
+                match theca_fileprovider::host::enabled(&domain) {
+                    Ok(Some(true)) => println!("    a drive, switched on"),
+                    Ok(Some(false)) => {
+                        println!("    a drive waiting to be switched on: {SWITCH_ON}")
+                    }
+                    Ok(None) => {
+                        println!("    a drive macOS doesn't have (removed in System Settings?)")
+                    }
+                    Err(e) => println!("    a drive macOS doesn't say about yet ({e})"),
+                }
+            }
+            #[cfg(any(target_os = "linux", windows))]
+            if p.mode == state::Mode::Drive {
+                let u = theca::drive::usage(state, p)?;
+                println!(
+                    "    a drive: {} downloaded, {} kept, {} waiting to upload",
+                    size(u.downloaded as i64),
+                    u.kept,
+                    u.waiting
+                );
+            }
         }
     }
     let notices = state.notices()?;
@@ -463,6 +758,98 @@ fn status(state: &State) -> Result<()> {
 }
 
 /// `1.2 MiB`: as the app and the web app show sizes.
+/// What libraries new to an account do, said.
+fn new_libraries_said(new: state::NewLibraries, limit: i64) -> String {
+    use state::NewLibraries::*;
+    match new {
+        Sync if limit == 0 => "synced by themselves (sync, no size limit)".into(),
+        Sync => format!(
+            "synced by themselves up to {}, notified above (sync)",
+            limit_size(limit.max(0) as u64)
+        ),
+        Drive => "added as drives (drive)".into(),
+        Notify => "listed, with a notification from the app (notify)".into(),
+        Silent => "listed only: theca libraries (silent)".into(),
+    }
+}
+
+/// `login --new-libraries`: what a computer without the app's window can do.
+fn headless_new_libraries(value: &str) -> std::result::Result<state::NewLibraries, String> {
+    match value.parse()? {
+        state::NewLibraries::Notify => {
+            Err("notify needs the app's window: sync, drive or silent".into())
+        }
+        new => Ok(new),
+    }
+}
+
+/// A setting's value, or `default`: back to it.
+#[derive(Clone)]
+enum Reset<T> {
+    To(T),
+    Default,
+}
+
+impl<T> Reset<T> {
+    fn value(self) -> Option<T> {
+        match self {
+            Reset::To(v) => Some(v),
+            Reset::Default => None,
+        }
+    }
+}
+
+fn reset<T: std::str::FromStr>(value: &str) -> std::result::Result<Reset<T>, String>
+where
+    T::Err: std::fmt::Display,
+{
+    if value == "default" {
+        return Ok(Reset::Default);
+    }
+    value.parse::<T>().map(Reset::To).map_err(|e| e.to_string())
+}
+
+/// A log level as `theca logs --level` takes it.
+#[derive(Clone)]
+struct LogLevel(String);
+
+impl std::str::FromStr for LogLevel {
+    type Err = String;
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        theca::logs::level(value).map(LogLevel)
+    }
+}
+
+/// `theca drive-limit`'s value: a size, or back to the default.
+#[derive(Clone)]
+enum LimitValue {
+    Bytes(u64),
+    Default,
+}
+
+fn limit_value(value: &str) -> std::result::Result<LimitValue, String> {
+    if value == "default" {
+        return Ok(LimitValue::Default);
+    }
+    value
+        .parse::<bytesize::ByteSize>()
+        .map(|b| LimitValue::Bytes(b.as_u64()))
+}
+
+/// A limit as it was given: in GB or MB when it's a whole number of them
+/// (20GB set reads "20 GB", not "19 GiB"), else as every size shows.
+fn limit_size(bytes: u64) -> String {
+    const GB: u64 = 1_000_000_000;
+    const MB: u64 = 1_000_000;
+    if bytes >= GB && bytes.is_multiple_of(GB) {
+        format!("{} GB", bytes / GB)
+    } else if bytes >= MB && bytes.is_multiple_of(MB) {
+        format!("{} MB", bytes / MB)
+    } else {
+        size(bytes as i64)
+    }
+}
+
 fn size(bytes: i64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut value = bytes as f64;

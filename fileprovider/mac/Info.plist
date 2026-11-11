@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Theca's File Provider extension (ci/mac-app.sh sets the version).
+  XPC! (not APPL): PlugInKit only takes extensions of that package type.
+  No NSExtensionFileProviderDocumentGroup: it needs an app group, which
+  needs a team ID; the app reaches the extension through its container.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>rs.theca.computer.drive</string>
+	<key>CFBundleName</key>
+	<string>ThecaDrive</string>
+	<key>CFBundleDisplayName</key>
+	<string>Theca</string>
+	<key>CFBundleExecutable</key>
+	<string>theca-drive</string>
+	<key>CFBundlePackageType</key>
+	<string>XPC!</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.0.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSExtension</key>
+	<dict>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.fileprovider-nonui</string>
+		<key>NSExtensionPrincipalClass</key>
+		<string>ThecaDriveExtension</string>
+		<key>NSExtensionFileProviderSupportsEnumeration</key>
+		<true/>
+		<!--
+		  Finder's actions, on the items' userInfo (kept: it or a folder
+		  above; keptItself: it; never the drive itself, its root). Always Keep on This Mac while one isn't kept;
+		  Free Up Space when all are kept themselves (what a folder keeps
+		  is undone on the folder). The identifiers: protocol::KEEP, FREE.
+		-->
+		<key>NSExtensionFileProviderActions</key>
+		<array>
+			<dict>
+				<key>NSExtensionFileProviderActionIdentifier</key>
+				<string>rs.theca.computer.drive.keep</string>
+				<key>NSExtensionFileProviderActionName</key>
+				<string>Always Keep on This Mac</string>
+				<key>NSExtensionFileProviderActionActivationRule</key>
+				<string>fileproviderItems.@count &gt; 0 AND SUBQUERY(fileproviderItems, $item, $item.userInfo.kept == NO).@count &gt; 0 AND SUBQUERY(fileproviderItems, $item, $item.itemIdentifier == "NSFileProviderRootContainerItemIdentifier").@count == 0</string>
+			</dict>
+			<dict>
+				<key>NSExtensionFileProviderActionIdentifier</key>
+				<string>rs.theca.computer.drive.free</string>
+				<key>NSExtensionFileProviderActionName</key>
+				<string>Free Up Space</string>
+				<key>NSExtensionFileProviderActionActivationRule</key>
+				<string>fileproviderItems.@count &gt; 0 AND SUBQUERY(fileproviderItems, $item, $item.userInfo.keptItself == YES).@count == fileproviderItems.@count</string>
+			</dict>
+		</array>
+	</dict>
+</dict>
+</plist>

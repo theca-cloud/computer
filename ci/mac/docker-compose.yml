@@ -1,0 +1,71 @@
+# Theca CE: the server (with the web app) and Postgres. OPERATING.md has the
+# details (https://github.com/theca-cloud/ce/blob/main/OPERATING.md); HTTPS is your reverse proxy's, and required (the server listens
+# on 127.0.0.1:8080, plain HTTP).
+#
+# Before the first start, next to this file:
+#   echo PUBLIC_URL=https://cloud.example.com > .env
+#   mkdir secrets
+#   openssl rand -hex 24 > secrets/postgres_password
+#   echo "postgres://theca:$(cat secrets/postgres_password)@postgres:5432/theca" > secrets/database_url
+#   openssl rand -hex 32 > secrets/server.key
+#   openssl rand -hex 32 > secrets/data.key
+#   chmod 644 secrets/*
+# Then: docker compose up -d, and the setup link is in docker compose logs theca.
+name: theca-mac-check
+
+services:
+  postgres:
+    # A major upgrade (19) is a pg_upgrade, not a pull.
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: theca
+      POSTGRES_DB: theca
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      # The server refuses other collations.
+      POSTGRES_INITDB_ARGS: --locale-provider=builtin --builtin-locale=C.UTF-8
+    secrets: [postgres_password]
+    volumes:
+      # Here, beside this file: ./server.sh down deletes it.
+      - ./data/db:/var/lib/postgresql
+    healthcheck:
+      test: pg_isready -U theca -d theca
+      interval: 5s
+      retries: 12
+
+  theca:
+    # The major version: `docker compose pull` upgrades within it, the
+    # database migrated forward at startup. A new major is a choice: read its
+    # release notes.
+    image: thecacloud/ce:1
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PUBLIC_URL: "${PUBLIC_URL:?the HTTPS address users open, set it in .env}"
+      DATABASE_URL__FILE: /run/secrets/database_url
+      SERVER_KEY__FILE: /run/secrets/server.key
+      DATA_KEY__FILE: /run/secrets/data.key
+      # Your reverse proxy's address, so its X-Forwarded-For gives the
+      # client's (rate limits, logs). A proxy on this host comes from the
+      # network's gateway: docker network inspect theca_default (Gateway).
+      # TRUSTED_PROXIES: 172.18.0.1
+    secrets: [database_url, server.key, data.key]
+    volumes:
+      # The files (the filesystem storage, /data/files in the setup), here.
+      - ./data/theca:/data
+    ports:
+      - 127.0.0.1:${THECA_PORT:-8080}:8080
+
+# Read-only files in the containers, at /run/secrets/<name>.
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+  database_url:
+    file: ./secrets/database_url
+  server.key:
+    file: ./secrets/server.key
+  data.key:
+    file: ./secrets/data.key
+

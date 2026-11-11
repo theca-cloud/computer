@@ -4,6 +4,7 @@
 //! a state an older version wrote is migrated, one step per version
 //! (`migrations/`), a copy kept first.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -31,8 +32,13 @@ CREATE TABLE account (
     -- Else the name of its entry in the OS keychain (a random ID).
     secret TEXT CHECK ((password IS NULL) <> (secret IS NULL)),
     default_folder TEXT NOT NULL,
-    -- Libraries up to this size (bytes) are synced when they appear; NULL: never.
-    auto_sync_limit INTEGER,
+    -- What a library new to the account does (one not in `seen`): synced (up
+    -- to auto_sync_limit), a drive, listed and notified, or listed only.
+    new_libraries TEXT NOT NULL DEFAULT 'notify'
+        CHECK (new_libraries IN ('sync', 'drive', 'notify', 'silent')),
+    -- New libraries up to this size (bytes) sync (new_libraries 'sync'); 0: no
+    -- limit.
+    auto_sync_limit INTEGER NOT NULL DEFAULT 524288000,
     -- The server refused the app password (revoked): nothing runs until a new login.
     signed_out INTEGER NOT NULL DEFAULT 0,
     UNIQUE (instance, uuid)
@@ -67,6 +73,11 @@ CREATE TABLE pair (
     -- until its next activity.
     error TEXT,
     synced_at INTEGER,
+    -- A sync pair, or a drive (its files' content fetched when opened).
+    mode TEXT NOT NULL DEFAULT 'sync' CHECK (mode IN ('sync', 'drive')),
+    -- Drives: the counter stamped on each change to its entries (macOS's
+    -- anchors), moved by `theca keep` and `free` (a running engine looks).
+    seq INTEGER NOT NULL DEFAULT 0,
     UNIQUE (account, library)
 );
 
@@ -85,9 +96,28 @@ CREATE TABLE entry (
     -- Local modification time, nanoseconds since the epoch.
     mtime INTEGER NOT NULL DEFAULT 0,
     file_id TEXT,
+    -- Drives on macOS and FUSE: kept on this computer; a node is kept when
+    -- it or an ancestor is.
+    kept INTEGER NOT NULL DEFAULT 0,
+    -- Drives on Linux and Windows: freed (`theca free`), evicted by the
+    -- running engine as soon as it isn't open, then cleared.
+    free INTEGER NOT NULL DEFAULT 0,
+    -- Drives: the last open seen, else the download (seconds since the epoch).
+    used INTEGER,
+    -- Drives on macOS: the pair's counter at this entry's last change.
+    seq INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (pair, node)
 );
 CREATE INDEX entry_parent ON entry (pair, parent);
+
+-- Drives on macOS: entries removed, with the pair's counter then, until the
+-- system has listed the changes past it.
+CREATE TABLE entry_gone (
+    pair INTEGER NOT NULL REFERENCES pair ON DELETE CASCADE,
+    node TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    PRIMARY KEY (pair, node)
+);
 
 -- Remote states received from the event feed (or the tree listing), not
 -- reconciled yet. `gone`: purged, trashed, or out of reach.
@@ -104,8 +134,10 @@ CREATE TABLE remote (
     PRIMARY KEY (pair, node)
 );
 
--- Libraries the user removed: never auto-synced again.
-CREATE TABLE declined (
+-- The libraries an account knows: one not here is new, and gets the
+-- account's new_libraries once (then it's here). One removed stays: never
+-- added by itself again.
+CREATE TABLE seen (
     account INTEGER NOT NULL REFERENCES account ON DELETE CASCADE,
     library TEXT NOT NULL,
     PRIMARY KEY (account, library)
@@ -124,9 +156,16 @@ CREATE TABLE notice (
     -- What `undo` restores: node UUIDs, space-separated.
     undo TEXT
 );
+
+-- Settings for the whole computer (the drive limit...): a missing key is its
+-- default.
+CREATE TABLE setting (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
-const VERSION: i32 = 3;
+const VERSION: i32 = 4;
 
 /// The oldest version migrated (`0.2.0`'s): before it, the schema was
 /// rewritten in place, and a state is deleted by hand.
@@ -134,7 +173,8 @@ const OLDEST: i32 = 2;
 
 /// The migration steps, from `OLDEST` + 1 up to `VERSION`: one per version,
 /// never edited once released (`scripts/ci.sh`).
-const STEPS: [fn(&rusqlite::Transaction<'_>) -> Result<()>; 1] = [migrations::v3::migrate];
+const STEPS: [fn(&rusqlite::Transaction<'_>) -> Result<()>; 2] =
+    [migrations::v3::migrate, migrations::v4::migrate];
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
@@ -178,9 +218,10 @@ pub enum Update {
     Accounts,
     /// Notices added or gone.
     Notices,
-    /// Libraries the account sees and doesn't sync (too big to sync by
-    /// themselves, or declined).
+    /// Libraries the account sees and doesn't sync or mount.
     Offered { account: i64, libraries: Vec<Offer> },
+    /// A library new to the account, listed (`notify`): an OS notification.
+    NewLibrary { account: i64, name: String },
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -194,6 +235,27 @@ pub struct Offer {
 pub fn default_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("rs", "theca", "theca")
         .map(|dirs| dirs.data_dir().join("state.sqlite"))
+}
+
+/// WAL, set once: a change of journal mode isn't retried by the busy
+/// timeout (another process opening the state meanwhile answers "locked"),
+/// so it is retried here, and skipped when already WAL.
+fn wal(db: &Connection) -> Result<()> {
+    for _ in 0..50 {
+        let mode: String = db.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+        if mode.eq_ignore_ascii_case("wal") {
+            return Ok(());
+        }
+        match db.pragma_update(None, "journal_mode", "wal") {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::DatabaseBusy =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            other => return Ok(other?),
+        }
+    }
+    Ok(db.pragma_update(None, "journal_mode", "wal")?)
 }
 
 impl State {
@@ -216,11 +278,19 @@ impl State {
             older if older < OLDEST => return Err(StateError::Older(path.to_owned())),
             _ => {}
         }
-        db.pragma_update(None, "journal_mode", "wal")?;
+        wal(&db)?;
         match version {
+            // Made under the write lock, checked again there: the app and a
+            // `theca` command starting on a new state at once each find it
+            // empty; the second waits, then finds it made.
             0 => {
-                db.execute_batch(SCHEMA)?;
-                db.pragma_update(None, "user_version", VERSION)?;
+                let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let now: i32 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
+                if now == 0 {
+                    tx.execute_batch(SCHEMA)?;
+                    tx.pragma_update(None, "user_version", VERSION)?;
+                }
+                tx.commit()?;
             }
             VERSION => {}
             _ => migrate(&mut db, path)?,
@@ -325,7 +395,12 @@ fn keep_copy(db: &Connection, path: &Path, from: i32) -> Result<()> {
     db.execute("VACUUM INTO ?1", [to.to_string_lossy()])?;
     let copied = Connection::open(&to)?;
     copied.pragma_update(None, "secure_delete", true)?;
-    copied.execute("UPDATE account SET password = ''", [])?;
+    // Only where there is one: from version 3, an account whose password is
+    // in the keychain has none, and its CHECK refuses both set.
+    copied.execute(
+        "UPDATE account SET password = '' WHERE password IS NOT NULL",
+        [],
+    )?;
     Ok(())
 }
 
@@ -349,8 +424,56 @@ pub struct Account {
     pub device: String,
     pub password: Password,
     pub default_folder: PathBuf,
-    pub auto_sync_limit: Option<i64>,
+    pub new_libraries: NewLibraries,
+    /// New libraries up to this size sync (`NewLibraries::Sync`); 0: no limit.
+    pub auto_sync_limit: i64,
     pub signed_out: bool,
+}
+
+/// What a library new to an account does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewLibraries {
+    /// Synced into the default folder, up to the size limit (notified above).
+    Sync,
+    /// Added as a drive (where one can't be: an error notice).
+    Drive,
+    /// Listed, and an OS notification.
+    #[default]
+    Notify,
+    /// Listed only.
+    Silent,
+}
+
+impl NewLibraries {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NewLibraries::Sync => "sync",
+            NewLibraries::Drive => "drive",
+            NewLibraries::Notify => "notify",
+            NewLibraries::Silent => "silent",
+        }
+    }
+
+    /// The column, which its CHECK limits to these four.
+    fn from_column(value: &str) -> NewLibraries {
+        match value {
+            "sync" => NewLibraries::Sync,
+            "drive" => NewLibraries::Drive,
+            "silent" => NewLibraries::Silent,
+            _ => NewLibraries::Notify,
+        }
+    }
+}
+
+impl std::str::FromStr for NewLibraries {
+    type Err = String;
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        match value {
+            "sync" | "drive" | "notify" | "silent" => Ok(NewLibraries::from_column(value)),
+            _ => Err(format!("{value:?}: sync, drive, notify or silent")),
+        }
+    }
 }
 
 /// Where an account's app password is.
@@ -382,6 +505,34 @@ pub struct Pair {
     /// The account's engine stopped on this error, until its next activity.
     pub error: Option<String>,
     pub synced_at: Option<DateTime<Utc>>,
+    pub mode: Mode,
+}
+
+/// What a pair keeps on this computer: everything (a sync pair), or what is
+/// opened, within the drive limit (a drive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    #[default]
+    Sync,
+    Drive,
+}
+
+impl Mode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Mode::Sync => "sync",
+            Mode::Drive => "drive",
+        }
+    }
+
+    /// The column, which its CHECK limits to these two.
+    fn from_column(mode: &str) -> Mode {
+        if mode == "drive" {
+            Mode::Drive
+        } else {
+            Mode::Sync
+        }
+    }
 }
 
 /// Why a pair stopped: stored as a kind, so that rewording what the user is
@@ -454,6 +605,22 @@ pub struct Entry {
     pub file_id: Option<String>,
 }
 
+/// An entry's columns, in `entry_row`'s order.
+const ENTRY: &str = "node, parent, name, is_file, version, size, mtime, file_id";
+
+fn entry_row(r: &rusqlite::Row) -> rusqlite::Result<Entry> {
+    Ok(Entry {
+        node: uuid(r.get(0)?),
+        parent: uuid(r.get(1)?),
+        name: r.get(2)?,
+        is_file: r.get(3)?,
+        version: r.get::<_, Option<String>>(4)?.map(uuid),
+        size: r.get(5)?,
+        mtime: r.get(6)?,
+        file_id: r.get(7)?,
+    })
+}
+
 /// A remote state not reconciled yet; `None`: gone.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoteState {
@@ -486,7 +653,7 @@ impl State {
         let db = self.db();
         let mut query = db.prepare(
             "SELECT id, instance, uuid, email, device, password, secret, default_folder,
-                    auto_sync_limit, signed_out
+                    new_libraries, auto_sync_limit, signed_out
              FROM account ORDER BY id",
         )?;
         let rows = query.query_map([], |r| {
@@ -502,8 +669,9 @@ impl State {
                     None => Password::Keychain(r.get(6)?),
                 },
                 default_folder: PathBuf::from(r.get::<_, String>(7)?),
-                auto_sync_limit: r.get(8)?,
-                signed_out: r.get(9)?,
+                new_libraries: NewLibraries::from_column(&r.get::<_, String>(8)?),
+                auto_sync_limit: r.get(9)?,
+                signed_out: r.get(10)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -516,13 +684,23 @@ impl State {
     /// Adds an account, or replaces the app password of the same account on
     /// the same instance (signing in again). Its ID.
     pub fn save_account(&self, a: &Account) -> Result<i64> {
+        self.save_account_seeing(a, &[])
+    }
+
+    /// `save_account`, the libraries it sees at login recorded with it, in
+    /// one transaction: its engine never finds it without them (they would
+    /// all be new).
+    pub fn save_account_seeing(&self, a: &Account, libraries: &[Uuid]) -> Result<i64> {
         let (password, secret) = match &a.password {
             Password::InState(password) => (Some(password), None),
             Password::Keychain(secret) => (None, Some(secret)),
         };
-        self.db().execute(
-            "INSERT INTO account (instance, uuid, email, device, password, secret, default_folder, auto_sync_limit)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        tx.execute(
+            "INSERT INTO account (instance, uuid, email, device, password, secret, default_folder,
+                                  new_libraries, auto_sync_limit)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT (instance, uuid) DO UPDATE SET
                 email = excluded.email, device = excluded.device, password = excluded.password,
                 secret = excluded.secret, signed_out = 0",
@@ -534,15 +712,25 @@ impl State {
                 password,
                 secret,
                 a.default_folder.to_string_lossy(),
+                a.new_libraries.as_str(),
                 a.auto_sync_limit
             ],
         )?;
-        self.publish(Update::Accounts);
-        Ok(self.db().query_row(
+        let id: i64 = tx.query_row(
             "SELECT id FROM account WHERE instance = ?1 AND uuid = ?2",
             params![a.instance, a.uuid.to_string()],
             |r| r.get(0),
-        )?)
+        )?;
+        for library in libraries {
+            tx.execute(
+                "INSERT OR IGNORE INTO seen (account, library) VALUES (?1, ?2)",
+                params![id, library.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        drop(db);
+        self.publish(Update::Accounts);
+        Ok(id)
     }
 
     pub fn set_signed_out(&self, account: i64) -> Result<()> {
@@ -552,10 +740,20 @@ impl State {
         Ok(())
     }
 
-    pub fn set_auto_sync_limit(&self, account: i64, limit: Option<i64>) -> Result<()> {
+    /// New libraries up to `limit` bytes sync (0: no limit).
+    pub fn set_auto_sync_limit(&self, account: i64, limit: i64) -> Result<()> {
         self.db().execute(
             "UPDATE account SET auto_sync_limit = ?2 WHERE id = ?1",
-            params![account, limit],
+            params![account, limit.max(0)],
+        )?;
+        self.publish(Update::Accounts);
+        Ok(())
+    }
+
+    pub fn set_new_libraries(&self, account: i64, new: NewLibraries) -> Result<()> {
+        self.db().execute(
+            "UPDATE account SET new_libraries = ?2 WHERE id = ?1",
+            params![account, new.as_str()],
         )?;
         self.publish(Update::Accounts);
         Ok(())
@@ -581,7 +779,8 @@ impl State {
         let db = self.db();
         let mut query = db.prepare(
             "SELECT id, account, library, root, library_name, path, root_file_id, position,
-                    paused, stop, writable, activity, synced_at, position_event, stop_detail, error
+                    paused, stop, writable, activity, synced_at, position_event, stop_detail, error,
+                    mode
              FROM pair ORDER BY id",
         )?;
         let rows = query.query_map([], |r| {
@@ -603,6 +802,7 @@ impl State {
                     .get::<_, Option<i64>>(12)?
                     .and_then(DateTime::from_timestamp_millis),
                 position_event: r.get::<_, Option<String>>(13)?.map(uuid),
+                mode: Mode::from_column(&r.get::<_, String>(16)?),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -614,40 +814,52 @@ impl State {
 
     pub fn add_pair(&self, p: &Pair) -> Result<i64> {
         self.db().execute(
-            "INSERT INTO pair (account, library, root, library_name, path, writable)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO pair (account, library, root, library_name, path, writable, mode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 p.account,
                 p.library.to_string(),
                 p.root.to_string(),
                 p.library_name,
                 p.path.to_string_lossy(),
-                p.writable
+                p.writable,
+                p.mode.as_str()
             ],
         )?;
-        self.db().execute(
-            "DELETE FROM declined WHERE account = ?1 AND library = ?2",
-            params![p.account, p.library.to_string()],
-        )?;
+        let id = self.db().last_insert_rowid();
+        self.see(p.account, &[p.library])?;
         self.publish(Update::Pairs);
-        Ok(self.db().last_insert_rowid())
+        Ok(id)
     }
 
-    /// Removes a pair: its state goes, and the library is never auto-synced again.
+    /// Removes a pair: its state goes; its library stays seen, so it is never
+    /// added by itself again.
     pub fn remove_pair(&self, pair: &Pair) -> Result<()> {
-        self.db().execute(
-            "INSERT OR IGNORE INTO declined (account, library) VALUES (?1, ?2)",
-            params![pair.account, pair.library.to_string()],
-        )?;
+        self.see(pair.account, &[pair.library])?;
         self.db()
             .execute("DELETE FROM pair WHERE id = ?1", [pair.id])?;
         self.publish(Update::Pairs);
         Ok(())
     }
 
-    pub fn declined(&self, account: i64) -> Result<Vec<Uuid>> {
+    /// Libraries the account knows from now on: never new again.
+    pub fn see(&self, account: i64, libraries: &[Uuid]) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        for library in libraries {
+            tx.execute(
+                "INSERT OR IGNORE INTO seen (account, library) VALUES (?1, ?2)",
+                params![account, library.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The libraries the account knows (one not here is new).
+    pub fn seen(&self, account: i64) -> Result<HashSet<Uuid>> {
         let db = self.db();
-        let mut query = db.prepare("SELECT library FROM declined WHERE account = ?1")?;
+        let mut query = db.prepare("SELECT library FROM seen WHERE account = ?1")?;
         let rows = query.query_map([account], |r| Ok(uuid(r.get(0)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -749,23 +961,290 @@ impl State {
 
     pub fn entries(&self, pair: i64) -> Result<Vec<Entry>> {
         let db = self.db();
-        let mut query = db.prepare(
-            "SELECT node, parent, name, is_file, version, size, mtime, file_id
-             FROM entry WHERE pair = ?1",
-        )?;
-        let rows = query.query_map([pair], |r| {
-            Ok(Entry {
-                node: uuid(r.get(0)?),
-                parent: uuid(r.get(1)?),
-                name: r.get(2)?,
-                is_file: r.get(3)?,
-                version: r.get::<_, Option<String>>(4)?.map(uuid),
-                size: r.get(5)?,
-                mtime: r.get(6)?,
-                file_id: r.get(7)?,
-            })
-        })?;
+        let mut query = db.prepare(&format!("SELECT {ENTRY} FROM entry WHERE pair = ?1"))?;
+        let rows = query.query_map([pair], entry_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn entry(&self, pair: i64, node: Uuid) -> Result<Option<Entry>> {
+        Ok(self
+            .db()
+            .query_row(
+                &format!("SELECT {ENTRY} FROM entry WHERE pair = ?1 AND node = ?2"),
+                params![pair, node.to_string()],
+                entry_row,
+            )
+            .optional()?)
+    }
+
+    /// The entry at a path below a pair's root, its names matched by key, as
+    /// the scan matches them (a drive's file opened through its mount).
+    pub fn entry_at(&self, pair: i64, root: Uuid, names: &[String]) -> Result<Option<Entry>> {
+        let db = self.db();
+        let mut query = db.prepare(&format!(
+            "SELECT {ENTRY} FROM entry WHERE pair = ?1 AND parent = ?2"
+        ))?;
+        let mut found = None;
+        let mut parent = root;
+        for name in names {
+            let key = crate::local::key(name);
+            let children = query.query_map(params![pair, parent.to_string()], entry_row)?;
+            let mut child = None;
+            for e in children {
+                let e = e?;
+                if crate::local::key(&e.name) == key {
+                    child = Some(e);
+                    break;
+                }
+            }
+            let Some(e) = child else {
+                return Ok(None);
+            };
+            parent = e.node;
+            found = Some(e);
+        }
+        Ok(found)
+    }
+
+    /// A drive's files' last use (opened, else downloaded), Unix seconds.
+    pub fn used(&self, pair: i64) -> Result<HashMap<Uuid, i64>> {
+        let db = self.db();
+        let mut query =
+            db.prepare("SELECT node, used FROM entry WHERE pair = ?1 AND used IS NOT NULL")?;
+        let rows = query.query_map([pair], |r| Ok((uuid(r.get(0)?), r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A drive's node kept on this computer, or not (macOS and FUSE): a
+    /// change to its entries, stamped with the pair's counter (what a
+    /// running engine, in another process, looks for).
+    pub fn set_kept(&self, pair: i64, node: Uuid, kept: bool) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        tx.execute("UPDATE pair SET seq = seq + 1 WHERE id = ?1", [pair])?;
+        tx.execute(
+            "UPDATE entry SET kept = ?3, seq = (SELECT seq FROM pair WHERE id = ?1)
+             WHERE pair = ?1 AND node = ?2",
+            params![pair, node.to_string(), kept],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A drive's file or folder freed (`theca free`): no longer kept, and
+    /// evicted as soon as possible by the running engine (the pair's counter
+    /// tells it), or at once by the caller when none runs.
+    pub fn set_free(&self, pair: i64, node: Uuid) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        tx.execute("UPDATE pair SET seq = seq + 1 WHERE id = ?1", [pair])?;
+        tx.execute(
+            "UPDATE entry SET kept = 0, free = 1, seq = (SELECT seq FROM pair WHERE id = ?1)
+             WHERE pair = ?1 AND node = ?2",
+            params![pair, node.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A drive's nodes freed, waiting for their eviction.
+    pub fn freed(&self, pair: i64) -> Result<Vec<Uuid>> {
+        let db = self.db();
+        let mut query = db.prepare("SELECT node FROM entry WHERE pair = ?1 AND free = 1")?;
+        let rows = query.query_map([pair], |r| Ok(uuid(r.get(0)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A freed node's files all evicted (or edited since: they stay).
+    pub fn clear_free(&self, pair: i64, node: Uuid) -> Result<()> {
+        self.db().execute(
+            "UPDATE entry SET free = 0 WHERE pair = ?1 AND node = ?2",
+            params![pair, node.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// A folder's entries (`parent`: the pair's root for the top level).
+    pub fn children(&self, pair: i64, parent: Uuid) -> Result<Vec<Entry>> {
+        let db = self.db();
+        let mut query = db.prepare(&format!(
+            "SELECT {ENTRY} FROM entry WHERE pair = ?1 AND parent = ?2"
+        ))?;
+        let rows = query.query_map(params![pair, parent.to_string()], entry_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A macOS drive's entry as it is now, recorded, stamped with the pair's
+    /// counter (its change listed past the anchors before it).
+    pub fn stamp(&self, pair: i64, e: &Entry) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        tx.execute("UPDATE pair SET seq = seq + 1 WHERE id = ?1", [pair])?;
+        tx.execute(
+            "INSERT INTO entry (pair, node, parent, name, is_file, version, size, mtime, file_id, seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, (SELECT seq FROM pair WHERE id = ?1))
+             ON CONFLICT (pair, node) DO UPDATE SET
+                 parent = excluded.parent, name = excluded.name, is_file = excluded.is_file,
+                 version = excluded.version, size = excluded.size, mtime = excluded.mtime,
+                 seq = excluded.seq",
+            params![
+                pair,
+                e.node.to_string(),
+                e.parent.to_string(),
+                e.name,
+                e.is_file,
+                e.version.map(|v| v.to_string()),
+                e.size,
+                e.mtime,
+                e.file_id
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM entry_gone WHERE pair = ?1 AND node = ?2",
+            params![pair, e.node.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A macOS drive's node gone, and what is below it: each listed as gone
+    /// past the anchors before it.
+    pub fn stamp_gone(&self, pair: i64, node: Uuid) -> Result<()> {
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        tx.execute("UPDATE pair SET seq = seq + 1 WHERE id = ?1", [pair])?;
+        tx.execute(
+            "WITH RECURSIVE below(node) AS (
+                 SELECT ?2
+                 UNION SELECT e.node FROM entry e JOIN below b ON e.parent = b.node WHERE e.pair = ?1
+             )
+             INSERT INTO entry_gone (pair, node, seq)
+                 SELECT ?1, e.node, (SELECT seq FROM pair WHERE id = ?1)
+                 FROM entry e WHERE e.pair = ?1 AND e.node IN (SELECT node FROM below)
+             ON CONFLICT (pair, node) DO UPDATE SET seq = excluded.seq",
+            params![pair, node.to_string()],
+        )?;
+        tx.execute(
+            "WITH RECURSIVE below(node) AS (
+                 SELECT ?2
+                 UNION SELECT e.node FROM entry e JOIN below b ON e.parent = b.node WHERE e.pair = ?1
+             )
+             DELETE FROM entry WHERE pair = ?1 AND node IN (SELECT node FROM below)",
+            params![pair, node.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A macOS drive's changes past `anchor`: the entries changed, the nodes
+    /// gone, and the counter now. Gone rows stay for the drive's life: a
+    /// system asking from an older anchor (restored) still learns of them.
+    pub fn changes_since(&self, pair: i64, anchor: i64) -> Result<(Vec<Entry>, Vec<Uuid>, i64)> {
+        let db = self.db();
+        let changed = {
+            let mut query = db.prepare(&format!(
+                "SELECT {ENTRY} FROM entry WHERE pair = ?1 AND seq > ?2"
+            ))?;
+            let rows = query.query_map(params![pair, anchor], entry_row)?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let gone = {
+            let mut query =
+                db.prepare("SELECT node FROM entry_gone WHERE pair = ?1 AND seq > ?2")?;
+            let rows = query.query_map(params![pair, anchor], |r| Ok(uuid(r.get(0)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let now = db.query_row("SELECT seq FROM pair WHERE id = ?1", [pair], |r| r.get(0))?;
+        Ok((changed, gone, now))
+    }
+
+    /// Each pair's counter of changes to its entries.
+    pub fn seqs(&self) -> Result<HashMap<i64, i64>> {
+        let db = self.db();
+        let mut query = db.prepare("SELECT id, seq FROM pair")?;
+        let rows = query.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A drive's file last used (opened, else downloaded), in Unix seconds.
+    pub fn set_used(&self, pair: i64, node: Uuid, at: i64) -> Result<()> {
+        self.db().execute(
+            "UPDATE entry SET used = ?3 WHERE pair = ?1 AND node = ?2",
+            params![pair, node.to_string(), at],
+        )?;
+        Ok(())
+    }
+
+    /// A drive's nodes kept on this computer (macOS and FUSE; Windows keeps
+    /// its pins on the files).
+    pub fn kept(&self, pair: i64) -> Result<HashSet<Uuid>> {
+        let db = self.db();
+        let mut query = db.prepare("SELECT node FROM entry WHERE pair = ?1 AND kept = 1")?;
+        let rows = query.query_map([pair], |r| Ok(uuid(r.get(0)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The drive limit set (`theca drive-limit`), in bytes; `None`: the
+    /// default (`drive::limit`). A value that isn't one is the default too,
+    /// logged.
+    pub fn drive_limit(&self) -> Result<Option<u64>> {
+        let value = self.setting("drive_limit")?;
+        Ok(value.and_then(|v| {
+            v.parse()
+                .inspect_err(|_| tracing::warn!(value = v, "drive_limit isn't a size: the default"))
+                .ok()
+        }))
+    }
+
+    /// Back to the default.
+    pub fn clear_drive_limit(&self) -> Result<()> {
+        self.clear_setting("drive_limit")
+    }
+
+    pub fn set_drive_limit(&self, bytes: u64) -> Result<()> {
+        self.set_setting("drive_limit", &bytes.to_string())
+    }
+
+    /// The settings stored at `path`, read without opening the state (no
+    /// migration: the logs read theirs before it runs, to log it); none
+    /// when there is no state yet, or no setting table.
+    pub fn stored_settings(path: &Path) -> std::collections::HashMap<String, String> {
+        let read = || -> rusqlite::Result<std::collections::HashMap<String, String>> {
+            let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let mut query = db.prepare("SELECT key, value FROM setting")?;
+            let rows = query.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect()
+        };
+        read().unwrap_or_default()
+    }
+
+    /// A setting stored as given; its reader parses it.
+    pub(crate) fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.db().execute(
+            "INSERT INTO setting (key, value) VALUES (?1, ?2)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            [key, value],
+        )?;
+        Ok(())
+    }
+
+    /// A setting back to its default.
+    pub(crate) fn clear_setting(&self, key: &str) -> Result<()> {
+        self.db()
+            .execute("DELETE FROM setting WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
+    /// A setting for the whole computer, as stored: each has its reader, the
+    /// one place that parses it (the drive limit here, the logs' in `logs`;
+    /// a key nobody reads is ignored).
+    pub(crate) fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .db()
+            .query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| {
+                r.get(0)
+            })
+            .optional()?)
     }
 
     /// A node synced, in one transaction: its entry (dropped once the base
@@ -777,9 +1256,15 @@ impl State {
         let mut db = self.db();
         let tx = db.transaction()?;
         tx.execute(
-            "INSERT OR REPLACE INTO entry (pair, node, parent, name, is_file, version, size, mtime, file_id)
+            "INSERT INTO entry (pair, node, parent, name, is_file, version, size, mtime, file_id)
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
-             WHERE EXISTS (SELECT 1 FROM pair WHERE id = ?1 AND position IS NOT NULL)",
+             WHERE EXISTS (SELECT 1 FROM pair WHERE id = ?1 AND position IS NOT NULL)
+             -- An update, not a replace: a drive's columns (kept, used,
+             -- seq) aren't the base's, and stay.
+             ON CONFLICT (pair, node) DO UPDATE SET
+                 parent = excluded.parent, name = excluded.name, is_file = excluded.is_file,
+                 version = excluded.version, size = excluded.size, mtime = excluded.mtime,
+                 file_id = excluded.file_id",
             params![
                 pair,
                 e.node.to_string(),
@@ -927,10 +1412,18 @@ impl State {
         undo: Option<&str>,
     ) -> Result<()> {
         // The same error again replaces the old one.
-        self.db().execute(
+        let again = self.db().execute(
             "DELETE FROM notice WHERE pair IS ?1 AND account IS ?2 AND path IS ?3 AND message = ?4",
             params![pair, account, path, message],
-        )?;
+        )? > 0;
+        // A new notice in the log too, at its level; one standing (said
+        // again each round) only at debug.
+        let path_ = path.unwrap_or_default();
+        match (again, level) {
+            (true, _) => tracing::debug!(account, pair, path = path_, "again: {message}"),
+            (false, "error") => tracing::error!(account, pair, path = path_, "{message}"),
+            (false, _) => tracing::info!(account, pair, path = path_, "{message}"),
+        }
         self.db().execute(
             "INSERT INTO notice (account, pair, at, level, path, message, undo)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1168,7 +1661,8 @@ mod tests {
                 device: "d".into(),
                 password: Password::InState("p".into()),
                 default_folder: "/tmp".into(),
-                auto_sync_limit: None,
+                new_libraries: Default::default(),
+                auto_sync_limit: 0,
                 signed_out: false,
             })
             .unwrap();
@@ -1189,6 +1683,7 @@ mod tests {
                 activity: String::new(),
                 error: None,
                 synced_at: None,
+                mode: Mode::Sync,
             })
             .unwrap()
     }
@@ -1204,6 +1699,177 @@ mod tests {
             mtime: 0,
             file_id: None,
         }
+    }
+
+    /// A path finds its entry by key (case, normalization), folder by
+    /// folder from the pair's root; a path nobody knows, nothing.
+    #[test]
+    fn an_entry_is_found_by_its_path() {
+        let state = State::memory().unwrap();
+        let pair = pair(&state);
+        let root = Uuid::from_u128(3);
+        let folder = Entry {
+            node: Uuid::from_u128(5),
+            parent: root,
+            name: "Caf\u{e9}".into(),
+            is_file: false,
+            ..entry()
+        };
+        let file = Entry {
+            parent: folder.node,
+            ..entry()
+        };
+        state
+            .record_remote(pair, &[], Some(theca_common::api::Position::Seq(1)))
+            .unwrap();
+        state.synced(pair, &folder, None, &[]).unwrap();
+        state.synced(pair, &file, None, &[]).unwrap();
+        let at = |names: &[&str]| {
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            state.entry_at(pair, root, &names).unwrap().map(|e| e.node)
+        };
+        assert_eq!(at(&["cafe\u{301}", "A.TXT"]), Some(file.node));
+        assert_eq!(at(&["Caf\u{e9}"]), Some(folder.node));
+        assert_eq!(at(&["a.txt"]), None);
+        assert_eq!(at(&["Caf\u{e9}", "b.txt"]), None);
+        state.set_used(pair, file.node, 1_800_000_000).unwrap();
+        let used: Option<i64> = state
+            .db()
+            .query_row(
+                "SELECT used FROM entry WHERE node = ?1",
+                [file.node.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(used, Some(1_800_000_000));
+    }
+
+    /// A macOS drive's changes since an anchor: what changed, what went (a
+    /// folder with what is below it), past that anchor only, from an older
+    /// anchor too.
+    #[test]
+    fn changes_since_an_anchor() {
+        let state = State::memory().unwrap();
+        let pair = pair(&state);
+        let root = Uuid::from_u128(3);
+        let folder = Entry {
+            node: Uuid::from_u128(5),
+            parent: root,
+            name: "d".into(),
+            is_file: false,
+            ..entry()
+        };
+        let file = Entry {
+            parent: folder.node,
+            ..entry()
+        };
+        state.stamp(pair, &folder).unwrap();
+        state.stamp(pair, &file).unwrap();
+        let (changed, gone, two) = state.changes_since(pair, 0).unwrap();
+        assert_eq!((changed.len(), gone.len(), two), (2, 0, 2));
+        let renamed = Entry {
+            name: "b.txt".into(),
+            ..file.clone()
+        };
+        state.stamp(pair, &renamed).unwrap();
+        let (changed, _, three) = state.changes_since(pair, two).unwrap();
+        assert_eq!(
+            changed.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            ["b.txt"]
+        );
+        state.stamp_gone(pair, folder.node).unwrap();
+        let (changed, mut gone, four) = state.changes_since(pair, three).unwrap();
+        gone.sort();
+        assert_eq!(
+            (changed.len(), gone, four),
+            (0, vec![file.node, folder.node], 4)
+        );
+        assert!(state.entries(pair).unwrap().is_empty());
+        assert!(state.changes_since(pair, four).unwrap().1.is_empty());
+        assert_eq!(
+            state.changes_since(pair, three).unwrap().1.len(),
+            2,
+            "asked again"
+        );
+    }
+
+    /// A new state opened by several processes at once (the app, a `theca`
+    /// command): each opens it, none finds it locked or half made.
+    #[test]
+    fn a_new_state_opened_at_once_by_several() {
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("state.sqlite");
+            let opened: Vec<_> = (0..4)
+                .map(|_| {
+                    let path = path.clone();
+                    std::thread::spawn(move || {
+                        State::open(&path).map(|s| s.accounts().map(|a| a.len()))
+                    })
+                })
+                .collect();
+            for o in opened {
+                assert_eq!(o.join().unwrap().unwrap().unwrap(), 0);
+            }
+        }
+    }
+
+    /// What new libraries do: one of four, the schema refuses a fifth.
+    #[test]
+    fn new_libraries_take_four_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open(&dir.path().join("state.sqlite")).unwrap();
+        state
+            .db()
+            .execute_batch(
+                "INSERT INTO account (instance, uuid, email, device, password, default_folder)
+                 VALUES ('https://x', 'u', 'e', 'd', 'p', '/f')",
+            )
+            .unwrap();
+        let id = state.accounts().unwrap()[0].id;
+        assert_eq!(
+            state.accounts().unwrap()[0].new_libraries,
+            NewLibraries::Notify
+        );
+        for new in [
+            NewLibraries::Sync,
+            NewLibraries::Drive,
+            NewLibraries::Silent,
+        ] {
+            state.set_new_libraries(id, new).unwrap();
+            assert_eq!(state.accounts().unwrap()[0].new_libraries, new);
+        }
+        let fifth = state.db().execute(
+            "UPDATE account SET new_libraries = 'always' WHERE id = ?1",
+            [id],
+        );
+        assert!(fifth.is_err(), "the CHECK refuses it");
+        assert!("always".parse::<NewLibraries>().is_err());
+    }
+
+    /// a key nobody reads changes nothing.
+    #[test]
+    fn a_setting_falls_back_to_its_default() {
+        let state = State::memory().unwrap();
+        assert_eq!(state.drive_limit().unwrap(), None);
+        let put = |key: &str, value: &str| {
+            state
+                .db()
+                .execute(
+                    "INSERT OR REPLACE INTO setting (key, value) VALUES (?1, ?2)",
+                    [key, value],
+                )
+                .unwrap();
+        };
+        put("updates", "beta");
+        assert_eq!(state.drive_limit().unwrap(), None);
+        for invalid in ["20GB", "-1", ""] {
+            put("drive_limit", invalid);
+            assert_eq!(state.drive_limit().unwrap(), None, "{invalid:?}");
+        }
+        state.set_drive_limit(5_000_000_000).unwrap();
+        state.set_drive_limit(20_000_000_000).unwrap();
+        assert_eq!(state.drive_limit().unwrap(), Some(20_000_000_000));
     }
 
     /// A round still running when the base is forgotten (`locate`) doesn't

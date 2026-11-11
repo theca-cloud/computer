@@ -12,6 +12,9 @@
 //! - Names that can't go up are reported, never renamed.
 //! - What an ignore file names is read-only, silently: the server's changes
 //!   come down, nothing goes up (the local path decides).
+//! - A drive's file not downloaded is never modified (nobody edits it
+//!   without downloading it); a remote file comes down as a placeholder
+//!   unless kept, and one downloaded and changed remotely is evicted.
 //!
 //! Actions name nodes, not paths: the executor finds a node's local path from
 //! the base as it updates it, so earlier actions (a move) are taken into
@@ -65,6 +68,15 @@ pub enum Action {
     /// A remote file's version written locally (new, or over the base's
     /// content, which the executor checks is still there).
     Download {
+        node: Uuid,
+        parent: Uuid,
+        name: String,
+        state: RemoteState,
+    },
+    /// A drive's remote file as a placeholder, its content left on the
+    /// server: new, or over the base's content (which the executor checks is
+    /// still there: an eviction), or over a placeholder.
+    Placeholder {
         node: Uuid,
         parent: Uuid,
         name: String,
@@ -144,6 +156,11 @@ pub struct Input<'a> {
     pub scan: &'a Scan,
     pub remote: &'a [(Uuid, Option<RemoteState>)],
     pub writable: bool,
+    /// A drive: files come down as placeholders unless kept.
+    pub drive: bool,
+    /// A drive's nodes kept, as the state records them (FUSE's
+    /// `entry.kept`): what is below one is kept too.
+    pub kept: &'a HashSet<Uuid>,
 }
 
 /// A node's place and content, on one side.
@@ -189,6 +206,8 @@ pub fn known_paths(
         scan: &scan,
         remote,
         writable: true,
+        drive: false,
+        kept: &HashSet::new(),
     };
     let planner = Planner::new(&input);
     let mut known: HashSet<Vec<String>> = base
@@ -254,7 +273,7 @@ fn sound(name: &str) -> bool {
 /// Steps up a parent chain before it counts as a cycle: a guard a real tree
 /// never reaches (so `>` or `>=` there, or a count that doesn't grow, changes
 /// nothing a test can see).
-const MAX_DEPTH: usize = 10_000;
+pub const MAX_DEPTH: usize = 10_000;
 
 fn nfc(name: &str) -> String {
     Name::new(name).map_or_else(|_| name.to_owned(), |n| n.as_str().to_owned())
@@ -397,6 +416,18 @@ impl<'a> Planner<'a> {
         self.plan.wait = self.plan.actions.len() < before;
     }
 
+    /// A placeholder whose file ID isn't `node`'s: another file renamed over
+    /// it (a placeholder is never an atomic save, which downloads it). Its
+    /// file ID says which node it is.
+    fn is_another(&self, item: &Item, node: Uuid) -> bool {
+        let base = self.base[&node];
+        item.is_file
+            && !item.downloaded
+            && item.file_id.is_some()
+            && base.file_id.is_some()
+            && item.file_id != base.file_id
+    }
+
     /// Which local items are which base nodes: by name within their parent
     /// first (an atomic save changes the file ID, not the path), then by file
     /// ID for what isn't where the base had it (a move or rename).
@@ -440,6 +471,7 @@ impl<'a> Planner<'a> {
                     if let Some(&node) = children.get(&(parent, key(item.name())))
                         && self.base[&node].is_file == item.is_file
                         && !in_place.contains(&node)
+                        && !self.is_another(item, node)
                         && match pass {
                             0 => item.file_id.is_some() && item.file_id == self.base[&node].file_id,
                             1 => item.name() == self.base[&node].name,
@@ -475,7 +507,11 @@ impl<'a> Planner<'a> {
                 children
                     .get(&(parent, key(item.name())))
                     .copied()
-                    .filter(|n| self.base[n].is_file == item.is_file && !taken.contains(n))
+                    .filter(|n| {
+                        self.base[n].is_file == item.is_file
+                            && !taken.contains(n)
+                            && !self.is_another(item, *n)
+                    })
             });
             let by_file = item
                 .file_id
@@ -483,8 +519,11 @@ impl<'a> Planner<'a> {
                 .and_then(|id| by_id.get(id).copied())
                 .filter(|n| {
                     let e = self.base[n];
+                    // A placeholder's mtime may be an interrupted
+                    // eviction's: its size alone.
                     e.is_file == item.is_file
-                        && (!e.is_file || (e.size == item.size && e.mtime == item.mtime))
+                        && (!e.is_file
+                            || (e.size == item.size && (e.mtime == item.mtime || !item.downloaded)))
                         && !taken.contains(n)
                 });
             if let Some(node) = by_name.or(by_file) {
@@ -529,8 +568,11 @@ impl<'a> Planner<'a> {
             let moved =
                 (parent != Parent::Node(e.parent) || name != e.name).then_some((parent, name));
             // The fingerprint: size, mtime, and the file ID when known (a file
-            // replaced by one of the same size and time).
+            // replaced by one of the same size and time). A file not
+            // downloaded is never modified, whatever it says (an eviction
+            // interrupted before its mtime was restored is no edit of zeros).
             let modified = e.is_file
+                && item.downloaded
                 && (item.size != e.size
                     || item.mtime != e.mtime
                     || (e.file_id.is_some() && item.file_id != e.file_id));
@@ -787,12 +829,8 @@ impl<'a> Planner<'a> {
                         (true, true, false) if ignored => {}
                         (true, true, false) => {
                             self.plan.actions.push(Action::KeepAside { node });
-                            self.plan.actions.push(Action::Download {
-                                node,
-                                parent: r.parent,
-                                name: r.name.clone(),
-                                state,
-                            });
+                            let fetch = self.fetch(node, &r, state);
+                            self.plan.actions.push(fetch);
                         }
                         (true, false, false) if ignored => {}
                         (true, false, false) => self.report(
@@ -800,12 +838,23 @@ impl<'a> Planner<'a> {
                             "not uploaded: read-only library",
                             Level::Error,
                         ),
-                        (false, true, _) => self.plan.actions.push(Action::Download {
-                            node,
-                            parent: r.parent,
-                            name: r.name.clone(),
-                            state,
-                        }),
+                        (false, true, _) => {
+                            let fetch = self.fetch(node, &r, state);
+                            self.plan.actions.push(fetch);
+                        }
+                        // A drive's file kept and not downloaded: it comes down.
+                        (false, false, _)
+                            if r.is_file
+                                && !self.items()[item].downloaded
+                                && self.is_kept(node) =>
+                        {
+                            self.plan.actions.push(Action::Download {
+                                node,
+                                parent: r.parent,
+                                name: r.name.clone(),
+                                state,
+                            });
+                        }
                         // A remote place change is in LocalMove; a remote
                         // touch (only its time) was settled.
                         (false, false, _) => {}
@@ -820,12 +869,8 @@ impl<'a> Planner<'a> {
     fn restore_locally(&mut self, node: Uuid, r: &Node) {
         let state = self.state(node, r);
         if r.is_file {
-            self.plan.actions.push(Action::Download {
-                node,
-                parent: r.parent,
-                name: r.name.clone(),
-                state,
-            });
+            let fetch = self.fetch(node, r, state);
+            self.plan.actions.push(fetch);
         } else {
             self.plan.actions.push(Action::LocalMkdir {
                 node,
@@ -833,6 +878,44 @@ impl<'a> Planner<'a> {
                 name: r.name.clone(),
             });
         }
+    }
+
+    /// How a remote file's version comes down: downloaded, or in a drive a
+    /// placeholder unless it is kept.
+    fn fetch(&self, node: Uuid, r: &Node, state: RemoteState) -> Action {
+        let (parent, name) = (r.parent, r.name.clone());
+        if self.input.drive && !self.is_kept(node) {
+            Action::Placeholder {
+                node,
+                parent,
+                name,
+                state,
+            }
+        } else {
+            Action::Download {
+                node,
+                parent,
+                name,
+                state,
+            }
+        }
+    }
+
+    /// A drive's node kept, or below a folder kept, in the remote view: as
+    /// the state records it, or as its local item says (Windows' pin).
+    fn is_kept(&self, mut node: Uuid) -> bool {
+        for _ in 0..MAX_DEPTH {
+            let pinned = matches!(self.local.get(&node),
+                Some(Local::Present { item, .. }) if self.items()[*item].kept);
+            if self.input.kept.contains(&node) || pinned {
+                return true;
+            }
+            match self.remote.get(&node) {
+                Some(r) => node = r.parent,
+                None => return false,
+            }
+        }
+        false
     }
 
     /// The remote state of a node in the remote view (its pending state when
@@ -931,6 +1014,13 @@ impl<'a> Planner<'a> {
                         );
                     }
                 }
+                // A placeholder where a remote file is (written, its entry
+                // not yet recorded: a crash): it holds nothing to merge.
+                Some(i) if r.is_file && !items[i].downloaded => {
+                    self.claimed.insert(i, node);
+                    let fetch = self.fetch(node, &r, state);
+                    self.plan.actions.push(fetch);
+                }
                 Some(i) if items[i].is_file == r.is_file => {
                     self.claimed.insert(i, node);
                     let path = items[i].path.clone();
@@ -950,12 +1040,10 @@ impl<'a> Planner<'a> {
                         Level::Error,
                     );
                 }
-                None if r.is_file => self.plan.actions.push(Action::Download {
-                    node,
-                    parent: r.parent,
-                    name: r.name.clone(),
-                    state,
-                }),
+                None if r.is_file => {
+                    let fetch = self.fetch(node, &r, state);
+                    self.plan.actions.push(fetch);
+                }
                 None => self.plan.actions.push(Action::LocalMkdir {
                     node,
                     parent: r.parent,
@@ -1069,6 +1157,16 @@ impl<'a> Planner<'a> {
                 continue;
             }
             let display = item.display();
+            // A placeholder no node is (its node gone remotely after a
+            // crash): there is nothing to upload.
+            if !item.downloaded {
+                self.report(
+                    display,
+                    "not synced: its content isn't on this computer",
+                    Level::Error,
+                );
+                continue;
+            }
             let name = match Name::new(item.name()) {
                 Ok(name) => name.as_str().to_owned(),
                 Err(e) => {
@@ -1131,7 +1229,7 @@ impl<'a> Planner<'a> {
             // One rank, by depth: a folder created before what moves into it.
             Action::LocalMove { .. } | Action::LocalMkdir { .. } => (4, 0),
             Action::KeepAside { .. } => (6, 0),
-            Action::Download { .. } => (7, 0),
+            Action::Download { .. } | Action::Placeholder { .. } => (7, 0),
             Action::RemoteTrash { .. } => (8, 0),
             Action::LocalDelete { .. } => (9, 0),
             Action::Forget { .. } => (10, 0),
@@ -1212,6 +1310,8 @@ mod tests {
             mtime: e.map_or(7, |e| e.mtime),
             file_id: e.and_then(|e| e.file_id.clone()),
             ignored: false,
+            downloaded: true,
+            kept: false,
         }
     }
 
@@ -1281,7 +1381,218 @@ mod tests {
             scan: &scan,
             remote: pending,
             writable,
+            drive: false,
+            kept: &HashSet::new(),
         })
+    }
+
+    /// A drive's plan, `kept` the nodes the state keeps.
+    fn run_drive(
+        base: &[Entry],
+        items: Vec<Item>,
+        pending: &[(Uuid, Option<RemoteState>)],
+        kept: &[Uuid],
+    ) -> Plan {
+        let scan = Scan {
+            items,
+            ..Default::default()
+        };
+        plan(&Input {
+            root: ROOT,
+            base,
+            scan: &scan,
+            remote: pending,
+            writable: true,
+            drive: true,
+            kept: &kept.iter().copied().collect(),
+        })
+    }
+
+    /// A local item for an entry, its content not downloaded.
+    fn placeholder(path: &str, e: &Entry) -> Item {
+        Item {
+            downloaded: false,
+            ..item(path, Some(e), true)
+        }
+    }
+
+    /// A placeholder renamed over another is the node its file ID says, not
+    /// the one its path had (a placeholder is never an atomic save: saving
+    /// downloads it): that one moved there, the other trashed.
+    #[test]
+    fn a_placeholder_renamed_over_another_is_the_moved_one() {
+        let (mut base, _) = synced();
+        let b = entry(3, id(1), "b.txt", v(3));
+        base.push(b.clone());
+        let items = vec![item("d", Some(&base[0]), false), placeholder("d/a.txt", &b)];
+        let plan = run_drive(&base, items, &[], &[]);
+        assert!(
+            plan.actions.contains(&Action::RemoteTrash { node: id(2) }),
+            "{:?}",
+            plan.actions
+        );
+        assert!(
+            plan.actions.iter().any(|a| matches!(a,
+                Action::RemoteMove { node, name, .. } if *node == id(3) && name == "a.txt")),
+            "{:?}",
+            plan.actions
+        );
+    }
+
+    /// A drive's file not downloaded is never modified, whatever its
+    /// fingerprint says (an eviction interrupted before its mtime was
+    /// restored), and never uploaded.
+    #[test]
+    fn a_file_not_downloaded_is_never_modified() {
+        let (base, mut items) = synced();
+        items[1] = placeholder("d/a.txt", &base[1]);
+        assert_eq!(run_drive(&base, items.clone(), &[], &[]).actions, []);
+        items[1].mtime += 1;
+        assert_eq!(run_drive(&base, items.clone(), &[], &[]).actions, []);
+        // Renamed so, it's still a move, not a delete and an unknown file.
+        items[1].path = vec!["d".into(), "b.txt".into()];
+        let plan = run_drive(&base, items, &[], &[]);
+        assert_eq!(
+            plan.actions,
+            [Action::RemoteMove {
+                node: id(2),
+                parent: Parent::Node(id(1)),
+                name: "b.txt".into(),
+            }]
+        );
+    }
+
+    /// A drive's remote file comes down as a placeholder: new, changed, or
+    /// back after a local delete; kept (the file or a folder above it), it is
+    /// downloaded.
+    #[test]
+    fn a_drive_fetches_placeholders_unless_kept() {
+        let (base, items) = synced();
+        let new = (id(3), remote(id(1), "b.txt", v(3)));
+        let changed = (id(2), remote(id(1), "a.txt", v(2)));
+        let cases: [(&[Uuid], bool); 4] = [
+            (&[], false),
+            (&[id(1)], true),
+            (&[id(2), id(3)], true),
+            (&[id(9)], false),
+        ];
+        for (kept, download) in cases {
+            for (pending, items) in [
+                (new.clone(), items.clone()),
+                (changed.clone(), items.clone()),
+                (changed.clone(), items[..1].to_vec()),
+            ] {
+                let plan = run_drive(&base, items, std::slice::from_ref(&pending), kept);
+                let (node, state) = (pending.0, pending.1.unwrap());
+                let (parent, name) = (state.parent, state.name.clone());
+                let fetch = if download {
+                    Action::Download {
+                        node,
+                        parent,
+                        name,
+                        state,
+                    }
+                } else {
+                    Action::Placeholder {
+                        node,
+                        parent,
+                        name,
+                        state,
+                    }
+                };
+                assert_eq!(plan.actions, [fetch], "kept {kept:?}");
+            }
+        }
+    }
+
+    /// A drive's downloaded file changed remotely is evicted (a placeholder
+    /// over the base's content, which the executor checks); edited locally
+    /// meanwhile, the edit wins as in a sync pair.
+    #[test]
+    fn a_remote_change_evicts_unless_edited() {
+        let (base, mut items) = synced();
+        let changed = [(id(2), remote(id(1), "a.txt", v(2)))];
+        let plan = run_drive(&base, items.clone(), &changed, &[]);
+        assert!(
+            matches!(plan.actions[..], [Action::Placeholder { node, .. }] if node == id(2)),
+            "{:?}",
+            plan.actions
+        );
+        items[1].size += 1;
+        let plan = run_drive(&base, items, &changed, &[]);
+        assert_eq!(
+            plan.actions,
+            [Action::Upload {
+                path: vec!["d".into(), "a.txt".into()],
+                to: UploadTo::Version {
+                    node: id(2),
+                    base: v(1),
+                },
+            }]
+        );
+    }
+
+    /// A drive's file kept and not downloaded is downloaded, at its version;
+    /// not kept, it stays a placeholder.
+    #[test]
+    fn a_file_kept_comes_down() {
+        let (base, mut items) = synced();
+        items[1] = placeholder("d/a.txt", &base[1]);
+        assert_eq!(run_drive(&base, items.clone(), &[], &[]).actions, []);
+        let plan = run_drive(&base, items, &[], &[id(1)]);
+        assert!(
+            matches!(&plan.actions[..], [Action::Download { node, state, .. }]
+                if *node == id(2) && state.version == v(1)),
+            "{:?}",
+            plan.actions
+        );
+    }
+
+    /// Windows' pin keeps, as the state's kept does: a placeholder pinned, or
+    /// in a folder pinned, comes down; a new file in a folder pinned too.
+    #[test]
+    fn a_pin_keeps() {
+        let (base, mut items) = synced();
+        items[1] = placeholder("d/a.txt", &base[1]);
+        items[1].kept = true;
+        let plan = run_drive(&base, items.clone(), &[], &[]);
+        assert!(
+            matches!(&plan.actions[..], [Action::Download { node, .. }] if *node == id(2)),
+            "{:?}",
+            plan.actions
+        );
+        items[1].kept = false;
+        items[0].kept = true;
+        let new = [(id(3), remote(id(1), "b.txt", v(3)))];
+        let plan = run_drive(&base, items, &new, &[]);
+        assert_eq!(plan.actions.len(), 2, "{:?}", plan.actions);
+        assert!(
+            plan.actions
+                .iter()
+                .all(|a| matches!(a, Action::Download { .. })),
+            "{:?}",
+            plan.actions
+        );
+    }
+
+    /// A placeholder no base node is (written, then a crash before its entry
+    /// was recorded) is never merged nor uploaded: where a remote file is, it
+    /// is written again; elsewhere it is listed.
+    #[test]
+    fn a_placeholder_without_an_entry_is_never_uploaded() {
+        let ghost = entry(3, ROOT, "b.txt", v(3));
+        let items = vec![placeholder("b.txt", &ghost)];
+        let pending = [(id(3), remote(ROOT, "b.txt", v(3)))];
+        let plan = run_drive(&[], items.clone(), &pending, &[]);
+        assert!(
+            matches!(plan.actions[..], [Action::Placeholder { node, .. }] if node == id(3)),
+            "{:?}",
+            plan.actions
+        );
+        let plan = run_drive(&[], items, &[], &[]);
+        assert_eq!(plan.actions, []);
+        assert_eq!(plan.reports.len(), 1, "{:?}", plan.reports);
+        assert_eq!(plan.reports[0].path, "b.txt");
     }
 
     /// A folder `d` (1) with `a.txt` (2), in sync.
@@ -1299,6 +1610,8 @@ mod tests {
             scan: &scan,
             remote: pending,
             writable: true,
+            drive: false,
+            kept: &HashSet::new(),
         })
     }
 

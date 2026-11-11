@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::engine::{self, Handle};
 use crate::ops;
-use crate::state::{Notice, State, Update};
+use crate::state::{Mode, NewLibraries, Notice, State, Update};
 
 /// What the app keeps.
 struct App {
@@ -67,6 +67,7 @@ pub fn run(state_path: PathBuf, background: bool) -> Result<(), tauri::Error> {
         .invoke_handler(tauri::generate_handler![
             status,
             libraries,
+            first_step,
             proposed_folder,
             login,
             add,
@@ -77,6 +78,15 @@ pub fn run(state_path: PathBuf, background: bool) -> Result<(), tauri::Error> {
             dismiss,
             set_account,
             remove_account,
+            drive_support,
+            kept,
+            keep,
+            free,
+            drive_limit,
+            set_drive_limit,
+            logs,
+            set_logs,
+            open_logs,
             quit,
         ])
         .setup(move |app| {
@@ -157,7 +167,10 @@ fn forward_updates(app: &AppHandle) {
         loop {
             match updates.recv().await {
                 Ok(update) => {
-                    if !matches!(update, Update::Offered { .. }) {
+                    if let Update::NewLibrary { name, .. } = &update {
+                        notify_new_library(&app, name);
+                    }
+                    if !matches!(update, Update::Offered { .. } | Update::NewLibrary { .. }) {
                         refresh_tray(&app);
                         notify_stops(&app);
                     }
@@ -241,6 +254,9 @@ struct Tray {
     icon: TrayIcon,
     summary: MenuItem<tauri::Wry>,
     pause: MenuItem<tauri::Wry>,
+    /// What it shows: set again only when it changes (setting the same
+    /// icon redraws it, a blink in the menu bar).
+    shown: Option<(Overall, String, bool)>,
 }
 
 /// The tray: the overall state, Open, Pause all or Resume, Quit.
@@ -281,6 +297,7 @@ fn tray(app: &AppHandle) -> tauri::Result<Tray> {
         icon,
         summary,
         pause,
+        shown: None,
     })
 }
 
@@ -352,12 +369,24 @@ fn notify_stops(app: &AppHandle) {
     }
 }
 
+/// A library new to an account (`notify`): an OS notification, nothing to
+/// answer; the window lists it.
+fn notify_new_library(app: &AppHandle, name: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app
+        .notification()
+        .builder()
+        .title(format!("A new library: {name}"))
+        .body("Open Theca to sync it or make it a drive.")
+        .show();
+}
+
 /// The tray's icon and summary from the state: attention first (an account
 /// signed out, a pair stopped), then syncing, then paused.
 fn refresh_tray(app: &AppHandle) {
     let a = app.state::<App>();
-    let tray = a.tray.lock().expect("tray");
-    let Some(tray) = tray.as_ref() else {
+    let mut tray = a.tray.lock().expect("tray");
+    let Some(tray) = tray.as_mut() else {
         return;
     };
     let state = state(app);
@@ -380,14 +409,19 @@ fn refresh_tray(app: &AppHandle) {
     } else {
         (Overall::Idle, "Up to date".to_owned())
     };
+    let paused = !pairs.is_empty() && pairs.iter().all(|p| p.paused);
+    let now = (overall, summary, paused);
+    if tray.shown.as_ref() == Some(&now) {
+        return;
+    }
     let _ = tray.icon.set_icon(Some(tray_icon(overall)));
     let _ = tray.icon.set_icon_as_template(cfg!(target_os = "macos"));
-    let _ = tray.icon.set_tooltip(Some(format!("Theca: {summary}")));
-    let _ = tray.summary.set_text(summary);
-    let paused = !pairs.is_empty() && pairs.iter().all(|p| p.paused);
+    let _ = tray.icon.set_tooltip(Some(format!("Theca: {}", now.1)));
+    let _ = tray.summary.set_text(&now.1);
     let _ = tray
         .pause
         .set_text(if paused { "Resume" } else { "Pause all" });
+    tray.shown = Some(now);
 }
 
 /// A command's result: the page shows the error's text.
@@ -405,7 +439,9 @@ struct AccountView {
     email: String,
     device: String,
     default_folder: PathBuf,
-    auto_sync_limit: Option<i64>,
+    new_libraries: NewLibraries,
+    /// New libraries up to it sync (`sync`); 0: no limit.
+    auto_sync_limit: i64,
     signed_out: bool,
 }
 
@@ -426,6 +462,48 @@ struct PairView {
     /// The account's engine stopped on it, until the pair's next activity.
     error: Option<String>,
     synced_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// A drive's: none for a sync pair.
+    drive: Option<DriveView>,
+}
+
+/// A drive's numbers, as each OS can tell them.
+#[derive(Serialize)]
+struct DriveView {
+    /// Bytes downloaded (Linux, Windows).
+    downloaded: Option<u64>,
+    kept: usize,
+    /// Files not uploaded yet (Linux, Windows).
+    waiting: Option<usize>,
+    /// macOS added it switched off: the user switches it on.
+    switch_on: bool,
+}
+
+fn drive_view(state: &State, p: &crate::state::Pair) -> Option<DriveView> {
+    if p.mode != Mode::Drive {
+        return None;
+    }
+    let kept = state.kept(p.id).map_or(0, |k| k.len());
+    #[cfg(any(target_os = "linux", windows))]
+    let view = crate::drive::usage(state, p).ok().map(|u| DriveView {
+        downloaded: Some(u.downloaded),
+        kept: u.kept,
+        waiting: Some(u.waiting),
+        switch_on: false,
+    });
+    #[cfg(target_os = "macos")]
+    let view = Some(DriveView {
+        downloaded: None,
+        kept,
+        waiting: None,
+        switch_on: theca_fileprovider::host::enabled(&crate::drive::provider::domain_of(p))
+            == Ok(Some(false)),
+    });
+    view.or(Some(DriveView {
+        downloaded: None,
+        kept,
+        waiting: None,
+        switch_on: false,
+    }))
 }
 
 #[derive(Serialize)]
@@ -477,6 +555,7 @@ fn status(app: AppHandle) -> Answer<Status> {
                 email: a.email,
                 device: a.device,
                 default_folder: a.default_folder,
+                new_libraries: a.new_libraries,
                 auto_sync_limit: a.auto_sync_limit,
                 signed_out: a.signed_out,
             })
@@ -486,6 +565,7 @@ fn status(app: AppHandle) -> Answer<Status> {
             .map_err(err)?
             .into_iter()
             .map(|p| PairView {
+                drive: drive_view(&state, &p),
                 folder_stop: p.stopped_for_its_folder(),
                 id: p.id,
                 account: p.account,
@@ -550,6 +630,38 @@ async fn libraries(app: AppHandle, account: i64) -> Answer<Vec<LibraryView>> {
         .collect())
 }
 
+/// A library of the first step: not synced, with its size and its folder by
+/// default under the parent chosen.
+#[derive(Serialize)]
+struct Proposed {
+    id: Uuid,
+    name: String,
+    size: Option<i64>,
+    path: PathBuf,
+}
+
+/// The first step's libraries (those not synced), each with its folder by
+/// default under `parent`.
+#[tauri::command]
+async fn first_step(app: AppHandle, account: i64, parent: PathBuf) -> Answer<Vec<Proposed>> {
+    let state = state(&app);
+    let account = state
+        .account(account)
+        .map_err(err)?
+        .ok_or("no such account")?;
+    Ok(ops::proposed_paths(&state, &account, &parent)
+        .await
+        .map_err(err)?
+        .into_iter()
+        .map(|(l, path)| Proposed {
+            id: l.library.id,
+            name: l.library.name,
+            size: l.size,
+            path,
+        })
+        .collect())
+}
+
 /// The default folder a new account would get, and this device's name.
 #[derive(Serialize)]
 struct Proposal {
@@ -578,14 +690,30 @@ async fn login(
     let background = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = state(&background);
-        let result = ops::login(&state, &instance, &device, folder, None, true, |flow| {
-            let _ = shown.send(flow.clone());
-        })
+        // New here: the page shows its first step (an account signed in
+        // again keeps its choices).
+        let before: Vec<i64> = state
+            .accounts()
+            .map_or_else(|_| Vec::new(), |a| a.iter().map(|a| a.id).collect());
+        // Nothing added: the first step chooses; libraries new later notified.
+        let result = ops::login(
+            &state,
+            &instance,
+            &device,
+            folder,
+            None,
+            true,
+            None,
+            NewLibraries::Notify,
+            |flow| {
+                let _ = shown.send(flow.clone());
+            },
+        )
         .await;
         let outcome = match result {
             Ok(account) => {
                 background.state::<App>().engine.wake();
-                serde_json::json!({ "account": account.id })
+                serde_json::json!({ "account": account.id, "fresh": !before.contains(&account.id) })
             }
             Err(e) => serde_json::json!({ "error": e.to_string() }),
         };
@@ -606,13 +734,23 @@ async fn add(
     library: Uuid,
     path: Option<PathBuf>,
     merge: bool,
+    drive: bool,
 ) -> Answer<Added> {
     let state = state(&app);
     let account = state
         .account(account)
         .map_err(err)?
         .ok_or("no such account")?;
-    match ops::add(&state, &account, &library.to_string(), path, merge).await {
+    match ops::add(
+        &state,
+        &account,
+        &library.to_string(),
+        path,
+        merge,
+        if drive { Mode::Drive } else { Mode::Sync },
+    )
+    .await
+    {
         Ok(pair) => {
             app.state::<App>().engine.wake();
             Ok(Added::Pair(pair.id))
@@ -629,6 +767,99 @@ async fn add(
 enum Added {
     Pair(i64),
     Holds(usize),
+}
+
+/// Why this computer can't hold a drive (the Drive tick greyed), if it can't.
+#[tauri::command]
+fn drive_support() -> Option<String> {
+    crate::drive::unavailable()
+}
+
+/// What a drive keeps on this computer, by path below its folder.
+#[tauri::command]
+fn kept(app: AppHandle, pair: i64) -> Answer<Vec<PathBuf>> {
+    let state = state(&app);
+    let pair = state.pair(pair).map_err(err)?.ok_or("no such drive")?;
+    crate::drive::kept_paths(&state, &pair).map_err(err)
+}
+
+/// A drive's file or folder kept on this computer (`theca keep`).
+#[tauri::command]
+fn keep(app: AppHandle, path: PathBuf) -> Answer<()> {
+    let state = state(&app);
+    ops::keep(&state, &path, true).map_err(err)?;
+    Ok(())
+}
+
+/// A drive's file or folder freed now (`theca free`).
+#[tauri::command]
+fn free(app: AppHandle, path: PathBuf) -> Answer<()> {
+    let state = state(&app);
+    ops::free(&state, &path).map_err(err)?;
+    Ok(())
+}
+
+/// The drive limit, and whether it is the default.
+#[derive(Serialize)]
+struct Limit {
+    bytes: u64,
+    default: bool,
+}
+
+#[tauri::command]
+fn drive_limit(app: AppHandle) -> Answer<Limit> {
+    let state = state(&app);
+    Ok(Limit {
+        bytes: crate::drive::limit(&state).map_err(err)?,
+        default: state.drive_limit().map_err(err)?.is_none(),
+    })
+}
+
+#[tauri::command]
+fn set_drive_limit(app: AppHandle, bytes: u64) -> Answer<()> {
+    state(&app).set_drive_limit(bytes).map_err(err)
+}
+
+/// The logs' settings (each applies at the next start).
+#[tauri::command]
+fn logs(app: AppHandle) -> Answer<crate::logs::Settings> {
+    crate::logs::settings(&state(&app)).map_err(err)
+}
+
+/// The four set at once, as the settings section saves them; `folder` none:
+/// the default one.
+#[tauri::command]
+fn set_logs(
+    app: AppHandle,
+    level: String,
+    days: u32,
+    max_size: u64,
+    folder: Option<PathBuf>,
+) -> Answer<()> {
+    use crate::logs::Change;
+    let state = state(&app);
+    let level = crate::logs::level(&level)?;
+    for change in [
+        Change::Level(Some(level)),
+        Change::Days(Some(days)),
+        Change::MaxSize(Some(max_size)),
+        Change::Folder(folder),
+    ] {
+        crate::logs::set(&state, change).map_err(err)?;
+    }
+    Ok(())
+}
+
+/// The logs' folder, in the file manager.
+#[tauri::command]
+fn open_logs(app: AppHandle) -> Answer<()> {
+    let folder = crate::logs::settings(&state(&app))
+        .map_err(err)?
+        .folder
+        .ok_or("no logs folder")?;
+    app.opener()
+        .open_path(folder.to_string_lossy(), None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 /// Stops syncing a pair; how many files were kept (not synced) when deleting.
@@ -673,18 +904,22 @@ fn dismiss(app: AppHandle, notice: i64) -> Answer<()> {
     state(&app).dismiss(notice).map_err(err)
 }
 
-/// An account's settings: its default folder, its auto-sync limit (none:
-/// never).
+/// An account's settings: its default folder, what libraries new to it do,
+/// and the size up to which they sync (0: no limit).
 #[tauri::command]
 fn set_account(
     app: AppHandle,
     account: i64,
     default_folder: PathBuf,
-    auto_sync_limit: Option<i64>,
+    new_libraries: NewLibraries,
+    auto_sync_limit: i64,
 ) -> Answer<()> {
     let state = state(&app);
     state
         .set_default_folder(account, &default_folder)
+        .map_err(err)?;
+    state
+        .set_new_libraries(account, new_libraries)
         .map_err(err)?;
     state
         .set_auto_sync_limit(account, auto_sync_limit)
