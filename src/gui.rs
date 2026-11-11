@@ -83,6 +83,9 @@ pub fn run(state_path: PathBuf, background: bool) -> Result<(), tauri::Error> {
             free,
             drive_limit,
             set_drive_limit,
+            logs,
+            set_logs,
+            open_logs,
             quit,
         ])
         .setup(move |app| {
@@ -739,6 +742,48 @@ fn drive_limit(app: AppHandle) -> Answer<Limit> {
 #[tauri::command]
 fn set_drive_limit(app: AppHandle, bytes: u64) -> Answer<()> {
     state(&app).set_drive_limit(bytes).map_err(err)
+}
+
+/// The logs' settings (each applies at the next start).
+#[tauri::command]
+fn logs(app: AppHandle) -> Answer<crate::logs::Settings> {
+    crate::logs::settings(&state(&app)).map_err(err)
+}
+
+/// The four set at once, as the settings section saves them; `folder` none:
+/// the default one.
+#[tauri::command]
+fn set_logs(
+    app: AppHandle,
+    level: String,
+    days: u32,
+    max_size: u64,
+    folder: Option<PathBuf>,
+) -> Answer<()> {
+    use crate::logs::Change;
+    let state = state(&app);
+    let level = crate::logs::level(&level)?;
+    for change in [
+        Change::Level(Some(level)),
+        Change::Days(Some(days)),
+        Change::MaxSize(Some(max_size)),
+        Change::Folder(folder),
+    ] {
+        crate::logs::set(&state, change).map_err(err)?;
+    }
+    Ok(())
+}
+
+/// The logs' folder, in the file manager.
+#[tauri::command]
+fn open_logs(app: AppHandle) -> Answer<()> {
+    let folder = crate::logs::settings(&state(&app))
+        .map_err(err)?
+        .folder
+        .ok_or("no logs folder")?;
+    app.opener()
+        .open_path(folder.to_string_lossy(), None::<&str>)
+        .map_err(|e| e.to_string())
 }
 
 /// Stops syncing a pair; how many files were kept (not synced) when deleting.

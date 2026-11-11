@@ -1071,23 +1071,47 @@ impl State {
 
     /// Back to the default.
     pub fn clear_drive_limit(&self) -> Result<()> {
-        self.db()
-            .execute("DELETE FROM setting WHERE key = 'drive_limit'", [])?;
-        Ok(())
+        self.clear_setting("drive_limit")
     }
 
     pub fn set_drive_limit(&self, bytes: u64) -> Result<()> {
+        self.set_setting("drive_limit", &bytes.to_string())
+    }
+
+    /// The settings stored at `path`, read without opening the state (no
+    /// migration: the logs read theirs before it runs, to log it); none
+    /// when there is no state yet, or no setting table.
+    pub fn stored_settings(path: &Path) -> std::collections::HashMap<String, String> {
+        let read = || -> rusqlite::Result<std::collections::HashMap<String, String>> {
+            let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let mut query = db.prepare("SELECT key, value FROM setting")?;
+            let rows = query.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect()
+        };
+        read().unwrap_or_default()
+    }
+
+    /// A setting stored as given; its reader parses it.
+    pub(crate) fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         self.db().execute(
-            "INSERT INTO setting (key, value) VALUES ('drive_limit', ?1)
+            "INSERT INTO setting (key, value) VALUES (?1, ?2)
              ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-            [bytes.to_string()],
+            [key, value],
         )?;
         Ok(())
     }
 
-    /// A setting for the whole computer, as stored: each has its accessor,
-    /// the one place that parses it (a key nobody reads is ignored).
-    fn setting(&self, key: &str) -> Result<Option<String>> {
+    /// A setting back to its default.
+    pub(crate) fn clear_setting(&self, key: &str) -> Result<()> {
+        self.db()
+            .execute("DELETE FROM setting WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
+    /// A setting for the whole computer, as stored: each has its reader, the
+    /// one place that parses it (the drive limit here, the logs' in `logs`;
+    /// a key nobody reads is ignored).
+    pub(crate) fn setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .db()
             .query_row("SELECT value FROM setting WHERE key = ?1", [key], |r| {
@@ -1261,10 +1285,18 @@ impl State {
         undo: Option<&str>,
     ) -> Result<()> {
         // The same error again replaces the old one.
-        self.db().execute(
+        let again = self.db().execute(
             "DELETE FROM notice WHERE pair IS ?1 AND account IS ?2 AND path IS ?3 AND message = ?4",
             params![pair, account, path, message],
-        )?;
+        )? > 0;
+        // A new notice in the log too, at its level; one standing (said
+        // again each round) only at debug.
+        let path_ = path.unwrap_or_default();
+        match (again, level) {
+            (true, _) => tracing::debug!(account, pair, path = path_, "again: {message}"),
+            (false, "error") => tracing::error!(account, pair, path = path_, "{message}"),
+            (false, _) => tracing::info!(account, pair, path = path_, "{message}"),
+        }
         self.db().execute(
             "INSERT INTO notice (account, pair, at, level, path, message, undo)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",

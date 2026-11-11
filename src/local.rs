@@ -184,6 +184,7 @@ pub fn scan_entering(root: &Path, known: &HashSet<Vec<String>>) -> io::Result<Sc
             }
             let mut item = item(path.clone(), &meta, &full, is_file);
             item.ignored = ignored;
+            tracing::trace!(?item, "scanned");
             scan.items.push(item);
             if !is_file {
                 pending.push((path, full));

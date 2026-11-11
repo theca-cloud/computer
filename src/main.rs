@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use theca::engine::{self, Handle, plural};
 use theca::keychain::KeychainError;
 use theca::state::{self, State};
@@ -177,6 +177,23 @@ enum Command {
         #[arg(value_parser = limit_value)]
         size: Option<LimitValue>,
     },
+    /// Where the logs are and their settings, shown, or set (each applies
+    /// at the next start of the app or `theca run`; `default` resets one).
+    Logs {
+        /// error, warn, info, debug, trace (default: info).
+        #[arg(long, value_parser = reset::<LogLevel>)]
+        level: Option<Reset<LogLevel>>,
+        /// Days of logs kept (default: 14).
+        #[arg(long, value_parser = reset::<u32>)]
+        days: Option<Reset<u32>>,
+        /// Their size in all, the oldest removed past it: 100MB, 1GiB
+        /// (default: 100 MB).
+        #[arg(long, value_parser = limit_value)]
+        max_size: Option<LimitValue>,
+        /// Their folder (default: `logs` beside the state).
+        #[arg(long, value_parser = reset::<PathBuf>)]
+        path: Option<Reset<PathBuf>>,
+    },
     /// Restore what the last deletion moved to the trash.
     Undo,
     /// Run the sync engine in the foreground (what a service runs).
@@ -188,14 +205,29 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "theca=info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
+    // Its name only: an argument may be a token (`login --token`).
+    let name = matches.subcommand_name().unwrap_or("app").to_owned();
+    // Every command logs to the day's file, as the state's settings say (no
+    // state: stderr only); the app and `theca run` keep the folder pruned.
+    // Read before the state is opened: its migration, if any, is logged.
+    let settings = state_path(cli.state.clone())
+        .ok()
+        .map(|path| theca::logs::settings_at(&path));
+    let _logging = theca::logs::init(settings.as_ref());
+    let long_running = matches!(cli.command, None | Some(Command::Run));
+    if long_running && let Some(settings) = &settings {
+        theca::logs::keep(settings);
+    }
+    let span = tracing::info_span!("command", name);
+    let _entered = span.enter();
+    if long_running {
+        tracing::info!(version = env!("CARGO_PKG_VERSION"), "started");
+    }
     if cli.command.is_none() {
         // The app runs its own runtime, on the main thread (the OS's windows
         // want it).
@@ -207,8 +239,13 @@ fn main() -> ExitCode {
 
 fn exit(result: Result<()>) -> ExitCode {
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            tracing::info!(target: theca::logs::EXIT, "done");
+            ExitCode::SUCCESS
+        }
         Err(e) => {
+            // In the file too (the terminal has it from the line below).
+            tracing::warn!(target: theca::logs::EXIT, code = e.code(), "{e}");
             eprintln!("theca: {e}");
             ExitCode::from(e.code())
         }
@@ -424,6 +461,58 @@ async fn command(cli: Cli) -> Result<()> {
                 limit_size(limit)
             );
         }
+        Command::Logs {
+            level,
+            days,
+            max_size,
+            path,
+        } => {
+            use theca::logs::Change;
+            let changes = [
+                level.map(|l| Change::Level(l.value().map(|l| l.0))),
+                days.map(|d| Change::Days(d.value())),
+                max_size.map(|s| {
+                    Change::MaxSize(match s {
+                        LimitValue::Bytes(b) => Some(b),
+                        LimitValue::Default => None,
+                    })
+                }),
+                path.map(|p| {
+                    Change::Folder(p.value().map(|p| std::path::absolute(&p).unwrap_or(p)))
+                }),
+            ];
+            let changed = changes.iter().any(Option::is_some);
+            for change in changes.into_iter().flatten() {
+                theca::logs::set(&state, change)?;
+            }
+            let s = theca::logs::settings(&state)?;
+            let folder = s
+                .folder
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), |f| f.display().to_string());
+            let default = if s.default_folder {
+                " (the default)"
+            } else {
+                ""
+            };
+            println!("Logs: {folder}{default}");
+            println!(
+                "  level {}, {} days kept, up to {} in all",
+                s.level,
+                s.days,
+                limit_size(s.max_size)
+            );
+            #[cfg(target_os = "macos")]
+            if let Some(container) = theca_fileprovider::host::container() {
+                println!(
+                    "The drive extension's: {}",
+                    container.join("drive.log").display()
+                );
+            }
+            if changed {
+                println!("Applies at the next start of the app or `theca run`.");
+            }
+        }
         Command::Undo => {
             let Some(notice) = state.latest_undo()? else {
                 println!("Nothing to undo.");
@@ -569,6 +658,43 @@ fn status(state: &State) -> Result<()> {
 }
 
 /// `1.2 MiB`: as the app and the web app show sizes.
+/// A setting's value, or `default`: back to it.
+#[derive(Clone)]
+enum Reset<T> {
+    To(T),
+    Default,
+}
+
+impl<T> Reset<T> {
+    fn value(self) -> Option<T> {
+        match self {
+            Reset::To(v) => Some(v),
+            Reset::Default => None,
+        }
+    }
+}
+
+fn reset<T: std::str::FromStr>(value: &str) -> std::result::Result<Reset<T>, String>
+where
+    T::Err: std::fmt::Display,
+{
+    if value == "default" {
+        return Ok(Reset::Default);
+    }
+    value.parse::<T>().map(Reset::To).map_err(|e| e.to_string())
+}
+
+/// A log level as `theca logs --level` takes it.
+#[derive(Clone)]
+struct LogLevel(String);
+
+impl std::str::FromStr for LogLevel {
+    type Err = String;
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        theca::logs::level(value).map(LogLevel)
+    }
+}
+
 /// `theca drive-limit`'s value: a size, or back to the default.
 #[derive(Clone)]
 enum LimitValue {
@@ -585,12 +711,15 @@ fn limit_value(value: &str) -> std::result::Result<LimitValue, String> {
         .map(|b| LimitValue::Bytes(b.as_u64()))
 }
 
-/// A limit as it was given: in GB when it's a whole number of them (20GB
-/// set reads "20 GB", not "19 GiB"), else as every size shows.
+/// A limit as it was given: in GB or MB when it's a whole number of them
+/// (20GB set reads "20 GB", not "19 GiB"), else as every size shows.
 fn limit_size(bytes: u64) -> String {
     const GB: u64 = 1_000_000_000;
+    const MB: u64 = 1_000_000;
     if bytes >= GB && bytes.is_multiple_of(GB) {
         format!("{} GB", bytes / GB)
+    } else if bytes >= MB && bytes.is_multiple_of(MB) {
+        format!("{} MB", bytes / MB)
     } else {
         size(bytes as i64)
     }

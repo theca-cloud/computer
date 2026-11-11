@@ -155,6 +155,42 @@ impl<'a> Executor<'a> {
         Some(local::resolve(&self.pair.path, &steps))
     }
 
+    /// An action as its log line says it as it starts: what, and the path
+    /// below the pair (a node the base doesn't know: by its parent's path and
+    /// its name).
+    fn said(&self, action: &Action) -> (&'static str, String) {
+        let at = |node: &Uuid| {
+            self.names(*node)
+                .map_or_else(|| node.to_string(), |n| n.join("/"))
+        };
+        let under = |parent: &Uuid, name: &str| match self.names(*parent) {
+            Some(n) if !n.is_empty() => format!("{}/{name}", n.join("/")),
+            _ => name.to_owned(),
+        };
+        match action {
+            Action::RemoteMkdir { path, .. } => ("make the folder on the server", path.join("/")),
+            Action::RemoteMove { node, name, .. } => {
+                ("move on the server", format!("{} to {name}", at(node)))
+            }
+            Action::Upload { path, .. } => ("upload", path.join("/")),
+            Action::LocalMove { node, parent, name } => (
+                "move here",
+                format!("{} to {}", at(node), under(parent, name)),
+            ),
+            Action::LocalMkdir { parent, name, .. } => {
+                ("make the folder here", under(parent, name))
+            }
+            Action::Download { parent, name, .. } => ("download", under(parent, name)),
+            Action::Placeholder { parent, name, .. } => ("make a placeholder", under(parent, name)),
+            Action::Merge { path, .. } => ("merge", path.join("/")),
+            Action::Adopt { path, .. } => ("adopt", path.join("/")),
+            Action::RemoteTrash { node } => ("trash on the server", at(node)),
+            Action::LocalDelete { node } => ("delete here", at(node)),
+            Action::KeepAside { node } => ("keep aside", at(node)),
+            Action::Forget { node } => ("forget", at(node)),
+        }
+    }
+
     fn local(&self, names: &[String]) -> PathBuf {
         let steps: Vec<_> = names.iter().map(|n| (n.as_str(), None)).collect();
         local::resolve(&self.pair.path, &steps)
@@ -297,7 +333,7 @@ impl<'a> Executor<'a> {
             _ => 0,
         };
         for action in &plan.actions {
-            tracing::debug!(pair = self.pair.id, ?action, "planned");
+            tracing::debug!(?action, "planned");
             if let Action::LocalMove { node, .. } = action {
                 self.moving.insert(*node);
             }
@@ -311,6 +347,10 @@ impl<'a> Executor<'a> {
             }
             let k = kind(&first);
             if k == 0 {
+                // As it starts (a failure says so in its notice, logged too);
+                // uploads, downloads and the trash say so once done.
+                let (what, path) = self.said(&first);
+                tracing::info!(path, "{what}");
                 self.one(first).await?;
                 continue;
             }
@@ -842,6 +882,11 @@ impl<'a> Executor<'a> {
     ) -> crate::state::Result<()> {
         match result {
             Ok(committed) => {
+                tracing::info!(
+                    path = names.join("/"),
+                    unchanged = committed.unchanged,
+                    "uploaded"
+                );
                 crate::crash_point("uploaded-unrecorded");
                 self.outcome.uploaded += usize::from(!committed.unchanged);
                 self.outcome.touched.push(committed.file);
@@ -1076,6 +1121,8 @@ impl<'a> Executor<'a> {
                         match result {
                             // Already gone: as good.
                             Ok(()) | Err(Error::Api { status: 404, .. }) => {
+                                let path = self.names(*node).unwrap_or_default().join("/");
+                                tracing::info!(path, "trashed on the server");
                                 crate::crash_point("trashed-unforgotten");
                                 self.outcome.trashed.push(*node);
                                 self.outcome.touched.push(*node);
@@ -1327,6 +1374,11 @@ impl SyncSink<'_> {
             .synced(r.pair, &entry, r.path.as_deref(), settled)
             .map_err(io::Error::other)?;
         crate::crash_point("downloaded");
+        let path = self
+            .target
+            .strip_prefix(&self.pair.path)
+            .unwrap_or(&self.target);
+        tracing::info!(path = %path.display(), "downloaded");
         *self.done.lock().map_err(|_| io::Error::other("poisoned"))? = Some(entry);
         Ok(())
     }

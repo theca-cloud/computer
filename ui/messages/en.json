@@ -108,6 +108,18 @@
 	"drive_limit_default": "the default: 10 GiB, or a tenth of the disk if smaller",
 	"drive_limit_unit": "GiB",
 	"drive_limit_save": "Save",
+	"logs": "Logs",
+	"logs_level": "Level",
+	"logs_days": "Days kept",
+	"logs_size": "Up to",
+	"logs_none": "No logs folder",
+	"logs_default": "the default",
+	"logs_choose": "Choose folder…",
+	"logs_use_default": "Use the default",
+	"logs_open": "Open logs folder",
+	"logs_save": "Save",
+	"logs_saved": "Saved: it applies the next time Theca starts.",
+	"logs_hint": "What Theca did, a file per day, to read or send when something goes wrong. They name your files, never your passwords. Changes apply the next time Theca starts.",
 	"autostart": "Start Theca when you log in",
 	"quit": "Quit Theca"
 }

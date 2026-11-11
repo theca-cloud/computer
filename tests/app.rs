@@ -225,3 +225,42 @@ async fn a_drive_in_the_window() {
 
     client.close().await.unwrap();
 }
+
+/// The logs' settings in the window: the defaults shown, then a level, days
+/// and a size saved (the folder is a native dialog: `theca logs` tests it).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_logs_in_the_window() {
+    let _one = ONE_APP.lock().await;
+    let w = world().await;
+    let (_dir, state_path, _account) = w.logged_in("app").await;
+    let state = theca::state::State::open(&state_path).unwrap();
+    let (_driver, client) = app(&state_path).await;
+    let level = client
+        .wait()
+        .at_most(Duration::from_secs(30))
+        .for_element(Locator::Id("log-level"))
+        .await
+        .unwrap();
+    assert_eq!(level.prop("value").await.unwrap().as_deref(), Some("info"));
+    level.select_by_value("debug").await.unwrap();
+    for (id, value) in [("log-days", "30"), ("log-size", "200")] {
+        let field = client.find(Locator::Id(id)).await.unwrap();
+        field.clear().await.unwrap();
+        field.send_keys(value).await.unwrap();
+    }
+    client
+        .find(Locator::XPath(
+            "//div[@id='logs-settings']//button[normalize-space()='Save']",
+        ))
+        .await
+        .unwrap()
+        .click()
+        .await
+        .unwrap();
+    eventually("the logs' settings saved", || async {
+        let s = theca::logs::settings(&state).unwrap();
+        (s.level.as_str(), s.days, s.max_size) == ("debug", 30, 200_000_000)
+    })
+    .await;
+    client.close().await.unwrap();
+}

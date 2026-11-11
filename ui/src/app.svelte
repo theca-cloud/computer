@@ -9,6 +9,7 @@
 	import AccountSettings from '#lib/components/account-settings.svelte';
 	import AskDialog from '#lib/components/ask-dialog.svelte';
 	import DriveSettings from '#lib/components/drive-settings.svelte';
+	import LogsSettings from '#lib/components/logs-settings.svelte';
 	import Login from '#lib/components/login.svelte';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import * as Card from '#lib/components/ui/card/index.js';
@@ -166,6 +167,8 @@
 				<Separator />
 			{/each}
 			<DriveSettings />
+			<Separator />
+			<LogsSettings />
 			<Separator />
 			<div class="flex items-center gap-2">
 				<Switch id="autostart" checked={autostart} onCheckedChange={setAutostart} />

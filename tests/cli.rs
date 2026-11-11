@@ -70,6 +70,68 @@ fn the_drive_limit_is_shown_and_set() {
     assert!(out.contains("(the default"), "{out}");
 }
 
+/// `logs`: where they are and the defaults; each set; a level or a size it
+/// can't read is a usage error; `default` resets; the folder set is where
+/// the next command writes.
+#[test]
+fn the_logs_are_shown_and_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state.sqlite");
+    let said = |args: &[&str]| {
+        let out = theca(&state, args);
+        (
+            code(&out),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    let defaults = format!(
+        "Logs: {} (the default)\n  level info, 14 days kept, up to 100 MB in all\n",
+        dir.path().join("logs").display()
+    );
+    let (code0, out) = said(&["logs"]);
+    assert_eq!(code0, 0);
+    assert!(out.starts_with(&defaults), "{out}");
+    let elsewhere = dir.path().join("elsewhere");
+    let (_, out) = said(&[
+        "logs",
+        "--level",
+        "debug",
+        "--days",
+        "30",
+        "--max-size",
+        "1GB",
+        "--path",
+        &elsewhere.to_string_lossy(),
+    ]);
+    assert!(
+        out.starts_with(&format!(
+            "Logs: {}\n  level debug, 30 days kept, up to 1 GB in all\n",
+            elsewhere.display()
+        )),
+        "{out}"
+    );
+    assert!(out.contains("next start"), "{out}");
+    assert_eq!(said(&["logs", "--level", "loud"]).0, exit::USAGE);
+    assert_eq!(said(&["logs", "--max-size", "lots"]).0, exit::USAGE);
+    said(&["logs"]);
+    assert!(
+        std::fs::read_dir(&elsewhere).is_ok_and(|mut d| d.next().is_some()),
+        "the next command writes there"
+    );
+    let (_, out) = said(&[
+        "logs",
+        "--level",
+        "default",
+        "--days",
+        "default",
+        "--max-size",
+        "default",
+        "--path",
+        "default",
+    ]);
+    assert!(out.starts_with(&defaults), "{out}");
+}
+
 /// `status` fails while a pair isn't syncing, and tells a signed-out account
 /// apart.
 #[tokio::test(flavor = "multi_thread")]

@@ -77,7 +77,7 @@ theca run                               # syncs, in the foreground (what a servi
 theca status                            # what syncs, what it's doing, errors
 ```
 
-Every command and its options: `theca --help`, `theca <command> --help`. The commands: `login`, `accounts`, `account` (an account's default folder and the size up to which new libraries sync by themselves), `remove-account`, `libraries`, `add`, `remove`, `pause`, `resume`, `locate` (a folder moved or on another disk), `status`, `undo` (restores what the last deletion moved to the trash), `run`; for drives, `keep`, `free`, `drive-limit`. A script logs in without a browser with an app password made in the web app: `THECA_TOKEN=… theca login <instance>`.
+Every command and its options: `theca --help`, `theca <command> --help`. The commands: `login`, `accounts`, `account` (an account's default folder and the size up to which new libraries sync by themselves), `remove-account`, `libraries`, `add`, `remove`, `pause`, `resume`, `locate` (a folder moved or on another disk), `status`, `undo` (restores what the last deletion moved to the trash), `run`, `logs`; for drives, `keep`, `free`, `drive-limit`. A script logs in without a browser with an app password made in the web app: `THECA_TOKEN=… theca login <instance>`.
 
 One `theca run`, or the app, syncs a state file at a time: a second one refuses to start. `run` stops within a few seconds on Ctrl-C or `SIGTERM`.
 
@@ -100,7 +100,13 @@ A command exits with 0 on success, and anything else on an error. The codes belo
 | `THECA_STATE` | The state file, instead of the default below (`--state`) |
 | `THECA_TOKEN` | `login`: an app password made in the web app, instead of the browser (`--token`) |
 | `THECA_NO_KEYRING` | `login`: set (to anything but `0`, `false`, `no` or `off`), keeps the app password in the state file (`--no-keyring`) |
-| `RUST_LOG` | What the log shows, on the error output: `theca=info` by default, `theca=debug` for more |
+| `RUST_LOG` | What the log shows, on the error output and in the log files, over `theca logs --level`: `theca=debug` for more |
+
+### Logs
+
+The app and every `theca` command log what they do to a file per day, in `logs` beside the state (`theca.2026-11-11.log`, in UTC): to read, or to send us, when something goes wrong. Each line says what it is about (the account, the synced folder, the round, a drive's file). Finished days are gzipped; 14 days and 100 MB are kept in all, the oldest removed first. They name your files and folders; never your app password.
+
+`theca logs` shows where they are and their settings, and sets them: `theca logs --level debug` (`error`, `warn`, `info`, `debug`, `trace`), `--days 30`, `--max-size 1GB`, `--path /var/log/theca`; `default` resets one. The app has them in its settings, with **Open logs folder**. A change applies at the next start of the app or `theca run`. `RUST_LOG`, set, wins over the level. On a Mac, the drive's extension keeps its own small log in its container (`theca logs` names it).
 
 ### Where the app keeps its state
 

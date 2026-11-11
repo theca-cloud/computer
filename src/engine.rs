@@ -119,6 +119,10 @@ pub async fn run(
             let path = state_path.clone();
             let handle = handle.clone();
             let shutdown = shutdown.clone();
+            // Every line of the account's engine says which account (inside
+            // the caller's span: the tests name each device).
+            let span =
+                tracing::info_span!("account", id = account.id, instance = %account.instance);
             running.insert(
                 account.id,
                 tokio::spawn(
@@ -131,8 +135,7 @@ pub async fn run(
                             let _ = stopped(&path, account.id, &e);
                         }
                     }
-                    // The caller's span on its lines too (the tests name each device).
-                    .in_current_span(),
+                    .instrument(span),
                 ),
             );
         }
@@ -301,7 +304,8 @@ async fn follow(
         let state = Arc::new(State::open(state_path)?);
         let (fetcher, serve) =
             drive::fetch::service(state, client.clone(), cancel.clone(), fetched.clone());
-        cancelling.spawn(serve);
+        // In the account's span: a fetch's lines say which account.
+        cancelling.spawn(serve.in_current_span());
         fetcher
     };
     let mut f = Follower {
@@ -367,8 +371,14 @@ async fn follow(
         f.watch()?;
         tokio::select! {
             message = feed.next() => match message {
-                Some(Ok(FeedMessage::Libraries(libraries))) => f.libraries(libraries).await?,
-                Some(Ok(FeedMessage::Changes(changes))) => f.changes(changes).await?,
+                Some(Ok(FeedMessage::Libraries(libraries))) => {
+                    tracing::debug!(libraries = libraries.len(), "the feed: libraries");
+                    f.libraries(libraries).await?
+                }
+                Some(Ok(FeedMessage::Changes(changes))) => {
+                    tracing::debug!(?changes, "the feed: changes");
+                    f.changes(changes).await?
+                }
                 Some(Err(e)) => {
                     if matches!(e.code(), Some("unauthenticated")) {
                         sign_out(&f.state, &f.account, "the server refused its app password")?;
@@ -1102,7 +1112,9 @@ impl Follower {
                 // Catching up: the feed's next batches bring it.
                 continue;
             }
-            match self.round(&p).await {
+            let pair = tracing::info_span!("pair", id = p.id, library = %p.library_name);
+            let round = tracing::info_span!(parent: &pair, "round");
+            match self.round(&p).instrument(round).await {
                 Ok(()) => {}
                 Err(EngineError::Client(e)) if matches!(e.code(), Some("unauthenticated")) => {
                     return Err(EngineError::Client(e));
@@ -1119,7 +1131,7 @@ impl Follower {
     }
 
     async fn round(&mut self, p: &Pair) -> Result<(), EngineError> {
-        tracing::debug!(pair = p.id, "round");
+        tracing::debug!("round");
         #[cfg(target_os = "macos")]
         if p.mode == Mode::Drive {
             return self.provider_round(p).await;

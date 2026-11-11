@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use theca_client::{Cancel, Client, DownloadOptions, Downloader, Sink};
 use tokio::sync::{Semaphore, mpsc, oneshot};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::state::{Entry, Pair, State};
@@ -105,21 +106,36 @@ pub fn service(
                 slots.clone(),
                 fetched.clone(),
             );
-            tokio::spawn(async move {
-                let Some(done) = r.done else {
-                    let _ = stamp(&state, &r.pair, &r.path);
-                    return;
-                };
-                let _slot = slots.acquire().await;
-                let result = match r.into {
-                    Some((node, sink)) => {
-                        fetch_into(&state, &client, &r.pair, node, &r.path, &*sink, &cancel).await
+            // Its lines say which drive and file (in the account's span).
+            let span = tracing::info_span!(
+                "fetch",
+                pair = r.pair.id,
+                path = %r.path.display()
+            );
+            tokio::spawn(
+                async move {
+                    let Some(done) = r.done else {
+                        let _ = stamp(&state, &r.pair, &r.path);
+                        return;
+                    };
+                    let _slot = slots.acquire().await;
+                    let started = std::time::Instant::now();
+                    let result = match r.into {
+                        Some((node, sink)) => {
+                            fetch_into(&state, &client, &r.pair, node, &r.path, &*sink, &cancel)
+                                .await
+                        }
+                        None => fetch(&state, &client, &r.pair, &r.path, &cancel).await,
+                    };
+                    match &result {
+                        Ok(()) => tracing::info!(took = ?started.elapsed(), "fetched"),
+                        Err(why) => tracing::warn!("not fetched: {why}"),
                     }
-                    None => fetch(&state, &client, &r.pair, &r.path, &cancel).await,
-                };
-                fetched.store(true, Ordering::Relaxed);
-                let _ = done.send(result);
-            });
+                    fetched.store(true, Ordering::Relaxed);
+                    let _ = done.send(result);
+                }
+                .instrument(span),
+            );
         }
     };
     (Fetcher(send), serve)

@@ -20,6 +20,7 @@ use theca_client::{
 use theca_common::api;
 use theca_common::name::Name;
 use theca_fileprovider::protocol::{Code, Item, ROOT, Reply, Request, WORKING_SET};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::state::{Entry, Pair, State};
@@ -105,6 +106,20 @@ impl Provider {
 
     /// The answer to one call of the system.
     pub async fn answer(&self, request: Request) -> Reply {
+        let span = tracing::info_span!("request", domain = request.domain());
+        async move {
+            tracing::debug!(?request, "asked");
+            let reply = self.answer_in(request).await;
+            if let Reply::Error { code, message } = &reply {
+                tracing::warn!(?code, "refused: {message}");
+            }
+            reply
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn answer_in(&self, request: Request) -> Reply {
         let found = lock(&self.drives)
             .get(request.domain())
             .map(|d| (d.pair, d.client.clone(), d.state.clone(), d.cancel.clone()));

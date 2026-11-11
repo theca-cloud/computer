@@ -3,7 +3,6 @@
 //! sandbox, `NSHomeDirectory` is that container).
 
 use std::ffi::CString;
-use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
@@ -30,13 +29,7 @@ pub fn log(message: &str) {
         // SAFETY: a constant "%s" format with one valid NUL-terminated argument.
         unsafe { libc::syslog(libc::LOG_NOTICE, c"%s".as_ptr(), text.as_ptr()) };
     }
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(home().join("drive.log"))
-    {
-        let _ = writeln!(file, "{line}");
-    }
+    let _ = crate::log_file::append(&home().join("drive.log"), &line, crate::log_file::MAX);
 }
 
 fn exchange(request: &Request) -> io::Result<Reply> {

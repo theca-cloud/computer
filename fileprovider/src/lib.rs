@@ -4,6 +4,7 @@
 //! to the running app over a Unix socket the app creates in the extension's
 //! container (`protocol`), and the app answers from the drive's entries.
 
+pub mod log_file;
 pub mod protocol;
 
 #[cfg(target_os = "macos")]

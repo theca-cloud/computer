@@ -8,6 +8,7 @@ pub mod exec;
 pub mod gui;
 pub mod keychain;
 pub mod local;
+pub mod logs;
 pub mod ops;
 pub mod plan;
 pub mod state;
