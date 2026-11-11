@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use theca::keychain;
-use theca::state::{Account, Entry, Pair, Password, RemoteState, State, StateError, Stop};
+use theca::state::{Account, Entry, Mode, Pair, Password, RemoteState, State, StateError, Stop};
 use theca_common::api::Position;
 use uuid::Uuid;
 
@@ -84,12 +84,24 @@ fn every_release_state_reads_back() {
                 a["secret"] = Value::Null;
             }
         }
+        // A release before the drive (version 4) has sync pairs only.
+        for (p, expected) in read["pairs"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(manifest["pairs"].as_array().unwrap())
+        {
+            if expected.get("mode").is_none() {
+                assert_eq!(p["mode"], "sync", "{}", release.display());
+                p.as_object_mut().unwrap().remove("mode");
+            }
+        }
         assert_eq!(read, manifest, "{}", release.display());
         if was < current {
             let copy = dir.path().join(format!("state.sqlite.v{was}"));
             let copy = Connection::open(copy).unwrap();
             let kept: Vec<String> = copy
-                .prepare("SELECT password FROM account")
+                .prepare("SELECT password FROM account WHERE password IS NOT NULL")
                 .unwrap()
                 .query_map([], |r| r.get(0))
                 .unwrap()
@@ -235,6 +247,10 @@ fn manifest_of(state: &State, version: &Value) -> Value {
                 "activity": p.activity,
                 "error": p.error,
                 "synced_at": p.synced_at.map(|t| t.timestamp_millis()),
+                "mode": match p.mode {
+                    Mode::Sync => "sync",
+                    Mode::Drive => "drive",
+                },
                 "entries": entries.iter().map(|e| json!({
                     "node": e.node,
                     "parent": e.parent,
@@ -353,6 +369,7 @@ fn fill() {
         activity: "waiting".into(),
         error: None,
         synced_at: None,
+        mode: Mode::Sync,
     };
     // Synced, with a base and pending remote states.
     let docs = state
@@ -453,6 +470,13 @@ fn fill() {
         .unwrap();
     state
         .set_error(music, "the server answered 502 Bad Gateway")
+        .unwrap();
+    // A drive.
+    state
+        .add_pair(&Pair {
+            mode: Mode::Drive,
+            ..pair(a, id(90), id(91), "Projects", true)
+        })
         .unwrap();
     // Read-only, its access removed, on the signed-out account.
     let shared = state

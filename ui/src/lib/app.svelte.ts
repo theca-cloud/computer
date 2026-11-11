@@ -28,6 +28,17 @@ export type Pair = {
 	activity: string;
 	error: string | null;
 	synced_at: string | null;
+	/** A drive's: none for a sync pair. */
+	drive: Drive | null;
+};
+
+/** A drive's numbers, as its OS can tell them (Linux, Windows: all; macOS: kept). */
+export type Drive = {
+	downloaded: number | null;
+	kept: number;
+	waiting: number | null;
+	/** macOS added it switched off: the user switches it on. */
+	switch_on: boolean;
 };
 
 export type Notice = {

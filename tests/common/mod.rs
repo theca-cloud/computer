@@ -20,7 +20,7 @@ use sqlx::Connection;
 use sqlx::Executor;
 use theca::engine::{self, Handle};
 use theca::ops;
-use theca::state::{Account, Pair, State};
+use theca::state::{Account, Mode, Pair, State};
 use theca_client::{Cancel, Client, DownloadOptions, MemorySink, download};
 use theca_common::api;
 use tokio::sync::watch;
@@ -427,11 +427,58 @@ impl World {
     /// `theca` runs on it, and can't read this process's keychain (the mock),
     /// nor, on macOS, an entry another binary wrote without a prompt.
     pub async fn device_without_keychain(&self, name: &str) -> Device {
-        self.device_made(name, &self.library, true, false).await
+        self.device_made(name, &self.library, true, false, Mode::Sync)
+            .await
     }
 
     pub async fn device_for(&self, name: &str, library: &api::Library, start: bool) -> Device {
-        self.device_made(name, library, start, true).await
+        self.device_made(name, library, start, true, Mode::Sync)
+            .await
+    }
+
+    /// A device logged in, its app password in its state (a child `theca`
+    /// runs on it), no library added yet: its folder, state and account.
+    pub async fn logged_in(&self, name: &str) -> (tempfile::TempDir, PathBuf, Account) {
+        let created = self
+            .admin
+            .create_app_password(&api::CreateAppPassword {
+                name: name.into(),
+                organization: None,
+                library: None,
+                read_only: false,
+            })
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.sqlite");
+        let state = State::open(&state_path).unwrap();
+        let account = ops::login(
+            &state,
+            &self.server.url,
+            name,
+            Some(dir.path().join("theca")),
+            Some(created.password),
+            false,
+            |_| panic!("a token needs no browser"),
+        )
+        .await
+        .unwrap();
+        // New libraries aren't synced by themselves unless a test says so.
+        state.set_auto_sync_limit(account.id, None).unwrap();
+        (dir, state_path, account)
+    }
+
+    /// A device whose pair is a drive.
+    pub async fn drive(&self, name: &str) -> Device {
+        self.device_made(name, &self.library, true, true, Mode::Drive)
+            .await
+    }
+
+    /// A drive whose app password is in its state: a child `theca` runs on
+    /// it (`device_without_keychain`).
+    pub async fn drive_without_keychain(&self, name: &str) -> Device {
+        self.device_made(name, &self.library, true, false, Mode::Drive)
+            .await
     }
 
     async fn device_made(
@@ -440,6 +487,7 @@ impl World {
         library: &api::Library,
         start: bool,
         keyring: bool,
+        mode: Mode,
     ) -> Device {
         let created = self
             .admin
@@ -452,7 +500,7 @@ impl World {
             .await
             .unwrap();
         let mut device = self
-            .device_with(name, library, &created.password, start, keyring)
+            .device_in(name, library, &created.password, start, keyring, mode)
             .await;
         device.app_password = Some(created.app_password.id);
         device
@@ -466,7 +514,31 @@ impl World {
         start: bool,
         keyring: bool,
     ) -> Device {
+        self.device_in(name, library, password, start, keyring, Mode::Sync)
+            .await
+    }
+
+    async fn device_in(
+        &self,
+        name: &str,
+        library: &api::Library,
+        password: &str,
+        start: bool,
+        keyring: bool,
+        mode: Mode,
+    ) -> Device {
         keychain();
+        // Windows takes no sync root in the temp folder (`UNABLE_TO_MASK_PATH`):
+        // a drive's folders in the user's profile, as a user's are.
+        #[cfg(windows)]
+        let dir = match mode {
+            Mode::Drive => tempfile::Builder::new()
+                .prefix("theca-drive-")
+                .tempdir_in(std::env::var("USERPROFILE").unwrap())
+                .unwrap(),
+            Mode::Sync => tempfile::tempdir().unwrap(),
+        };
+        #[cfg(not(windows))]
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.sqlite");
         let folder = dir.path().join("theca");
@@ -492,6 +564,7 @@ impl World {
             &library.id.to_string(),
             Some(folder.join(&library.name)),
             false,
+            mode,
         )
         .await
         .unwrap();
@@ -666,6 +739,13 @@ impl Device {
 
     pub fn path(&self, path: &str) -> PathBuf {
         self.folder.join(path)
+    }
+
+    /// Where a drive's rounds work: a FUSE drive's backing folder, a
+    /// Windows drive's own folder.
+    #[cfg(any(target_os = "linux", windows))]
+    pub fn backing(&self) -> PathBuf {
+        theca::drive::root_of(&self.state(), &self.pair()).unwrap()
     }
 
     /// Writes a file, its time set in the past: the engine doesn't wait for

@@ -4,10 +4,13 @@
 	import { onMount } from 'svelte';
 	import { invoke } from '@tauri-apps/api/core';
 	import { open } from '@tauri-apps/plugin-dialog';
+	import DriveView from '#lib/components/drive.svelte';
 	import LoginCode from '#lib/components/login-code.svelte';
 	import { Badge, type BadgeVariant } from '#lib/components/ui/badge/index.js';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import * as Card from '#lib/components/ui/card/index.js';
+	import { Label } from '#lib/components/ui/label/index.js';
+	import { Switch } from '#lib/components/ui/switch/index.js';
 	import {
 		app,
 		ask,
@@ -43,9 +46,18 @@
 	let loading = $state(false);
 	let code = $state('');
 	let attempts = 0;
+	/** Why this computer can't hold a drive (the Drive tick greyed), if it can't. */
+	let unavailable = $state<string | null>(null);
+	/** The libraries ticked as drives. */
+	let asDrive = $state<Record<string, boolean>>({});
+	/** A Mac places a drive's folder itself. */
+	const mac = navigator.userAgent.includes('Mac');
 
 	onMount(() => {
 		if (browse) void list();
+		void attempt(() => invoke<string | null>('drive_support')).then(
+			(why) => (unavailable = why ?? null)
+		);
 	});
 
 	async function list() {
@@ -70,7 +82,8 @@
 				account: account.id,
 				library,
 				path,
-				merge
+				merge,
+				drive: asDrive[library] ?? false
 			});
 		const added = await attempt(() => add(false));
 		if (added && 'holds' in added) {
@@ -165,15 +178,26 @@
 			{name}
 			{#if size !== null}<span class="text-muted-foreground"> · {formatSize(size)}</span>{/if}
 		</span>
-		<div class="flex shrink-0 gap-1">
-			<Button
-				size="sm"
-				variant="ghost"
-				aria-label={m.sync_library_to({ library: name })}
-				onclick={() => sync(id, name, true)}
-			>
-				{m.sync_to()}
-			</Button>
+		<div class="flex shrink-0 items-center gap-1">
+			<div class="flex items-center gap-1.5" title={unavailable ?? m.drive_hint()}>
+				<Switch
+					id="drive-{id}"
+					aria-label={m.drive_library({ library: name })}
+					disabled={unavailable !== null}
+					bind:checked={() => asDrive[id] ?? false, (on) => (asDrive[id] = on)}
+				/>
+				<Label for="drive-{id}" class="text-xs">{m.drive()}</Label>
+			</div>
+			{#if !(mac && asDrive[id])}
+				<Button
+					size="sm"
+					variant="ghost"
+					aria-label={m.sync_library_to({ library: name })}
+					onclick={() => sync(id, name, true)}
+				>
+					{m.sync_to()}
+				</Button>
+			{/if}
 			<Button
 				size="sm"
 				variant="outline"
@@ -217,8 +241,10 @@
 							<span class="font-medium">{pair.library_name}</span>
 							<Badge variant={badge.variant} class="max-w-full truncate">{badge.text}</Badge>
 							{#if !pair.writable}<Badge variant="outline">{m.read_only()}</Badge>{/if}
+							{#if pair.drive}<Badge variant="outline">{m.drive()}</Badge>{/if}
 						</div>
 						<p class="truncate text-xs text-muted-foreground" title={pair.path}>{pair.path}</p>
+						{#if pair.drive}<DriveView {pair} />{/if}
 						<div class="flex flex-wrap items-center justify-between gap-2">
 							<p class="text-xs text-muted-foreground">
 								{pair.synced_at
@@ -244,14 +270,17 @@
 									>
 										{m.try_again()}
 									</Button>
-									<Button
-										size="sm"
-										variant="outline"
-										aria-label="{m.locate()} {pair.library_name}"
-										onclick={() => locate(pair)}
-									>
-										{m.locate()}
-									</Button>
+									<!-- A drive's folder is the system's: it can't move. -->
+									{#if !pair.drive}
+										<Button
+											size="sm"
+											variant="outline"
+											aria-label="{m.locate()} {pair.library_name}"
+											onclick={() => locate(pair)}
+										>
+											{m.locate()}
+										</Button>
+									{/if}
 								{/if}
 								<Button
 									size="sm"

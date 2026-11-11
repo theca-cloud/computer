@@ -1,8 +1,8 @@
 # Theca for computers
 
-The Theca app for macOS, Windows and Linux: local folders kept identical to Theca libraries, both ways. A tray app with a small window, or a CLI and daemon (`theca`) for servers.
+The Theca app for macOS, Windows and Linux: local folders kept identical to Theca libraries, both ways, or libraries as drives (all shown, a file downloaded when opened). A tray app with a small window, or a CLI and daemon (`theca`) for servers.
 
-Installing it, the app password and the keychain, headless use (commands, exit codes, environment variables, where it keeps its state): **[USING.md](USING.md)**, also on [theca.rs/computer](https://theca.rs/computer).
+Installing it, the app password and the keychain, drives, headless use (commands, exit codes, environment variables, where it keeps its state): **[USING.md](USING.md)**, also on [theca.rs/computer](https://theca.rs/computer).
 
 ## Development
 

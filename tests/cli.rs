@@ -42,6 +42,34 @@ fn usage_and_errors() {
     );
 }
 
+/// `drive-limit`: the default until one is set, then that one; a size it
+/// can't read is a usage error, and changes nothing.
+#[test]
+fn the_drive_limit_is_shown_and_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state.sqlite");
+    let said = |args: &[&str]| {
+        let out = theca(&state, args);
+        (
+            code(&out),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    let (code0, out) = said(&["drive-limit"]);
+    assert_eq!(code0, 0);
+    assert!(out.contains("(the default"), "{out}");
+    assert_eq!(said(&["drive-limit", "1.5GiB"]).0, 0);
+    assert_eq!(said(&["drive-limit", "lots"]).0, exit::USAGE);
+    let (_, out) = said(&["drive-limit"]);
+    assert_eq!(out, "Drives keep up to 1.5 GiB downloaded.\n");
+    // As it was given: 20GB reads "20 GB".
+    let (_, out) = said(&["drive-limit", "20GB"]);
+    assert_eq!(out, "Drives keep up to 20 GB downloaded.\n");
+    // Back to the default.
+    let (_, out) = said(&["drive-limit", "default"]);
+    assert!(out.contains("(the default"), "{out}");
+}
+
 /// `status` fails while a pair isn't syncing, and tells a signed-out account
 /// apart.
 #[tokio::test(flavor = "multi_thread")]

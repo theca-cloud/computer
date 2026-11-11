@@ -8,11 +8,11 @@ Download it from the [releases](https://github.com/theca-cloud/computer/releases
 
 | | The app | Headless (servers) |
 |---|---|---|
-| macOS | `theca-<version>-macos-<arch>.dmg`: open it, drag Theca to Applications | `theca-headless-<version>-macos-<arch>.tar.gz` |
+| macOS | `theca-<version>-macos-<arch>.dmg`: open it, drag Theca to Applications | the app's own `theca` (below) |
 | Windows | `theca-<version>-windows-x86_64.exe`: installs for you alone, no admin | `theca-headless-<version>-windows-x86_64.zip` |
 | Linux | `theca-<version>-linux-<arch>.deb` (Debian, Ubuntu: `sudo apt install ./theca-….deb`), or the `.AppImage` anywhere else (`chmod +x`, then run it) | `theca-headless-<version>-linux-<arch>.tar.gz` |
 
-The app also answers the CLI (`theca --help`). Headless, unpack the archive and put `theca` on your `PATH` (`sudo install theca-headless-*/theca /usr/local/bin/`), then `theca login`. Linux builds run on Ubuntu 22.04 and Debian 12 or newer.
+The app also answers the CLI (`theca --help`). Headless, unpack the archive and put `theca` on your `PATH` (`sudo install theca-headless-*/theca /usr/local/bin/`), then `theca login`. On a Mac used from the command line, install the app and use its `theca`: `/Applications/Theca.app/Contents/MacOS/theca` (a Mac's drives need the app's extension; there is no headless Mac archive from 1.2.0). Linux builds run on Ubuntu 22.04 and Debian 12 or newer; drives on Linux need `fuse3` (the `.deb` installs it; elsewhere, install it).
 
 To update, install the new version over the old one: what the app keeps is upgraded the first time the new version starts.
 
@@ -47,6 +47,26 @@ It syncs like any other file, so every device follows it, and the web app and We
 
 One limitation: an ignore file arriving after the files it names (a copy still in progress, or a move from another disk) lets those that came first be uploaded. A move within the same disk is fine. More, with examples: [theca.rs/features](https://theca.rs/features#ignored-files).
 
+## Drives
+
+A library can be a **drive** instead of a synced folder: your file manager shows all of it, a file is downloaded when you open it, and downloads are kept within a limit, the least recently used freed first. Tick **Drive** beside a library when adding it, or `theca add <library> --drive`.
+
+| | Where it is | Needs |
+|---|---|---|
+| Windows | the folder you choose, as a synced one (NTFS only) | Windows 10 1709 or newer; Theca running for a file not downloaded to open |
+| macOS | `~/Library/CloudStorage/Theca-<library>`, where macOS puts it (in Finder's sidebar) | macOS 13; the app (its `theca` from the command line) running for a file not downloaded to open |
+| Linux | the folder you choose, as a synced one | `fuse3`; Theca running for the folder to show anything (it is mounted while Theca runs) |
+
+**On a Mac, macOS adds a drive switched off**: switch it on in **System Settings → General → Login Items & Extensions → File Providers → Theca** (the app has a button to that pane; `theca status` says when a drive waits for it).
+
+- **Keep a file or folder on this computer** (downloaded, never freed, what arrives later in a folder kept too): **Keep…** in the app, `theca keep <path>`, Windows' **Always keep on this device**, or Finder's **Keep Downloaded** (and **Don't Keep Downloaded** to stop). Kept files don't count in the drive limit.
+- **Free its space now** (it stays listed, downloaded again when opened): **Free** in the app, `theca free <path>`. A file open in a program is freed once it is closed; an edit not uploaded yet is never freed.
+- **The drive limit**, one for the computer: `theca drive-limit` shows it, `theca drive-limit 20GB` (or `20GiB`) sets it, `theca drive-limit default` goes back to the default (10 GiB, or a tenth of the disk if smaller). Kept files and edits not uploaded yet don't count. Windows and macOS may free more on their own when the disk is low.
+- **What counts as a use** (the limit frees the least recently used first): every open on Linux; on Windows, an open by any program but Theca; on macOS, an open through Finder or "Open With" (a file read by a script isn't seen as used). A file never opened since its download counts from its download.
+- **Offline**, a file already downloaded opens; one that isn't fails to open (Theca says so on Windows and Linux; Finder shows its error on a Mac).
+- **Removing a drive** moves the edits not uploaded yet to `<default folder>/<library> (not uploaded)`, never deleted; everything else goes (it is on the server). Uninstalling Theca on Windows removes its drives first, the same way.
+- **On Linux, a file saved into the drive's folder while Theca wasn't running** (so not into the drive) stops the drive until you move it out; the drive then comes back by itself.
+
 ## Headless use
 
 ```sh
@@ -57,7 +77,7 @@ theca run                               # syncs, in the foreground (what a servi
 theca status                            # what syncs, what it's doing, errors
 ```
 
-Every command and its options: `theca --help`, `theca <command> --help`. The commands: `login`, `accounts`, `account` (an account's default folder and the size up to which new libraries sync by themselves), `remove-account`, `libraries`, `add`, `remove`, `pause`, `resume`, `locate` (a folder moved or on another disk), `status`, `undo` (restores what the last deletion moved to the trash), `run`. A script logs in without a browser with an app password made in the web app: `THECA_TOKEN=… theca login <instance>`.
+Every command and its options: `theca --help`, `theca <command> --help`. The commands: `login`, `accounts`, `account` (an account's default folder and the size up to which new libraries sync by themselves), `remove-account`, `libraries`, `add`, `remove`, `pause`, `resume`, `locate` (a folder moved or on another disk), `status`, `undo` (restores what the last deletion moved to the trash), `run`; for drives, `keep`, `free`, `drive-limit`. A script logs in without a browser with an app password made in the web app: `THECA_TOKEN=… theca login <instance>`.
 
 One `theca run`, or the app, syncs a state file at a time: a second one refuses to start. `run` stops within a few seconds on Ctrl-C or `SIGTERM`.
 
@@ -92,4 +112,4 @@ One file, `state.sqlite`: the accounts, the synced folders and what was last in 
 | Linux | `~/.local/share/theca/state.sqlite` (`$XDG_DATA_HOME/theca/` when set) |
 | Windows | `%APPDATA%\theca\theca\data\state.sqlite` |
 
-Before an upgrade changes it, a copy of the previous one is kept beside it (`state.sqlite.v2`), without the app passwords.
+Before an upgrade changes it, a copy of the previous one is kept beside it (`state.sqlite.v2`), without the app passwords. On Linux, a drive's files are kept beside it too, in `drives/` (its folder is mounted from there).

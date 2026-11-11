@@ -64,8 +64,11 @@ released_guard() {
 
 if [ "$step" = all ] || [ "$step" = lint ]; then
     released_guard
-    cargo fmt --check
+    cargo fmt --all --check
     cargo clippy --features crash-points --all-targets -- -D warnings
+    # macOS's File Provider extension and calls (a stub elsewhere: its
+    # protocol is still checked).
+    cargo clippy -p theca-fileprovider --all-targets -- -D warnings
     # The app: its page (formatting, lint, types), built, then embedded in the
     # `gui` build, linted too (needs WebKitGTK on Linux).
     [ -d ui/node_modules ] || npm --prefix ui ci
@@ -84,6 +87,7 @@ if [ "$step" = all ] || [ "$step" = test ]; then
     # The crash tests' named points (tests/crash.rs) built in: inert unless
     # THECA_CRASH_AT names one.
     cargo test --features crash-points
+    cargo test -p theca-fileprovider
 fi
 # Only Linux has a WebDriver for WebKit: elsewhere, `all` skips it, and the app
 # is checked by hand (the sprint's checklist).

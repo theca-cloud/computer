@@ -9,6 +9,10 @@ use theca::keychain::KeychainError;
 use theca::state::{self, State};
 use theca::{exit, ops};
 
+/// Where a Mac's drive is switched on: macOS adds it switched off.
+#[cfg(target_os = "macos")]
+const SWITCH_ON: &str = "Switch it on in System Settings → General → Login Items & Extensions → File Providers → Theca.";
+
 /// What a command fails with: said on stderr, with its exit code (`exit`).
 #[derive(Debug, thiserror::Error)]
 enum CliError {
@@ -124,6 +128,10 @@ enum Command {
         /// The folder already holds files: merge them with the library.
         #[arg(long)]
         merge: bool,
+        /// A drive: the whole library shown, each file downloaded when
+        /// opened, kept within the drive limit.
+        #[arg(long)]
+        drive: bool,
         #[arg(long)]
         account: Option<String>,
     },
@@ -148,10 +156,35 @@ enum Command {
     },
     /// What is synced, what it's doing, errors and notices.
     Status,
+    /// Keep files or folders of a drive on this computer, downloaded (what
+    /// arrives later in a folder kept too), outside the drive limit.
+    Keep {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// Free the space files or folders of a drive take, now: they stay
+    /// listed, downloaded again when opened (not while an edit isn't
+    /// uploaded).
+    Free {
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+    },
+    /// How much downloaded content drives keep, shown, or set: 20GB (10^9
+    /// bytes) or 20GiB (2^30). Kept files and edits not yet uploaded don't
+    /// count.
+    DriveLimit {
+        /// 20GB, 20GiB, or `default` (10 GiB, or a tenth of the disk).
+        #[arg(value_parser = limit_value)]
+        size: Option<LimitValue>,
+    },
     /// Restore what the last deletion moved to the trash.
     Undo,
     /// Run the sync engine in the foreground (what a service runs).
     Run,
+    /// Every drive removed, as `remove` does (the Windows uninstaller runs
+    /// it: no sync root stays registered).
+    #[command(hide = true)]
+    RemoveDrives,
 }
 
 fn main() -> ExitCode {
@@ -294,15 +327,26 @@ async fn command(cli: Cli) -> Result<()> {
             library,
             path,
             merge,
+            drive,
             account,
         } => {
             let account = ops::find_account(&state, account.as_deref())?;
-            let pair = ops::add(&state, &account, &library, path, merge).await?;
+            let mode = if drive {
+                state::Mode::Drive
+            } else {
+                state::Mode::Sync
+            };
+            let pair = ops::add(&state, &account, &library, path, merge, mode).await?;
+            let what = if drive { "is a drive in" } else { "syncs into" };
             println!(
-                "{} syncs into {} (theca run, or the app, does it).",
+                "{} {what} {} (theca run, or the app, does it).",
                 pair.library_name,
                 pair.path.display()
             );
+            #[cfg(target_os = "macos")]
+            if drive {
+                println!("{SWITCH_ON}");
+            }
         }
         Command::Remove { pair, delete_files } => {
             let pair = ops::find_pair(&state, &pair)?;
@@ -335,6 +379,51 @@ async fn command(cli: Cli) -> Result<()> {
             }
         }
         Command::Status => status(&state)?,
+        Command::RemoveDrives => {
+            for pair in state.pairs()? {
+                if pair.mode == state::Mode::Drive {
+                    let kept = ops::remove(&state, &pair, false)?;
+                    println!("{} isn't a drive anymore.", pair.path.display());
+                    if kept > 0 {
+                        println!("Kept {} that weren't uploaded.", plural(kept, "file"));
+                    }
+                }
+            }
+        }
+        Command::Free { paths } => {
+            for path in paths {
+                let pair = ops::free(&state, &path)?;
+                println!("{} is freed ({}).", path.display(), pair.library_name);
+            }
+        }
+        Command::Keep { paths } => {
+            for path in paths {
+                let pair = ops::keep(&state, &path, true)?;
+                println!(
+                    "{} is kept on this computer ({}).",
+                    path.display(),
+                    pair.library_name
+                );
+            }
+        }
+        Command::DriveLimit { size: set } => {
+            match set {
+                Some(LimitValue::Bytes(bytes)) => state.set_drive_limit(bytes)?,
+                Some(LimitValue::Default) => state.clear_drive_limit()?,
+                None => {}
+            }
+            let limit = theca::drive::limit(&state)?;
+            let default = state.drive_limit()?.is_none();
+            let default = if default {
+                " (the default: 10 GiB, or a tenth of the disk if smaller)"
+            } else {
+                ""
+            };
+            println!(
+                "Drives keep up to {} downloaded{default}.",
+                limit_size(limit)
+            );
+        }
         Command::Undo => {
             let Some(notice) = state.latest_undo()? else {
                 println!("Nothing to undo.");
@@ -422,6 +511,23 @@ fn status(state: &State) -> Result<()> {
                 })
                 .unwrap_or_default();
             println!("  {}  {}  {what}{when}", p.library_name, p.path.display());
+            #[cfg(target_os = "macos")]
+            if p.mode == state::Mode::Drive {
+                let domain = theca::drive::provider::domain_of(p);
+                if theca_fileprovider::host::enabled(&domain) == Ok(Some(false)) {
+                    println!("    a drive waiting to be switched on: {SWITCH_ON}");
+                }
+            }
+            #[cfg(any(target_os = "linux", windows))]
+            if p.mode == state::Mode::Drive {
+                let u = theca::drive::usage(state, p)?;
+                println!(
+                    "    a drive: {} downloaded, {} kept, {} waiting to upload",
+                    size(u.downloaded as i64),
+                    u.kept,
+                    u.waiting
+                );
+            }
         }
     }
     let notices = state.notices()?;
@@ -463,6 +569,33 @@ fn status(state: &State) -> Result<()> {
 }
 
 /// `1.2 MiB`: as the app and the web app show sizes.
+/// `theca drive-limit`'s value: a size, or back to the default.
+#[derive(Clone)]
+enum LimitValue {
+    Bytes(u64),
+    Default,
+}
+
+fn limit_value(value: &str) -> std::result::Result<LimitValue, String> {
+    if value == "default" {
+        return Ok(LimitValue::Default);
+    }
+    value
+        .parse::<bytesize::ByteSize>()
+        .map(|b| LimitValue::Bytes(b.as_u64()))
+}
+
+/// A limit as it was given: in GB when it's a whole number of them (20GB
+/// set reads "20 GB", not "19 GiB"), else as every size shows.
+fn limit_size(bytes: u64) -> String {
+    const GB: u64 = 1_000_000_000;
+    if bytes >= GB && bytes.is_multiple_of(GB) {
+        format!("{} GB", bytes / GB)
+    } else {
+        size(bytes as i64)
+    }
+}
+
 fn size(bytes: i64) -> String {
     const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
     let mut value = bytes as f64;

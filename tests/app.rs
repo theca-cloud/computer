@@ -14,6 +14,10 @@ use common::*;
 use fantoccini::{Client, ClientBuilder, Locator};
 use sqlx::Connection;
 
+/// One app at a time: it is single-instance, a second launch hands over to
+/// the first and exits (its test's window gone).
+static ONE_APP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// `tauri-driver`, killed when dropped.
 struct Driver(Child);
 
@@ -105,6 +109,7 @@ async fn approve(w: &World) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sign_in_sync_and_an_error() {
+    let _one = ONE_APP.lock().await;
     let w = world().await;
     w.upload(&w.library, "hello.txt", b"hello").await;
     let dir = tempfile::tempdir().unwrap();
@@ -148,6 +153,75 @@ async fn sign_in_sync_and_an_error() {
         .status()
         .unwrap();
     assert!(again.success(), "{again:?}");
+
+    client.close().await.unwrap();
+}
+
+/// A drive in the window: its line (the Drive badge, its numbers), the drive
+/// limit set in the settings, the Drive tick when adding a library (greyed
+/// where this computer can't hold one: the CI image has no FUSE).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drive_in_the_window() {
+    let _one = ONE_APP.lock().await;
+    let w = world().await;
+    let (dir, state_path, account) = w.logged_in("app").await;
+    let state = theca::state::State::open(&state_path).unwrap();
+    theca::ops::add(
+        &state,
+        &account,
+        "Docs",
+        Some(dir.path().join("theca/Docs")),
+        false,
+        theca::state::Mode::Drive,
+    )
+    .await
+    .unwrap();
+    let other = w
+        .admin
+        .create_library(w.organization, "Photos")
+        .await
+        .unwrap();
+    let (_driver, client) = app(&state_path).await;
+
+    // Its line.
+    shown(&client, "Drive").await;
+    shown(&client, "kept").await;
+
+    // The drive limit, from the settings.
+    let limit = client.find(Locator::Id("drive-limit")).await.unwrap();
+    limit.clear().await.unwrap();
+    limit.send_keys("2").await.unwrap();
+    client
+        .find(Locator::XPath("//button[normalize-space()='Save']"))
+        .await
+        .unwrap()
+        .click()
+        .await
+        .unwrap();
+    eventually("the limit saved", || async {
+        state.drive_limit().unwrap() == Some(2 * 1024 * 1024 * 1024)
+    })
+    .await;
+
+    // The Drive tick beside a library to add.
+    client
+        .find(Locator::XPath(
+            "//button[normalize-space()='Add a library…']",
+        ))
+        .await
+        .unwrap()
+        .click()
+        .await
+        .unwrap();
+    let tick = client
+        .wait()
+        .at_most(Duration::from_secs(30))
+        .for_element(Locator::Id(&format!("drive-{}", other.id)))
+        .await
+        .unwrap();
+    let greyed = tick.attr("disabled").await.unwrap().is_some()
+        || tick.attr("data-disabled").await.unwrap().is_some();
+    assert_eq!(greyed, theca::drive::unavailable().is_some());
 
     client.close().await.unwrap();
 }

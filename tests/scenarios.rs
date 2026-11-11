@@ -241,13 +241,27 @@ async fn a_lost_state_resyncs_without_new_versions() {
     let pair = a.pair();
     state.remove_pair(&pair).unwrap();
     let account = a.account.clone();
-    let err = theca::ops::add(&state, &account, "Docs", Some(a.folder.clone()), false)
-        .await
-        .unwrap_err();
+    let err = theca::ops::add(
+        &state,
+        &account,
+        "Docs",
+        Some(a.folder.clone()),
+        false,
+        theca::state::Mode::Sync,
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("confirm the merge"), "{err}");
-    theca::ops::add(&state, &account, "Docs", Some(a.folder.clone()), true)
-        .await
-        .unwrap();
+    theca::ops::add(
+        &state,
+        &account,
+        "Docs",
+        Some(a.folder.clone()),
+        true,
+        theca::state::Mode::Sync,
+    )
+    .await
+    .unwrap();
     a.restart();
     w.converge(&[&a]).await;
     eventually("in sync again", || async {

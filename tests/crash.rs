@@ -257,3 +257,180 @@ async fn a_local_delete_killed_before_its_record_converges() {
     assert!(!a.path("x.txt").exists());
     assert_eq!(w.admin.library_trash(w.library.id).await.unwrap().len(), 1);
 }
+
+/// The drive's backend here: its crash tests need it (as `tests/drive.rs`).
+#[cfg(any(target_os = "linux", windows))]
+fn fuse() -> bool {
+    #[cfg(target_os = "linux")]
+    let here = Path::new("/dev/fuse").exists() && theca::drive::fuse::available();
+    #[cfg(windows)]
+    let here = true;
+    let required = std::env::var("THECA_TEST_DRIVE").is_ok_and(|v| !v.is_empty() && v != "0");
+    assert!(here || !required, "THECA_TEST_DRIVE: no FUSE here");
+    here
+}
+
+/// A drive's file downloaded (kept, then no longer), its engine stopped.
+#[cfg(any(target_os = "linux", windows))]
+async fn downloaded_in_a_stopped_drive(w: &World) -> Device {
+    let s = w.device("sync").await;
+    s.write("a.txt", "hello");
+    w.converge(&[&s]).await;
+    let mut d = w.drive_without_keychain("drive").await;
+    let backing = d.backing();
+    let state = d.state();
+    let pair = d.pair();
+    // Recorded too (a placeholder shows a moment before its entry).
+    eventually("a placeholder", || async {
+        theca::drive::is_placeholder(&backing.join("a.txt"))
+            && state
+                .entry_at(pair.id, pair.root, &["a.txt".to_owned()])
+                .unwrap()
+                .is_some()
+    })
+    .await;
+    theca::ops::keep(&state, &d.folder.join("a.txt"), true).unwrap();
+    eventually("downloaded", || async {
+        !theca::drive::is_placeholder(&backing.join("a.txt"))
+            && std::fs::read_to_string(backing.join("a.txt")).is_ok_and(|c| c == "hello")
+    })
+    .await;
+    theca::ops::keep(&state, &d.folder.join("a.txt"), false).unwrap();
+    d.stop().await;
+    d
+}
+
+/// An eviction killed once the file is marked, its data still there: the
+/// next start takes it for a placeholder (never an edit of zeros), and it
+/// opens with the server's content.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_eviction_killed_after_its_mark_loses_nothing() {
+    if !fuse() {
+        return;
+    }
+    let w = world().await;
+    let mut d = downloaded_in_a_stopped_drive(&w).await;
+    let a = d.folder.join("a.txt").to_string_lossy().into_owned();
+    crash(&d.state_path, "evicted-marked", &["free", &a]).await;
+    let backing = d.backing().join("a.txt");
+    assert!(theca::drive::placeholder::is(&backing));
+    assert_eq!(
+        std::fs::read_to_string(&backing).unwrap(),
+        "hello",
+        "its data still there"
+    );
+    d.restart();
+    let mounted = d.folder.join("a.txt");
+    let opened = tokio::task::spawn_blocking(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(c) = std::fs::read_to_string(&mounted)
+                && !c.is_empty()
+            {
+                return c;
+            }
+            assert!(std::time::Instant::now() < deadline, "never mounted");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
+    assert_eq!(opened.await.unwrap(), "hello");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let remote = w.remote(&w.library).await;
+    assert_eq!(remote["a.txt"].as_deref(), Some(&b"hello"[..]));
+    d.stop().await;
+}
+
+/// A fetch killed once its file is renamed into the backing folder, before
+/// it is recorded: the next start takes it as the server's file, downloaded
+/// (never an edit), and records it; nothing goes up.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fetch_killed_before_its_record_is_no_edit() {
+    if !fuse() {
+        return;
+    }
+    let w = world().await;
+    let s = w.device("sync").await;
+    s.write("a.txt", "hello");
+    w.converge(&[&s]).await;
+    let mut d = w.drive_without_keychain("drive").await;
+    let backing = d.backing().join("a.txt");
+    let state = d.state();
+    let pair = d.pair();
+    let entry = || {
+        state
+            .entry_at(pair.id, pair.root, &["a.txt".to_owned()])
+            .unwrap()
+    };
+    eventually("a placeholder, recorded", || async {
+        theca::drive::is_placeholder(&backing) && entry().is_some()
+    })
+    .await;
+    d.stop().await;
+    // Kept while no engine runs: the next one fetches it, and is killed.
+    theca::ops::keep(&state, &d.folder.join("a.txt"), true).unwrap();
+    crash(&d.state_path, "downloaded-unrecorded", &["run"]).await;
+    assert!(!theca::drive::placeholder::is(&backing), "renamed in");
+    assert_eq!(std::fs::read_to_string(&backing).unwrap(), "hello");
+    let landed = theca::local::file_id(&backing);
+    assert_ne!(entry().unwrap().file_id, landed, "not recorded yet");
+    let node = entry().unwrap().node;
+
+    d.restart();
+    eventually("recorded by the next start", || async {
+        entry().unwrap().file_id == landed
+    })
+    .await;
+    let opened = d.folder.join("a.txt");
+    let read = tokio::task::spawn_blocking(move || std::fs::read_to_string(opened))
+        .await
+        .unwrap();
+    assert_eq!(read.unwrap(), "hello");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        w.admin.versions(node).await.unwrap().len(),
+        1,
+        "nothing uploaded"
+    );
+    assert!(
+        !d.notices().iter().any(|n| n.contains("elsewhere")),
+        "{:?}",
+        d.notices()
+    );
+    d.stop().await;
+}
+
+/// A drive's removal killed once its pair is forgotten, or once its edits
+/// moved out: the next start finishes it, each edit moved once.
+#[cfg(any(target_os = "linux", windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drive_removal_killed_midway_is_finished() {
+    if !fuse() {
+        return;
+    }
+    for point in ["drive-removal-forgotten", "drive-removal-moved"] {
+        let w = world().await;
+        let mut d = downloaded_in_a_stopped_drive(&w).await;
+        let backing = d.backing();
+        std::fs::write(backing.join("edit.txt"), "not uploaded").unwrap();
+        crash(&d.state_path, point, &["remove", "Docs"]).await;
+        assert!(d.state().pairs().unwrap().is_empty(), "{point}");
+        assert!(backing.exists(), "{point}: not deleted yet");
+        d.restart();
+        let aside = d
+            .account
+            .default_folder
+            .join("Docs (not uploaded)/edit.txt");
+        eventually("finished by the next start", || async {
+            !backing.exists() && !backing.with_extension("removal").exists()
+        })
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&aside).unwrap(),
+            "not uploaded",
+            "{point}"
+        );
+        d.stop().await;
+    }
+}

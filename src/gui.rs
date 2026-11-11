@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::engine::{self, Handle};
 use crate::ops;
-use crate::state::{Notice, State, Update};
+use crate::state::{Mode, Notice, State, Update};
 
 /// What the app keeps.
 struct App {
@@ -77,6 +77,12 @@ pub fn run(state_path: PathBuf, background: bool) -> Result<(), tauri::Error> {
             dismiss,
             set_account,
             remove_account,
+            drive_support,
+            kept,
+            keep,
+            free,
+            drive_limit,
+            set_drive_limit,
             quit,
         ])
         .setup(move |app| {
@@ -426,6 +432,48 @@ struct PairView {
     /// The account's engine stopped on it, until the pair's next activity.
     error: Option<String>,
     synced_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// A drive's: none for a sync pair.
+    drive: Option<DriveView>,
+}
+
+/// A drive's numbers, as each OS can tell them.
+#[derive(Serialize)]
+struct DriveView {
+    /// Bytes downloaded (Linux, Windows).
+    downloaded: Option<u64>,
+    kept: usize,
+    /// Files not uploaded yet (Linux, Windows).
+    waiting: Option<usize>,
+    /// macOS added it switched off: the user switches it on.
+    switch_on: bool,
+}
+
+fn drive_view(state: &State, p: &crate::state::Pair) -> Option<DriveView> {
+    if p.mode != Mode::Drive {
+        return None;
+    }
+    let kept = state.kept(p.id).map_or(0, |k| k.len());
+    #[cfg(any(target_os = "linux", windows))]
+    let view = crate::drive::usage(state, p).ok().map(|u| DriveView {
+        downloaded: Some(u.downloaded),
+        kept: u.kept,
+        waiting: Some(u.waiting),
+        switch_on: false,
+    });
+    #[cfg(target_os = "macos")]
+    let view = Some(DriveView {
+        downloaded: None,
+        kept,
+        waiting: None,
+        switch_on: theca_fileprovider::host::enabled(&crate::drive::provider::domain_of(p))
+            == Ok(Some(false)),
+    });
+    view.or(Some(DriveView {
+        downloaded: None,
+        kept,
+        waiting: None,
+        switch_on: false,
+    }))
 }
 
 #[derive(Serialize)]
@@ -486,6 +534,7 @@ fn status(app: AppHandle) -> Answer<Status> {
             .map_err(err)?
             .into_iter()
             .map(|p| PairView {
+                drive: drive_view(&state, &p),
                 folder_stop: p.stopped_for_its_folder(),
                 id: p.id,
                 account: p.account,
@@ -606,13 +655,23 @@ async fn add(
     library: Uuid,
     path: Option<PathBuf>,
     merge: bool,
+    drive: bool,
 ) -> Answer<Added> {
     let state = state(&app);
     let account = state
         .account(account)
         .map_err(err)?
         .ok_or("no such account")?;
-    match ops::add(&state, &account, &library.to_string(), path, merge).await {
+    match ops::add(
+        &state,
+        &account,
+        &library.to_string(),
+        path,
+        merge,
+        if drive { Mode::Drive } else { Mode::Sync },
+    )
+    .await
+    {
         Ok(pair) => {
             app.state::<App>().engine.wake();
             Ok(Added::Pair(pair.id))
@@ -629,6 +688,57 @@ async fn add(
 enum Added {
     Pair(i64),
     Holds(usize),
+}
+
+/// Why this computer can't hold a drive (the Drive tick greyed), if it can't.
+#[tauri::command]
+fn drive_support() -> Option<String> {
+    crate::drive::unavailable()
+}
+
+/// What a drive keeps on this computer, by path below its folder.
+#[tauri::command]
+fn kept(app: AppHandle, pair: i64) -> Answer<Vec<PathBuf>> {
+    let state = state(&app);
+    let pair = state.pair(pair).map_err(err)?.ok_or("no such drive")?;
+    crate::drive::kept_paths(&state, &pair).map_err(err)
+}
+
+/// A drive's file or folder kept on this computer (`theca keep`).
+#[tauri::command]
+fn keep(app: AppHandle, path: PathBuf) -> Answer<()> {
+    let state = state(&app);
+    ops::keep(&state, &path, true).map_err(err)?;
+    Ok(())
+}
+
+/// A drive's file or folder freed now (`theca free`).
+#[tauri::command]
+fn free(app: AppHandle, path: PathBuf) -> Answer<()> {
+    let state = state(&app);
+    ops::free(&state, &path).map_err(err)?;
+    Ok(())
+}
+
+/// The drive limit, and whether it is the default.
+#[derive(Serialize)]
+struct Limit {
+    bytes: u64,
+    default: bool,
+}
+
+#[tauri::command]
+fn drive_limit(app: AppHandle) -> Answer<Limit> {
+    let state = state(&app);
+    Ok(Limit {
+        bytes: crate::drive::limit(&state).map_err(err)?,
+        default: state.drive_limit().map_err(err)?.is_none(),
+    })
+}
+
+#[tauri::command]
+fn set_drive_limit(app: AppHandle, bytes: u64) -> Answer<()> {
+    state(&app).set_drive_limit(bytes).map_err(err)
 }
 
 /// Stops syncing a pair; how many files were kept (not synced) when deleting.

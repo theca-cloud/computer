@@ -46,6 +46,11 @@ pub struct Item {
     /// Named by an ignore file (`.thecaignore`): never uploaded, read-only
     /// for the plan.
     pub ignored: bool,
+    /// Its content is here: false for a drive's file not downloaded, as the
+    /// file itself says (a placeholder); always true in a sync pair.
+    pub downloaded: bool,
+    /// A Windows drive's file or folder pinned: kept, as Windows stores it.
+    pub kept: bool,
 }
 
 impl Item {
@@ -199,6 +204,8 @@ fn item(path: Vec<String>, meta: &Metadata, full: &Path, is_file: bool) -> Item 
         mtime: mtime(meta),
         file_id: file_id(full),
         ignored: false,
+        downloaded: true,
+        kept: false,
     }
 }
 

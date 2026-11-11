@@ -15,12 +15,13 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::Instrument;
 use uuid::Uuid;
 
+use crate::drive;
 use crate::exec::{Executor, remote_state};
 use crate::keychain::{self, KeychainError};
 use crate::local;
 use crate::ops;
 use crate::plan::{Action, Input, plan};
-use crate::state::{Account, Offer, Pair, RemoteState, State, StateError, Stop, Update};
+use crate::state::{Account, Mode, Offer, Pair, RemoteState, State, StateError, Stop, Update};
 
 /// A full scan even without any sign of change: watchers drop events.
 const FULL_SCAN: Duration = Duration::from_secs(3600);
@@ -64,6 +65,8 @@ pub struct Handle {
     /// Per account, the libraries last offered (a window opening shows them
     /// without waiting for the next `Update::Offered`).
     pub offered: Arc<std::sync::Mutex<HashMap<i64, Vec<Offer>>>>,
+    /// The macOS drives this process serves to the File Provider extension.
+    pub provider: Arc<crate::drive::provider::Provider>,
 }
 
 impl Handle {
@@ -80,6 +83,7 @@ impl Default for Handle {
             // A window that falls this far behind reloads the whole status.
             updates: broadcast::channel(256).0,
             offered: Arc::default(),
+            provider: Arc::default(),
         }
     }
 }
@@ -93,6 +97,12 @@ pub async fn run(
 ) -> Result<(), EngineError> {
     let mut running: HashMap<i64, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut woken = handle.woken.subscribe();
+    // The File Provider extension's socket, for every macOS drive.
+    #[cfg(target_os = "macos")]
+    crate::drive::provider::listen(handle.provider.clone(), tokio::runtime::Handle::current());
+    // Drive removals a crash left half done.
+    #[cfg(any(target_os = "linux", windows))]
+    crate::drive::finish_removals(&State::open(&state_path)?);
     loop {
         let accounts = State::open(&state_path)?.accounts()?;
         running.retain(|id, task| {
@@ -222,6 +232,30 @@ struct Follower {
     stopping: watch::Receiver<bool>,
     /// Cancels the round's transfers when it stops.
     cancel: Cancel,
+    /// Each running drive's mount (FUSE) or sync root (Windows), and what fetches for them.
+    #[cfg(any(target_os = "linux", windows))]
+    mounts: HashMap<i64, drive::Served>,
+    #[cfg(any(target_os = "linux", windows))]
+    fetcher: drive::fetch::Fetcher,
+    /// The macOS drives served to the extension, and the state they read
+    /// (a connection of their own).
+    #[cfg(target_os = "macos")]
+    provider: Arc<crate::drive::provider::Provider>,
+    #[cfg(target_os = "macos")]
+    provider_state: Arc<State>,
+    #[cfg(target_os = "macos")]
+    served: HashSet<i64>,
+    /// Each pair's counter of changes to its entries, as last seen: a drive
+    /// whose counter moved (a node kept, from another process) runs a round.
+    seqs: HashMap<i64, i64>,
+    /// Drives with nodes freed (`theca free`) to evict: as soon as possible,
+    /// tried every pass while a file of theirs is open.
+    #[cfg(any(target_os = "linux", windows))]
+    freeing: HashSet<i64>,
+    /// When the drive limit is next checked: every minute, and after a fetch.
+    limit_at: Instant,
+    #[cfg(any(target_os = "linux", windows))]
+    fetched: Arc<std::sync::atomic::AtomicBool>,
 }
 
 async fn follow(
@@ -256,6 +290,20 @@ async fn follow(
         return Err(EngineError::Server(why));
     }
     let (events, mut changed) = mpsc::unbounded_channel();
+    let cancel = Cancel::default();
+    // Fetches for the drives' mounts, beside the rounds, on a connection of
+    // their own; aborted with this task.
+    let mut cancelling = tokio::task::JoinSet::new();
+    #[cfg(any(target_os = "linux", windows))]
+    let fetched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(any(target_os = "linux", windows))]
+    let fetcher = {
+        let state = Arc::new(State::open(state_path)?);
+        let (fetcher, serve) =
+            drive::fetch::service(state, client.clone(), cancel.clone(), fetched.clone());
+        cancelling.spawn(serve);
+        fetcher
+    };
     let mut f = Follower {
         state,
         account,
@@ -274,12 +322,27 @@ async fn follow(
         watchers: HashMap::new(),
         events,
         offered: handle.offered.clone(),
+        #[cfg(target_os = "macos")]
+        provider: handle.provider.clone(),
+        #[cfg(target_os = "macos")]
+        provider_state: Arc::new(State::open(state_path)?),
+        #[cfg(target_os = "macos")]
+        served: HashSet::new(),
         stopped_at: HashMap::new(),
         stopping: shutdown.clone(),
-        cancel: Cancel::default(),
+        cancel,
+        #[cfg(any(target_os = "linux", windows))]
+        mounts: HashMap::new(),
+        #[cfg(any(target_os = "linux", windows))]
+        fetcher,
+        seqs: HashMap::new(),
+        #[cfg(any(target_os = "linux", windows))]
+        freeing: HashSet::new(),
+        limit_at: Instant::now(),
+        #[cfg(any(target_os = "linux", windows))]
+        fetched,
     };
     // The stop cancels the transfers in flight (aborted with this task).
-    let mut cancelling = tokio::task::JoinSet::new();
     {
         let (mut stopping, cancel) = (shutdown.clone(), f.cancel.clone());
         cancelling.spawn(async move {
@@ -333,6 +396,9 @@ async fn follow(
             f.heard(pair);
         }
         f.rounds().await?;
+        #[cfg(any(target_os = "linux", windows))]
+        f.free()?;
+        f.keep_under_limit()?;
     }
 }
 
@@ -381,7 +447,221 @@ impl Follower {
             .pairs()?
             .into_iter()
             .filter(|p| p.account == self.account.id)
+            .map(|p| self.local_side(p))
             .collect())
+    }
+
+    /// Each running drive mounted (FUSE) or connected (Windows) on its folder, once that folder is
+    /// bare (the root check stops it otherwise); the others unmounted.
+    #[cfg(any(target_os = "linux", windows))]
+    fn mount(&mut self, pairs: &[Pair], running: &HashSet<i64>) -> Result<(), EngineError> {
+        self.mounts.retain(|p, _| running.contains(p));
+        for p in pairs
+            .iter()
+            .filter(|p| p.mode == Mode::Drive && running.contains(&p.id))
+        {
+            if self.mounts.contains_key(&p.id) {
+                continue;
+            }
+            let Some(folder) = self.state.pair(p.id)?.map(|p| p.path) else {
+                continue;
+            };
+            match drive::serve(p, &folder, self.fetcher.clone()) {
+                Ok(m) => {
+                    self.mounts.insert(p.id, m);
+                }
+                Err(why) => self.stop(p, Stop::Folder(why))?,
+            }
+        }
+        Ok(())
+    }
+
+    /// What `theca free` asked, evicted now: a file open waits for the next
+    /// pass (every second).
+    #[cfg(any(target_os = "linux", windows))]
+    fn free(&mut self) -> Result<(), EngineError> {
+        let pairs: Vec<i64> = self.freeing.iter().copied().collect();
+        for id in pairs {
+            let (Some(p), Some(mount)) = (self.state.pair(id)?, self.mounts.get(&id)) else {
+                self.freeing.remove(&id);
+                continue;
+            };
+            if drive::free_now(&self.state, &p, Some(&mount.busy))? == 0 {
+                self.freeing.remove(&id);
+            }
+        }
+        Ok(())
+    }
+
+    /// Drives' downloads kept under the drive limit (one per computer): the
+    /// same choice over every drive in each account's engine, each evicting
+    /// its own drives' files, least recently used first, never one open.
+    #[cfg(any(target_os = "linux", windows))]
+    fn keep_under_limit(&mut self) -> Result<(), EngineError> {
+        use std::sync::atomic::Ordering;
+        let now = Instant::now();
+        if now < self.limit_at && !self.fetched.swap(false, Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.limit_at = now + Duration::from_secs(60);
+        let limit = drive::limit(&self.state)?;
+        let mut files = Vec::new();
+        for p in self.state.pairs()? {
+            if p.mode != Mode::Drive {
+                continue;
+            }
+            let busy = self.mounts.get(&p.id).map(|m| &m.busy);
+            let own = p.account == self.account.id;
+            for f in drive::downloaded(&self.state, &p, |rel| busy.is_some_and(|b| b.is_open(rel)))?
+            {
+                files.push(drive::Downloaded {
+                    file: (own.then_some(p.id), f.file),
+                    size: f.size,
+                    used: f.used,
+                    busy: f.busy,
+                });
+            }
+        }
+        for (pair, rel) in drive::evictions(files, limit) {
+            let Some(pair) = pair else {
+                continue;
+            };
+            let Some(mount) = self.mounts.get(&pair) else {
+                continue;
+            };
+            let Some(_taken) = mount.busy.try_take(&rel) else {
+                continue;
+            };
+            let Some(p) = self.state.pair(pair)? else {
+                continue;
+            };
+            let names: Vec<String> = rel
+                .iter()
+                .map(|n| n.to_string_lossy().into_owned())
+                .collect();
+            let (Some(root), Some(entry)) = (
+                drive::root_of(&self.state, &p),
+                self.state.entry_at(pair, p.root, &names)?,
+            ) else {
+                continue;
+            };
+            match drive::evict_synced(&root.join(&rel), &entry) {
+                Ok(true) => tracing::debug!(pair, path = %rel.display(), "evicted"),
+                Ok(false) => tracing::debug!(pair, path = %rel.display(), "edited since: kept"),
+                Err(e) => tracing::warn!(pair, path = %rel.display(), "not evicted: {e}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// A macOS drive's round: no scan, no plan (the system holds the local
+    /// side). The feed's states applied to its entries, the system told; its
+    /// domain removed (System Settings, by hand): stopped.
+    #[cfg(target_os = "macos")]
+    async fn provider_round(&mut self, p: &Pair) -> Result<(), EngineError> {
+        let domain = drive::provider::domain_of(p);
+        match theca_fileprovider::host::enabled(&domain) {
+            Ok(None) => {
+                let why = "the drive was removed from this Mac".to_owned();
+                self.stop(p, Stop::Folder(why))?;
+                return Ok(());
+            }
+            // Switched on: its folder is where the system put it (`add`
+            // guessed it while it was off).
+            Ok(Some(true)) => {
+                if let Ok(folder) = theca_fileprovider::host::folder(&domain)
+                    && folder != p.path
+                {
+                    self.state.set_pair_path(p.id, &folder, None)?;
+                }
+            }
+            Ok(Some(false)) => {}
+            Err(e) => tracing::warn!(pair = p.id, "the drive not checked: {e}"),
+        }
+        if p.position.is_none() && !self.resync(p).await? {
+            return Ok(());
+        }
+        if drive::provider::apply_remote(&self.state, p)?
+            && let Err(e) = theca_fileprovider::host::signal(&domain)
+        {
+            tracing::debug!(pair = p.id, "the system not told: {e}");
+        }
+        self.state.set_activity(p.id, "up to date", true)?;
+        Ok(())
+    }
+
+    /// Each running macOS drive served to the extension; the others not.
+    #[cfg(target_os = "macos")]
+    fn serve(&mut self, pairs: &[Pair], running: &HashSet<i64>) {
+        for p in pairs.iter().filter(|p| p.mode == Mode::Drive) {
+            let serve = running.contains(&p.id);
+            if serve && self.served.insert(p.id) {
+                self.provider.serve(
+                    p,
+                    self.client.clone(),
+                    self.provider_state.clone(),
+                    self.cancel.clone(),
+                );
+            } else if !serve && self.served.remove(&p.id) {
+                self.provider.forget(p);
+            }
+        }
+    }
+
+    /// macOS's drives kept under the drive limit, every minute: what the
+    /// system says is downloaded, not kept, least recently used first,
+    /// evicted by the system (it refuses an edit not uploaded, a file in use).
+    #[cfg(target_os = "macos")]
+    fn keep_under_limit(&mut self) -> Result<(), EngineError> {
+        let now = Instant::now();
+        if now < self.limit_at {
+            return Ok(());
+        }
+        self.limit_at = now + Duration::from_secs(60);
+        let limit = drive::limit(&self.state)?;
+        let mut files = Vec::new();
+        for p in self.pairs()?.into_iter().filter(|p| p.mode == Mode::Drive) {
+            let kept = self.state.kept(p.id)?;
+            let used = self.state.used(p.id)?;
+            for node in self.provider.materialized(&p) {
+                let Some(e) = self.state.entry(p.id, node)? else {
+                    continue;
+                };
+                if !e.is_file || drive::provider::kept_here(&self.state, &p, &e, &kept)? {
+                    continue;
+                }
+                files.push(drive::Downloaded {
+                    file: (drive::provider::domain_of(&p), node),
+                    size: u64::try_from(e.size).unwrap_or_default(),
+                    used: used.get(&node).copied().unwrap_or_default(),
+                    busy: false,
+                });
+            }
+        }
+        for (domain, node) in drive::evictions(files, limit) {
+            if let Err(e) = theca_fileprovider::host::evict(&domain, &node.to_string()) {
+                tracing::debug!(%node, "not evicted: {}", e.why);
+            }
+        }
+        Ok(())
+    }
+
+    /// No drive limit to keep elsewhere (no drives).
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+    fn keep_under_limit(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    /// A pair as its rounds see it: a FUSE drive's path is its backing
+    /// folder (its own folder is the mount, served from it).
+    fn local_side(&self, p: Pair) -> Pair {
+        #[cfg(target_os = "linux")]
+        if p.mode == Mode::Drive
+            && let Some(path) = drive::backing(&self.state, p.id)
+        {
+            return Pair { path, ..p };
+        }
+        p
     }
 
     /// A watcher and an open handle for each running pair; none for the others.
@@ -405,6 +685,10 @@ impl Follower {
         }
         self.watchers.retain(|p, _| running.contains(p));
         self.roots.retain(|p, _| running.contains(p));
+        #[cfg(any(target_os = "linux", windows))]
+        self.mount(&pairs, &running)?;
+        #[cfg(target_os = "macos")]
+        self.serve(&pairs, &running);
         for p in pairs.iter().filter(|p| running.contains(&p.id)) {
             if !self.roots.contains_key(&p.id)
                 && let Ok(file) = open_dir(&p.path)
@@ -573,6 +857,7 @@ impl Follower {
                 activity: String::new(),
                 error: None,
                 synced_at: None,
+                mode: Mode::Sync,
             })?;
             self.state.notify(
                 Some(self.account.id),
@@ -726,29 +1011,7 @@ impl Follower {
 
     /// A folder's tree, as remote states.
     async fn tree(&self, folder: Uuid) -> Result<Vec<(Uuid, Option<RemoteState>)>, Error> {
-        let mut lines = Box::pin(self.client.tree(folder).await?);
-        let mut ids: HashMap<String, Uuid> = HashMap::new();
-        let mut states = Vec::new();
-        while let Some(node) = lines.next().await {
-            let node = node?;
-            let (parent, name) = match node.path.rsplit_once('/') {
-                Some((up, name)) => (ids.get(up).copied().unwrap_or(folder), name.to_owned()),
-                None => (folder, node.path.clone()),
-            };
-            ids.insert(node.path.clone(), node.id);
-            states.push((
-                node.id,
-                Some(remote_state(
-                    parent,
-                    name,
-                    node.is_file,
-                    node.current_version,
-                    node.size,
-                    node.modified,
-                )),
-            ));
-        }
-        Ok(states)
+        tree(&self.client, folder).await
     }
 
     /// Rounds for the pairs that need one.
@@ -767,6 +1030,19 @@ impl Follower {
                 self.dirty.insert(p.id);
             }
         }
+        let seqs = self.state.seqs()?;
+        for p in self.pairs()? {
+            if self
+                .seqs
+                .get(&p.id)
+                .is_some_and(|seen| Some(seen) != seqs.get(&p.id))
+            {
+                self.dirty.insert(p.id);
+                #[cfg(any(target_os = "linux", windows))]
+                self.freeing.insert(p.id);
+            }
+        }
+        self.seqs = seqs;
         // A pair stopped for its folder resumes once the folder passes the
         // root check again: what a Resume by hand did.
         for p in self.pairs()? {
@@ -775,6 +1051,14 @@ impl Follower {
                 continue;
             }
             let here = local::root_id(&p.path);
+            // A FUSE drive: also what its own folder holds (emptied, it mounts).
+            #[cfg(target_os = "linux")]
+            let here = match (p.mode, self.state.pair(p.id)?) {
+                (Mode::Drive, Some(own)) => {
+                    Some(format!("{here:?} {:?}", drive::fuse::listing(&own.path)))
+                }
+                _ => here,
+            };
             if self.stopped_at.get(&p.id) == Some(&here) {
                 continue;
             }
@@ -804,7 +1088,7 @@ impl Follower {
             if *self.stopping.borrow() {
                 break;
             }
-            let Some(p) = self.state.pair(id)? else {
+            let Some(p) = self.state.pair(id)?.map(|p| self.local_side(p)) else {
                 continue;
             };
             if p.paused || p.stop.is_some() {
@@ -836,6 +1120,10 @@ impl Follower {
 
     async fn round(&mut self, p: &Pair) -> Result<(), EngineError> {
         tracing::debug!(pair = p.id, "round");
+        #[cfg(target_os = "macos")]
+        if p.mode == Mode::Drive {
+            return self.provider_round(p).await;
+        }
         let p = match self.root(p).await? {
             Ok(p) => p,
             Err(why) => {
@@ -850,26 +1138,39 @@ impl Follower {
         self.state.set_activity(p.id, "syncing", false)?;
         let base = self.state.entries(p.id)?;
         let remote = self.state.remote(p.id)?;
+        let drive = p.mode == Mode::Drive;
+        let kept = if drive {
+            self.state.kept(p.id)?
+        } else {
+            HashSet::new()
+        };
         let path = p.path.clone();
         // An ignored folder is scanned only where the server has something.
         let known = crate::plan::known_paths(p.root, &base, &remote);
-        let mut scan =
-            match tokio::task::spawn_blocking(move || local::scan_entering(&path, &known)).await {
-                Ok(Ok(scan)) => scan,
-                _ => {
-                    // Renamed or removed during this round: the root check says
-                    // which (followed, or stopped as missing); the next round
-                    // runs from there. Unreadable where it is: stopped as such.
-                    match self.root(&p).await? {
-                        Ok(now) if now.path != p.path => {
-                            self.dirty.insert(p.id);
-                        }
-                        Ok(_) => self.stop(&p, Stop::Folder("the folder can't be read".into()))?,
-                        Err(why) => self.stop(&p, Stop::Folder(why))?,
+        let mut scan = match tokio::task::spawn_blocking(move || {
+            if drive {
+                crate::drive::scan(&path, &known)
+            } else {
+                local::scan_entering(&path, &known)
+            }
+        })
+        .await
+        {
+            Ok(Ok(scan)) => scan,
+            _ => {
+                // Renamed or removed during this round: the root check says
+                // which (followed, or stopped as missing); the next round
+                // runs from there. Unreadable where it is: stopped as such.
+                match self.root(&p).await? {
+                    Ok(now) if now.path != p.path => {
+                        self.dirty.insert(p.id);
                     }
-                    return Ok(());
+                    Ok(_) => self.stop(&p, Stop::Folder("the folder can't be read".into()))?,
+                    Err(why) => self.stop(&p, Stop::Folder(why))?,
                 }
-            };
+                return Ok(());
+            }
+        };
         let real = p.path.canonicalize().unwrap_or_else(|_| p.path.clone());
         self.skipped
             .lock()
@@ -888,6 +1189,8 @@ impl Follower {
                 scan,
                 remote: &remote,
                 writable: p.writable,
+                drive,
+                kept: &kept,
             })
         };
         let mut plan = planned(&scan);
@@ -920,7 +1223,12 @@ impl Follower {
         } else {
             self.deletions_held.remove(&p.id);
         }
+        #[cfg(any(target_os = "linux", windows))]
+        let busy = self.mounts.get(&p.id).map(|m| &m.busy);
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let busy = None;
         let outcome = Executor::new(&self.client, &self.state, &p, &self.cancel, &self.stopping)?
+            .with_busy(busy)
             .run(plan, &scan)
             .await?;
         let recent = self.recent.entry(p.id).or_default();
@@ -958,6 +1266,24 @@ impl Follower {
     /// device number if its files vouch for it; otherwise why not (the caller
     /// stops the pair, or leaves a stopped one as it is).
     async fn root(&mut self, p: &Pair) -> Result<Result<Pair, String>, StateError> {
+        // A FUSE drive not mounted: its own folder must be bare.
+        #[cfg(target_os = "linux")]
+        if p.mode == Mode::Drive
+            && !self.mounts.contains_key(&p.id)
+            && let Some(folder) = self.state.pair(p.id)?.map(|p| p.path)
+            && let Err(why) = drive::fuse::bare(&folder)
+        {
+            return Ok(Err(why));
+        }
+        // A Windows drive whose sync root was unregistered (an uninstall, by
+        // hand): every placeholder would read as deleted.
+        #[cfg(windows)]
+        if p.mode == Mode::Drive && !drive::cloud::registered(p) {
+            return Ok(Err(format!(
+                "{} isn't a drive for Windows anymore (its sync root was removed)",
+                p.path.display()
+            )));
+        }
         let here = local::root_id(&p.path);
         let same = match (&here, &p.root_file_id) {
             (Some(here), Some(known)) => here == known,
@@ -966,6 +1292,19 @@ impl Follower {
         };
         if same && p.path.is_dir() {
             return Ok(Ok(p.clone()));
+        }
+        // A FUSE drive's backing folder is Theca's own, a Windows drive's
+        // folder its sync root: never followed.
+        #[cfg(target_os = "linux")]
+        if p.mode == Mode::Drive {
+            return Ok(Err(format!(
+                "its files kept by Theca ({}) are missing or replaced",
+                p.path.display()
+            )));
+        }
+        #[cfg(windows)]
+        if p.mode == Mode::Drive {
+            return Ok(Err(format!("{} is missing or replaced", p.path.display())));
         }
         tracing::debug!(pair = p.id, path = %p.path.display(), ?here, known = ?p.root_file_id,
             held = ?self.roots.get(&p.id).map(filepath::FilePath::path), "root changed");
@@ -1050,6 +1389,36 @@ impl Follower {
         self.state.record_remote(p.id, &states, Some(position))?;
         Ok(true)
     }
+}
+
+/// A folder's whole tree on the server, as remote states (a resync's listing).
+pub async fn tree(
+    client: &Client,
+    folder: Uuid,
+) -> Result<Vec<(Uuid, Option<RemoteState>)>, Error> {
+    let mut lines = Box::pin(client.tree(folder).await?);
+    let mut ids: HashMap<String, Uuid> = HashMap::new();
+    let mut states = Vec::new();
+    while let Some(node) = lines.next().await {
+        let node = node?;
+        let (parent, name) = match node.path.rsplit_once('/') {
+            Some((up, name)) => (ids.get(up).copied().unwrap_or(folder), name.to_owned()),
+            None => (folder, node.path.clone()),
+        };
+        ids.insert(node.path.clone(), node.id);
+        states.push((
+            node.id,
+            Some(remote_state(
+                parent,
+                name,
+                node.is_file,
+                node.current_version,
+                node.size,
+                node.modified,
+            )),
+        ));
+    }
+    Ok(states)
 }
 
 /// When each pair's watcher last reported a change.

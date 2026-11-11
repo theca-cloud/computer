@@ -18,6 +18,7 @@ use theca_common::api;
 use theca_common::name::Name;
 use uuid::Uuid;
 
+use crate::drive::busy::{Busy, Taken};
 use crate::local::{self, PART_SUFFIX, Scan};
 use crate::plan::{Action, Level, Parent, Plan, UploadTo};
 use crate::state::{Entry, Pair, RemoteState, State};
@@ -65,6 +66,8 @@ pub struct Executor<'a> {
     waiting: Vec<(Uuid, Uuid, String)>,
     /// A node moved out of the way of a swap, where it is meanwhile.
     stepped_aside: HashMap<Uuid, PathBuf>,
+    /// A mounted drive's: what its file system is serving.
+    busy: Option<&'a Busy>,
     outcome: Outcome,
 }
 
@@ -93,8 +96,32 @@ impl<'a> Executor<'a> {
             moving: HashSet::new(),
             waiting: Vec::new(),
             stepped_aside: HashMap::new(),
+            busy: None,
             outcome: Outcome::default(),
         })
+    }
+
+    /// A mounted drive's: its rounds leave alone what its file system serves.
+    pub fn with_busy(mut self, busy: Option<&'a Busy>) -> Self {
+        self.busy = busy;
+        self
+    }
+
+    /// A drive's file taken for an action on it (`Ok(None)`: not a mounted
+    /// drive's). `Err`: open or fetched through the mount, or below a folder
+    /// that is: skipped, the next round does it.
+    fn take(&mut self, path: &Path) -> Result<Option<Taken>, ()> {
+        let Some(busy) = self.busy else {
+            return Ok(None);
+        };
+        let rel = path.strip_prefix(&self.pair.path).unwrap_or(path);
+        match busy.try_take(rel) {
+            Some(taken) => Ok(Some(taken)),
+            None => {
+                self.outcome.again = true;
+                Err(())
+            }
+        }
     }
 
     /// A node's base entries from the root down to it (none for the root).
@@ -439,6 +466,18 @@ impl<'a> Executor<'a> {
     }
 
     async fn one(&mut self, action: Action) -> crate::state::Result<()> {
+        // What changes a drive's file, or a folder holding it, waits while the
+        // mount serves it.
+        let acted_on = match &action {
+            Action::LocalMove { node, .. }
+            | Action::KeepAside { node }
+            | Action::LocalDelete { node }
+            | Action::Placeholder { node, .. } => self.path(*node),
+            _ => None,
+        };
+        let Ok(_taken) = acted_on.map_or(Ok(None), |path| self.take(&path)) else {
+            return Ok(());
+        };
         match action {
             Action::Adopt { node, path, state } => {
                 // A folder, or a read-only library's file as downloaded.
@@ -636,6 +675,33 @@ impl<'a> Executor<'a> {
             | Action::Merge { .. }
             | Action::Download { .. }
             | Action::RemoteTrash { .. } => unreachable!("batched"),
+            #[cfg(any(target_os = "linux", windows))]
+            Action::Placeholder {
+                node,
+                parent,
+                name,
+                state,
+            } => {
+                let Some(sink) = self.landing(node, parent, name, &state) else {
+                    return Ok(());
+                };
+                let size = u64::try_from(state.size).unwrap_or_default();
+                match sink.placeholder(size) {
+                    Ok(()) => {
+                        if let Some(e) = sink.done.lock().ok().and_then(|d| d.clone()) {
+                            self.base.insert(e.node, e);
+                        }
+                    }
+                    // Changed locally meanwhile: the local edit wins, next round.
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        self.outcome.again = true;
+                    }
+                    Err(e) => self.fail(&sink.target.to_string_lossy(), &Error::Io(e)),
+                }
+            }
+            // macOS has no plan: no other pair is a drive.
+            #[cfg(not(any(target_os = "linux", windows)))]
+            Action::Placeholder { .. } => unreachable!("no drive here"),
         }
         Ok(())
     }
@@ -666,6 +732,20 @@ impl<'a> Executor<'a> {
                         (path, target, (p, name), None, false)
                     }
                     UploadTo::Version { node, base } => {
+                        // A drive's file fetched since this round read its
+                        // base (fetches land beside rounds): no edit.
+                        if self.pair.mode == crate::state::Mode::Drive
+                            && let Some(now) = self.state.entry(self.pair.id, node)?
+                            && local::unchanged(
+                                &self.local(&path),
+                                now.size,
+                                now.mtime,
+                                now.file_id.as_deref(),
+                            )
+                        {
+                            self.base.insert(node, now);
+                            continue;
+                        }
                         let Some(e) = self.base.get(&node) else {
                             continue;
                         };
@@ -806,6 +886,114 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
+    /// Where a remote file's version lands, and what it records: its sink.
+    /// None: it doesn't land this round (its local move refused, something
+    /// else local has its name).
+    fn landing(
+        &self,
+        node: Uuid,
+        parent: Uuid,
+        name: String,
+        state: &RemoteState,
+    ) -> Option<SyncSink<'a>> {
+        if self.unmoved.contains(&node) {
+            return None;
+        }
+        let mut names = self.names(parent)?;
+        // Where it is locally now (a known node), else where it goes: in
+        // its folder found by file ID too.
+        let target = match self.base.get(&node) {
+            Some(_) => self.path(node),
+            None => self.path(parent).map(|folder| folder.join(&name)),
+        }
+        .unwrap_or_else(|| {
+            names.push(name.clone());
+            self.local(&names)
+        });
+        let expected = self
+            .base
+            .get(&node)
+            .filter(|e| e.is_file)
+            .map(|e| (e.size, e.mtime, e.file_id.clone()));
+        // A new file where something local already has the name: never
+        // replaced, so not fetched either (it would be, every few seconds).
+        // A drive's placeholder holds nothing: replaced.
+        if expected.is_none()
+            && target.symlink_metadata().is_ok()
+            && !is_placeholder(self.pair, &target)
+        {
+            let below = target.strip_prefix(&self.pair.path).unwrap_or(&target);
+            let display: Vec<_> = below.iter().map(|n| n.to_string_lossy()).collect();
+            self.report(
+                &display.join("/"),
+                "not downloaded: something local has this name",
+                Level::Error,
+            );
+            return None;
+        }
+        let place = self.base.get(&node).map(|e| (e.parent, e.name.clone()));
+        // Where the server has it now, unless the base has it elsewhere (a
+        // remote move not done locally yet): then its state stays pending.
+        let settle = place
+            .as_ref()
+            .is_none_or(|(p, n)| *p == state.parent && *n == state.name);
+        let (parent, name) = place.unwrap_or((parent, name));
+        let path = self.names(parent).map(|mut n| {
+            n.push(name.clone());
+            n.join("/")
+        });
+        let entry = Entry {
+            node,
+            parent,
+            name,
+            is_file: true,
+            version: state.version,
+            size: 0,
+            mtime: 0,
+            file_id: None,
+        };
+        let record = Record {
+            state: self.state,
+            pair: self.pair.id,
+            entry,
+            path,
+            settle,
+        };
+        Some(SyncSink::new(
+            self.pair,
+            record,
+            &target,
+            expected,
+            state.modified,
+        ))
+    }
+
+    /// A Windows drive's placeholder downloaded in place: brought to the
+    /// version first if it changed (recorded), then hydrated (Windows asks
+    /// this process for the data, as for an open; never taken here, or that
+    /// fetch would wait for it).
+    #[cfg(windows)]
+    async fn hydrate(&mut self, sink: SyncSink<'a>, state: &RemoteState) {
+        let target = sink.target.clone();
+        let current = self.base.get(&sink.record.entry.node).map(|e| e.version);
+        if current != Some(state.version) {
+            let size = u64::try_from(state.size).unwrap_or_default();
+            if let Err(e) = sink.placeholder(size) {
+                self.fail(&target.to_string_lossy(), &Error::Io(e));
+                return;
+            }
+            if let Some(e) = sink.done.lock().ok().and_then(|d| d.clone()) {
+                self.base.insert(e.node, e);
+            }
+        }
+        let path = target.clone();
+        match tokio::task::spawn_blocking(move || crate::drive::cloud::hydrate(&path)).await {
+            Ok(Ok(())) => self.outcome.downloaded += 1,
+            Ok(Err(e)) => self.fail(&target.to_string_lossy(), &Error::Io(e)),
+            Err(_) => self.outcome.again = true,
+        }
+    }
+
     async fn downloads(&mut self, actions: Vec<Action>) -> crate::state::Result<()> {
         if actions.is_empty() {
             return Ok(());
@@ -821,80 +1009,32 @@ impl<'a> Executor<'a> {
             else {
                 continue;
             };
-            if self.unmoved.contains(&node) {
-                continue;
-            }
-            let Some(mut names) = self.names(parent) else {
+            let Some(sink) = self.landing(node, parent, name, &state) else {
                 continue;
             };
-            // Where it is locally now (a known node), else where it goes: in
-            // its folder found by file ID too.
-            let target = match self.base.get(&node) {
-                Some(_) => self.path(node),
-                None => self.path(parent).map(|folder| folder.join(&name)),
-            }
-            .unwrap_or_else(|| {
-                names.push(name.clone());
-                self.local(&names)
-            });
-            let expected = self
-                .base
-                .get(&node)
-                .filter(|e| e.is_file)
-                .map(|e| (e.size, e.mtime, e.file_id.clone()));
-            // A new file where something local already has the name: never
-            // replaced, so not fetched either (it would be, every few seconds).
-            if expected.is_none() && target.symlink_metadata().is_ok() {
-                let below = target.strip_prefix(&self.pair.path).unwrap_or(&target);
-                let display: Vec<_> = below.iter().map(|n| n.to_string_lossy()).collect();
-                self.report(
-                    &display.join("/"),
-                    "not downloaded: something local has this name",
-                    Level::Error,
-                );
+            // A Windows drive's placeholder (kept): hydrated in place, so it
+            // stays one Windows can free later.
+            #[cfg(windows)]
+            if self.pair.mode == crate::state::Mode::Drive
+                && crate::drive::cloud::is_placeholder(&sink.target)
+            {
+                self.hydrate(sink, &state).await;
                 continue;
             }
-            let place = self.base.get(&node).map(|e| (e.parent, e.name.clone()));
-            // Where the server has it now, unless the base has it elsewhere (a
-            // remote move not done locally yet): then its state stays pending.
-            let settle = place
-                .as_ref()
-                .is_none_or(|(p, n)| *p == state.parent && *n == state.name);
-            let (parent, name) = place.unwrap_or((parent, name));
-            let path = self.names(parent).map(|mut n| {
-                n.push(name.clone());
-                n.join("/")
-            });
-            let entry = Entry {
-                node,
-                parent,
-                name,
-                is_file: true,
-                version: state.version,
-                size: 0,
-                mtime: 0,
-                file_id: None,
-            };
-            let record = Record {
-                state: self.state,
-                pair: self.pair.id,
-                entry,
-                path,
-                settle,
-            };
-            let sink = SyncSink::new(self.pair, record, &target, expected, state.modified);
-            jobs.push((sink, node, state));
+            if let Ok(taken) = self.take(&sink.target.clone()) {
+                jobs.push((sink, node, state, taken));
+            }
         }
         let options = DownloadOptions::default();
         let cancel = self.cancel;
         let (downloader, run) = Downloader::new(self.client, &options, cancel, |_| {});
         let fetched: Vec<_> = jobs
             .iter()
-            .map(|(sink, node, state)| downloader.submit(*node, state.version, sink))
+            .map(|(sink, node, state, _)| downloader.submit(*node, state.version, sink))
             .collect();
         drop(downloader);
         let (_, results) = futures::join!(run, futures::future::join_all(fetched));
-        for (result, (sink, _, _)) in results.into_iter().zip(jobs) {
+        for (result, (sink, _, _, _)) in results.into_iter().zip(jobs) {
             let display = sink.target.to_string_lossy().into_owned();
             match result {
                 // Recorded by the sink as it landed.
@@ -953,6 +1093,54 @@ impl<'a> Executor<'a> {
             }
         }
         Ok(())
+    }
+}
+
+/// A drive's file fetched now, beside rounds (opened through the mount as a
+/// placeholder): its entry's version lands as a download does, only over
+/// the placeholder, its mtime kept, and is recorded. The caller holds the
+/// file (`Busy`), so no round acts on it meanwhile.
+pub async fn fetch(
+    client: &Client,
+    state: &State,
+    pair: &Pair,
+    entry: Entry,
+    target: &Path,
+    cancel: &Cancel,
+) -> Result<Entry, Error> {
+    let expected = Some((entry.size, entry.mtime, entry.file_id.clone()));
+    let modified = Some(DateTime::<Utc>::from_timestamp_nanos(entry.mtime));
+    let (node, version) = (entry.node, entry.version);
+    let record = Record {
+        state,
+        pair: pair.id,
+        entry,
+        path: None,
+        settle: false,
+    };
+    let sink = SyncSink::new(pair, record, target, expected, modified);
+    let options = DownloadOptions::default();
+    let (downloader, run) = Downloader::new(client, &options, cancel, |_| {});
+    let fetched = downloader.submit(node, version, &sink);
+    drop(downloader);
+    let (_, result) = futures::join!(run, fetched);
+    result?;
+    sink.done
+        .lock()
+        .ok()
+        .and_then(|d| d.clone())
+        .ok_or_else(|| Error::Io(io::Error::other("fetched, not recorded")))
+}
+
+/// A drive's placeholder, which holds nothing to lose (Linux; Windows' come
+/// with its drive).
+fn is_placeholder(pair: &Pair, path: &Path) -> bool {
+    #[cfg(any(target_os = "linux", windows))]
+    return pair.mode == crate::state::Mode::Drive && crate::drive::is_placeholder(path);
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = (pair, path);
+        false
     }
 }
 
@@ -1082,10 +1270,10 @@ impl<'a> SyncSink<'a> {
                 "changed locally during the download",
             )
         };
-        let Some((size, mtime, id)) = &self.expected else {
-            // A new file: nothing may be replaced.
+        // A new file: nothing may be replaced, but a drive's placeholder.
+        if self.expected.is_none() && !is_placeholder(&self.pair, &self.target) {
             return local::rename_new(&self.part, &self.target).map_err(|_| changed());
-        };
+        }
         let aside = aside(&self.target);
         match local::rename_new(&self.target, &aside) {
             Ok(()) => {}
@@ -1099,7 +1287,11 @@ impl<'a> SyncSink<'a> {
         if let Some(meanwhile) = &self.meanwhile {
             meanwhile();
         }
-        if !local::unchanged(&aside, *size, *mtime, id.as_deref()) {
+        let unchanged = is_placeholder(&self.pair, &aside)
+            || self.expected.as_ref().is_some_and(|(size, mtime, id)| {
+                local::unchanged(&aside, *size, *mtime, id.as_deref())
+            });
+        if !unchanged {
             // Back where it was (unless a save took the name meanwhile: then
             // both stay, the old one as a `(local)` copy).
             let _ = local::rename_new(&aside, &self.target);
@@ -1122,6 +1314,66 @@ impl<'a> SyncSink<'a> {
                 Err(e)
             }
         }
+    }
+}
+
+impl SyncSink<'_> {
+    /// What landed recorded: its entry, its path's notices cleared, its
+    /// remote state settled.
+    fn recorded(&self, entry: Entry) -> io::Result<()> {
+        let r = &self.record;
+        let settled = if r.settle { &[entry.node][..] } else { &[] };
+        r.state
+            .synced(r.pair, &entry, r.path.as_deref(), settled)
+            .map_err(io::Error::other)?;
+        crate::crash_point("downloaded");
+        *self.done.lock().map_err(|_| io::Error::other("poisoned"))? = Some(entry);
+        Ok(())
+    }
+
+    /// A placeholder of the version, its content left on the server (a
+    /// Windows drive): over a downloaded file only if it holds the base's
+    /// content (an eviction), over a placeholder whatever (it holds nothing);
+    /// recorded as a download is.
+    #[cfg(windows)]
+    fn placeholder(&self, size: u64) -> io::Result<()> {
+        use crate::drive::cloud;
+        if self.target.symlink_metadata().is_ok() && !cloud::is_placeholder(&self.target) {
+            let unchanged = self
+                .expected
+                .as_ref()
+                .is_some_and(|(s, m, id)| local::unchanged(&self.target, *s, *m, id.as_deref()));
+            if !unchanged {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "changed locally since it was synced",
+                ));
+            }
+        }
+        if let Some(dir) = self.target.parent() {
+            create_in(&self.pair, dir)?;
+        }
+        let modified = self.modified.map(SystemTime::from);
+        cloud::placeholder(&self.target, self.record.entry.node, size, modified)?;
+        let meta = std::fs::metadata(&self.target)?;
+        let mut entry = self.record.entry.clone();
+        entry.size = meta.len() as i64;
+        entry.mtime = local::mtime(&meta);
+        entry.file_id = local::file_id(&self.target);
+        self.recorded(entry)
+    }
+
+    /// A placeholder of the version, its content left on the server (a
+    /// drive): landed and recorded as a download is.
+    #[cfg(target_os = "linux")]
+    fn placeholder(&self, size: u64) -> io::Result<()> {
+        if let Some(dir) = self.part.parent() {
+            create_in(&self.pair, dir)?;
+        }
+        let file = std::fs::File::create_new(&self.part)?;
+        crate::drive::placeholder::write(&file, size)?;
+        *self.file.lock().map_err(|_| io::Error::other("poisoned"))? = Some(file);
+        self.finish()
     }
 }
 
@@ -1179,14 +1431,7 @@ impl Sink for SyncSink<'_> {
             std::fs::File::open(dir)?.sync_all()?;
         }
         crate::crash_point("downloaded-unrecorded");
-        let r = &self.record;
-        let settled = if r.settle { &[entry.node][..] } else { &[] };
-        r.state
-            .synced(r.pair, &entry, r.path.as_deref(), settled)
-            .map_err(io::Error::other)?;
-        crate::crash_point("downloaded");
-        *self.done.lock().map_err(|_| io::Error::other("poisoned"))? = Some(entry);
-        Ok(())
+        self.recorded(entry)
     }
 
     fn abort(&self) {
@@ -1257,6 +1502,7 @@ mod tests {
             activity: String::new(),
             error: None,
             synced_at: None,
+            mode: crate::state::Mode::Sync,
         }
     }
 
@@ -1355,6 +1601,91 @@ mod tests {
                 "atomic: {atomic}, {contents:?}"
             );
         }
+    }
+
+    /// A drive's pair (Linux: placeholders in its folder).
+    #[cfg(target_os = "linux")]
+    fn drive(path: &Path) -> Pair {
+        Pair {
+            mode: crate::state::Mode::Drive,
+            ..pair(path)
+        }
+    }
+
+    /// The fingerprint a sink expects of the file at `path`.
+    #[cfg(target_os = "linux")]
+    fn fingerprint(path: &Path) -> (i64, i64, Option<String>) {
+        let meta = std::fs::metadata(path).unwrap();
+        (meta.len() as i64, local::mtime(&meta), local::file_id(path))
+    }
+
+    /// A drive's placeholder lands as a download does, and records its
+    /// fingerprint: its size, no data, marked. Over the base's content (an
+    /// eviction for a remote change) it replaces it; over an edit, the edit
+    /// stays.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_placeholder_lands_only_over_what_was_synced() {
+        use crate::drive::placeholder;
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::memory().unwrap();
+        let p = drive(dir.path());
+        let new = dir.path().join("new.bin");
+        let sink = SyncSink::new(&p, record(&state), &new, None, None);
+        sink.placeholder(7_000).unwrap();
+        assert!(placeholder::is(&new));
+        assert_eq!(std::fs::metadata(&new).unwrap().len(), 7_000);
+        let e = sink.done.lock().unwrap().clone().unwrap();
+        assert_eq!((e.size, e.file_id), (7_000, local::file_id(&new)));
+
+        for edited in [false, true] {
+            let target = dir.path().join("x.txt");
+            std::fs::write(&target, "synced").unwrap();
+            let expected = fingerprint(&target);
+            if edited {
+                std::fs::write(&target, "edited, longer").unwrap();
+            }
+            let sink = SyncSink::new(&p, record(&state), &target, Some(expected), None);
+            let landed = sink.placeholder(20);
+            assert_eq!(landed.is_ok(), !edited, "edited: {edited}");
+            assert_eq!(placeholder::is(&target), !edited);
+            if edited {
+                assert_eq!(std::fs::read_to_string(&target).unwrap(), "edited, longer");
+            }
+            std::fs::remove_file(&target).unwrap();
+        }
+    }
+
+    /// Over a drive's placeholder nothing is checked, as it holds nothing: a
+    /// download replaces one whose fingerprint isn't the base's (an eviction
+    /// interrupted), or one no entry knows (a crash before its record); a
+    /// plain file no entry knows stays.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_placeholder_is_replaced_unchecked() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::memory().unwrap();
+        let p = drive(dir.path());
+        let target = dir.path().join("x.bin");
+        let sink = SyncSink::new(&p, record(&state), &target, None, None);
+        sink.placeholder(10).unwrap();
+        let mut stale = fingerprint(&target);
+        stale.1 += 1;
+        for expected in [Some(stale), None] {
+            let sink = SyncSink::new(&p, record(&state), &target, expected, None);
+            sink.write_at(0, b"downloaded").unwrap();
+            sink.finish().unwrap();
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "downloaded");
+            assert!(!crate::drive::placeholder::is(&target));
+            std::fs::remove_file(&target).unwrap();
+            let sink = SyncSink::new(&p, record(&state), &target, None, None);
+            sink.placeholder(10).unwrap();
+        }
+        let plain = dir.path().join("plain.txt");
+        std::fs::write(&plain, "mine").unwrap();
+        let sink = SyncSink::new(&p, record(&state), &plain, None, None);
+        assert!(sink.placeholder(10).is_err());
+        assert_eq!(std::fs::read_to_string(&plain).unwrap(), "mine");
     }
 
     /// A download replaces the base's file, and only it: a file edited
