@@ -3,7 +3,10 @@
 
 mod common;
 
+use std::sync::{Arc, Mutex};
+
 use common::*;
+use theca::state::NewLibraries;
 use theca::state::Stop;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -343,19 +346,23 @@ async fn library_trashed_and_device_signed_out() {
     .await;
 }
 
-/// A new library under the account's limit is synced into the default
-/// folder by itself; a bigger one is only offered. One removed is declined:
-/// never synced again by itself, and no folder made for it.
+/// `sync`: a library new to the account under its limit is synced into the
+/// default folder by itself; a bigger one is only listed. One removed stays
+/// seen: never synced again by itself, and no folder made for it.
 #[tokio::test(flavor = "multi_thread")]
 async fn small_new_libraries_sync_by_themselves() {
     let w = world().await;
-    // Full before the device sees it (an empty library is small).
+    let mut a = w.device("a").await;
+    a.stop().await;
+    a.state()
+        .set_new_libraries(a.account.id, NewLibraries::Sync)
+        .unwrap();
+    a.state().set_auto_sync_limit(a.account.id, 1024).unwrap();
+    // New to it, and full before its engine sees it (an empty library is
+    // small).
     let big = w.admin.create_library(w.organization, "Big").await.unwrap();
     w.upload(&big, "big.bin", &[7; 2048]).await;
-    let a = w.device("a").await;
-    a.state()
-        .set_auto_sync_limit(a.account.id, Some(1024))
-        .unwrap();
+    a.restart();
     w.converge(&[&a]).await;
     let small = w
         .admin
@@ -429,8 +436,9 @@ async fn clashing_names_get_their_organization() {
     let w = world().await;
     let a = w.device("a").await;
     a.state()
-        .set_auto_sync_limit(a.account.id, Some(1024))
+        .set_new_libraries(a.account.id, NewLibraries::Sync)
         .unwrap();
+    a.state().set_auto_sync_limit(a.account.id, 1024).unwrap();
     w.converge(&[&a]).await;
     let beta: serde_json::Value = w
         .admin
@@ -976,4 +984,183 @@ async fn an_ignore_file_s_bad_line_is_said() {
     a.write("marker.txt", "a's round ran");
     marked(&w, "marker.txt").await;
     assert!(!w.remote(&w.library).await.contains_key("a.log"));
+}
+
+/// The libraries announced as new (`Update::NewLibrary`: the window's OS
+/// notification), by name, as the engine publishes them.
+fn announced(d: &Device) -> Arc<Mutex<Vec<String>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut updates = d.handle.updates.subscribe();
+    let names = seen.clone();
+    tokio::spawn(async move {
+        while let Ok(update) = updates.recv().await {
+            if let theca::state::Update::NewLibrary { name, .. } = update {
+                names.lock().unwrap().push(name);
+            }
+        }
+    });
+    seen
+}
+
+/// `notify`: a library new to the account is listed and announced once,
+/// not again after a restart; one there at login never is. `silent`: listed
+/// only. `sync`: 0 is no limit; above the limit, announced.
+#[tokio::test(flavor = "multi_thread")]
+async fn new_libraries_follow_the_account() {
+    let w = world().await;
+    // There before the login: never new.
+    let before = w
+        .admin
+        .create_library(w.organization, "Before")
+        .await
+        .unwrap();
+    let mut a = w.device("a").await;
+    let state = a.state();
+    state
+        .set_new_libraries(a.account.id, NewLibraries::Notify)
+        .unwrap();
+    let said = announced(&a);
+    a.handle.wake();
+    let notified = w
+        .admin
+        .create_library(w.organization, "Notified")
+        .await
+        .unwrap();
+    // The list is the engine's at once, the announcement a channel's
+    // message: both waited for, then a moment for one too many.
+    eventually("Notified listed and announced", || async {
+        a.offered().contains(&notified.id) && !said.lock().unwrap().is_empty()
+    })
+    .await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    assert!(a.offered().contains(&before.id), "Before listed too");
+    let announced_now = said.lock().unwrap().clone();
+    assert_eq!(announced_now, ["Notified"], "once, Before never");
+    // A restart, still `notify`: listed again, never announced again.
+    a.stop().await;
+    a.restart();
+    let said = announced(&a);
+    eventually("Notified listed again", || async {
+        a.offered().contains(&notified.id)
+    })
+    .await;
+    // Time for an announcement, if one were coming.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(
+        said.lock().unwrap().is_empty(),
+        "{:?}",
+        said.lock().unwrap()
+    );
+    state
+        .set_new_libraries(a.account.id, NewLibraries::Silent)
+        .unwrap();
+    let quiet = w
+        .admin
+        .create_library(w.organization, "Quiet")
+        .await
+        .unwrap();
+    eventually("Quiet listed", || async {
+        a.offered().contains(&quiet.id) && a.offered().contains(&notified.id)
+    })
+    .await;
+    assert!(
+        said.lock().unwrap().is_empty(),
+        "{:?}",
+        said.lock().unwrap()
+    );
+
+    // `sync`, no limit: a big library syncs; with one, a bigger one is
+    // announced, listed.
+    state
+        .set_new_libraries(a.account.id, NewLibraries::Sync)
+        .unwrap();
+    state.set_auto_sync_limit(a.account.id, 0).unwrap();
+    a.stop().await;
+    let big = w.admin.create_library(w.organization, "Big").await.unwrap();
+    w.upload(&big, "big.bin", &[7; 4096]).await;
+    a.restart();
+    eventually("Big synced", || async {
+        state.pairs().unwrap().iter().any(|p| p.library == big.id)
+    })
+    .await;
+    state.set_auto_sync_limit(a.account.id, 1024).unwrap();
+    a.stop().await;
+    let bigger = w
+        .admin
+        .create_library(w.organization, "Bigger")
+        .await
+        .unwrap();
+    w.upload(&bigger, "big.bin", &[7; 4096]).await;
+    a.restart();
+    let said = announced(&a);
+    eventually("Bigger listed and announced", || async {
+        a.offered().contains(&bigger.id) && said.lock().unwrap().contains(&"Bigger".to_owned())
+    })
+    .await;
+    assert!(
+        !state
+            .pairs()
+            .unwrap()
+            .iter()
+            .any(|p| p.library == bigger.id)
+    );
+    for l in [&before, &notified, &quiet] {
+        assert!(
+            !state.pairs().unwrap().iter().any(|p| p.library == l.id),
+            "{}",
+            l.name
+        );
+    }
+    a.stop().await;
+}
+
+/// `drive`: a library new to the account becomes a drive; where one can't
+/// be (no FUSE: the CI image), an error notice names it and why, and nothing
+/// is synced instead.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_library_becomes_a_drive() {
+    let w = world().await;
+    let mut a = w.device("a").await;
+    let state = a.state();
+    state
+        .set_new_libraries(a.account.id, NewLibraries::Drive)
+        .unwrap();
+    a.handle.wake();
+    let photos = w
+        .admin
+        .create_library(w.organization, "Photos")
+        .await
+        .unwrap();
+    match theca::drive::unavailable() {
+        None => {
+            eventually("Photos a drive", || async {
+                state
+                    .pairs()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p.library == photos.id && p.mode == theca::state::Mode::Drive)
+            })
+            .await;
+        }
+        Some(why) => {
+            eventually("an error notice", || async {
+                a.notices()
+                    .iter()
+                    .any(|n| n.contains("Photos not added as a drive") && n.contains(&why))
+            })
+            .await;
+            assert!(a.offered().contains(&photos.id));
+            assert!(
+                !state
+                    .pairs()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p.library == photos.id)
+            );
+        }
+    }
+    // Stopped before its folder goes: a mount's own engine can't serve its
+    // removal.
+    a.stop().await;
 }

@@ -6,6 +6,7 @@
 
 pub mod log_file;
 pub mod protocol;
+pub mod staged;
 
 #[cfg(target_os = "macos")]
 mod ext;

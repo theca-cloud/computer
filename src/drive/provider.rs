@@ -110,8 +110,17 @@ impl Provider {
         async move {
             tracing::debug!(?request, "asked");
             let reply = self.answer_in(request).await;
-            if let Reply::Error { code, message } = &reply {
-                tracing::warn!(?code, "refused: {message}");
+            // No such item is an answer the system expects (its trash, an
+            // item gone): only at debug.
+            match &reply {
+                Reply::Error {
+                    code: Code::NoSuchItem,
+                    message,
+                } => {
+                    tracing::debug!("no such item: {message}")
+                }
+                Reply::Error { code, message } => tracing::warn!(?code, "refused: {message}"),
+                _ => {}
             }
             reply
         }
@@ -146,7 +155,37 @@ impl Provider {
             lock(&self.materialized).insert(domain_of(&pair), ids);
             return Reply::Done;
         }
-        answered.answer(request).await
+        let freed = match &request {
+            Request::Free { ids, .. } => ids.clone(),
+            _ => Vec::new(),
+        };
+        let reply = answered.answer(request).await;
+        // Finder's Free Up Space: not kept anymore (answered), then evicted
+        // as `theca free` does, on a thread of its own (the system re-reads
+        // the items first, and the extension waits for no eviction).
+        #[cfg(target_os = "macos")]
+        if reply == Reply::Done && !freed.is_empty() {
+            let (state, pair) = (state.clone(), pair.clone());
+            let span = tracing::Span::current();
+            std::thread::spawn(move || {
+                let _in = span.enter();
+                for id in freed {
+                    let Some(entry) = id
+                        .parse()
+                        .ok()
+                        .and_then(|n| state.entry(pair.id, n).ok().flatten())
+                    else {
+                        continue;
+                    };
+                    if let Err(e) = crate::ops::free_on_mac(&state, &pair, entry) {
+                        tracing::warn!(item = id, "not freed: {e}");
+                    }
+                }
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = freed;
+        reply
     }
 }
 
@@ -189,7 +228,9 @@ impl Answer<'_> {
             }
             Request::Delete { id, .. } => self.delete(&id).await,
             Request::Materialized { .. } => Ok(Reply::Done),
-            Request::Keep { ids, kept, .. } => self.keep(&ids, kept),
+            Request::Keep { ids, .. } => self.keep(&ids, true),
+            // Its eviction follows the answer (`Provider::answer`).
+            Request::Free { ids, .. } => self.keep(&ids, false),
         };
         answered.unwrap_or_else(Reply::from)
     }
@@ -489,7 +530,8 @@ impl Answer<'_> {
         self.stamped(e)
     }
 
-    /// Finder's Keep Downloaded (or Don't): all the items, or none when one
+    /// Finder's Always Keep on This Mac (or, for Free Up Space, not kept
+    /// anymore): all the items, or none when one
     /// can't be (the drive itself, an item not in the library). The
     /// extension then signals the system, which reads the items again.
     fn keep(&self, ids: &[String], kept: bool) -> Result<Reply, Failed> {
@@ -530,6 +572,32 @@ impl Answer<'_> {
             .stamp_gone(self.pair.id, node)
             .map_err(|e| from_state(&e))?;
         Ok(Reply::Done)
+    }
+}
+
+/// A drive's files kept on this computer (themselves, or below a folder
+/// kept), with their paths in its folder.
+pub fn kept_files(state: &State, pair: &Pair) -> crate::state::Result<Vec<(Uuid, PathBuf)>> {
+    let kept = state.kept(pair.id)?;
+    if kept.is_empty() {
+        return Ok(Vec::new());
+    }
+    let entries = state.entries(pair.id)?;
+    let mut files = Vec::new();
+    for (path, e) in crate::drive::paths(&entries, pair.root) {
+        if e.is_file && kept_here(state, pair, e, &kept)? {
+            files.push((e.node, pair.path.join(path)));
+        }
+    }
+    Ok(files)
+}
+
+/// Whether a drive's file is still kept here (asked again before a
+/// download started a while ago: it may have been freed since).
+pub fn still_kept(state: &State, pair: &Pair, node: Uuid) -> crate::state::Result<bool> {
+    match state.entry(pair.id, node)? {
+        Some(e) => kept_here(state, pair, &e, &state.kept(pair.id)?),
+        None => Ok(false),
     }
 }
 

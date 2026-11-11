@@ -7,7 +7,7 @@
 	import { Button } from '#lib/components/ui/button/index.js';
 	import { Input } from '#lib/components/ui/input/index.js';
 	import { Label } from '#lib/components/ui/label/index.js';
-	import { attempt, say, signIn } from '#lib/app.svelte.js';
+	import { attempt, say, signIn, type SignedIn } from '#lib/app.svelte.js';
 	import { m } from '#lib/paraglide/messages.js';
 
 	let {
@@ -15,7 +15,7 @@
 		oncancel
 	}: {
 		/** Signed in: the account. */
-		onaccount: (account: number) => void;
+		onaccount: (signed: SignedIn) => void;
 		/** Absent on the first launch: there is nothing to go back to. */
 		oncancel?: () => void;
 	} = $props();
@@ -58,7 +58,7 @@
 		code = started.code;
 		const mine = ++attempts;
 		started.account.then(
-			(account) => mine === attempts && onaccount(account),
+			(signed) => mine === attempts && onaccount(signed),
 			(error) => {
 				if (mine !== attempts) return;
 				code = '';

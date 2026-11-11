@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::keychain::{self, KeychainError};
 use crate::local;
-use crate::state::{Account, Mode, Pair, Password, State, StateError};
+use crate::state::{Account, Mode, NewLibraries, Pair, Password, State, StateError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpError {
@@ -101,6 +101,12 @@ pub fn proposed_folder(state: &State, instance: &str) -> Result<PathBuf> {
 /// account. With `token` (an app password made in the web app, for
 /// scripts), no flow. The app password goes into the OS keychain when
 /// `keyring` and there is one, else into the state (said in a notice).
+/// Logs in to `instance`, saving the account: what libraries new to it do
+/// is `new_libraries` if given, else what a known account had, else
+/// `fresh` (the window: notified; the CLI: silent). A new account's
+/// libraries now are seen: the first step's (or `theca add`'s) to decide,
+/// never new.
+#[allow(clippy::too_many_arguments)] // Each a login option, from the CLI or the window.
 pub async fn login(
     state: &State,
     instance: &str,
@@ -108,6 +114,8 @@ pub async fn login(
     folder: Option<PathBuf>,
     token: Option<String>,
     keyring: bool,
+    new_libraries: Option<NewLibraries>,
+    fresh: NewLibraries,
     show: impl FnOnce(&api::LoginFlow),
 ) -> Result<Account> {
     let instance = instance.trim_end_matches('/').to_owned();
@@ -144,6 +152,14 @@ pub async fn login(
         (None, Some(known)) => known.default_folder.clone(),
         (None, None) => proposed_folder(state, &instance)?,
     };
+    // A new account's libraries now: the first step's (or `theca add`'s),
+    // never new. Asked before the password is kept: a failure leaves no
+    // keychain entry behind. A known account signing in again records none:
+    // one shared meanwhile is still new to it.
+    let libraries: Vec<Uuid> = match &known {
+        None => client.libraries().await?.iter().map(|l| l.id).collect(),
+        Some(_) => Vec::new(),
+    };
     let (password, left) = keep_password(known.as_ref().map(|k| &k.password), password, keyring);
     let mut account = Account {
         id: 0,
@@ -153,12 +169,21 @@ pub async fn login(
         device: device.to_owned(),
         password,
         default_folder,
+        new_libraries: new_libraries
+            .or(known.as_ref().map(|k| k.new_libraries))
+            .unwrap_or(fresh),
         auto_sync_limit: known
             .as_ref()
-            .map_or(Some(AUTO_SYNC_LIMIT), |k| k.auto_sync_limit),
+            .map_or(AUTO_SYNC_LIMIT, |k| k.auto_sync_limit),
         signed_out: false,
     };
-    account.id = state.save_account(&account)?;
+    account.id = state.save_account_seeing(&account, &libraries)?;
+    // Known, its choice changed with this login.
+    if known.is_some()
+        && let Some(new) = new_libraries
+    {
+        state.set_new_libraries(account.id, new)?;
+    }
     // Only once the account no longer names it.
     if let Some(left) = left {
         let _ = keychain::delete(&left);
@@ -304,7 +329,7 @@ pub async fn add(
     // A Mac's drive: the system places its folder (in ~/Library/CloudStorage).
     #[cfg(target_os = "macos")]
     if mode == Mode::Drive {
-        return add_mac_drive(state, account, &found);
+        return add_mac_drive(state, account, &found).await;
     }
     let path = match path {
         Some(path) => path,
@@ -396,7 +421,7 @@ pub async fn add(
 /// A Mac's drive: its domain added (switched off: the user switches it on in
 /// System Settings), its folder where macOS puts it.
 #[cfg(target_os = "macos")]
-fn add_mac_drive(state: &State, account: &Account, found: &api::Library) -> Result<Pair> {
+async fn add_mac_drive(state: &State, account: &Account, found: &api::Library) -> Result<Pair> {
     // Translocated, macOS refuses the drive with a cryptic error (-2002).
     if let Some(why) = crate::drive::unavailable() {
         return refused(format!("no drive on this Mac: {why}"));
@@ -420,18 +445,68 @@ fn add_mac_drive(state: &State, account: &Account, found: &api::Library) -> Resu
         mode: Mode::Drive,
     };
     let domain = crate::drive::provider::domain_of(&pair);
-    theca_fileprovider::host::add(&domain, &found.name)
-        .map_err(|e| OpError::Refused(format!("macOS refused the drive: {e}")))?;
+    let name = mac_drive_name(account, found).await?;
+    theca_fileprovider::host::add(&domain, &name).map_err(|e| {
+        OpError::Refused(if e.contains("NSCocoaErrorDomain 516") {
+            format!(
+                "macOS refused the drive: ~/Library/CloudStorage/Theca-{name} is in the way \
+                 (an earlier drive's folder: remove it in Finder's sidebar, or delete the folder)"
+            )
+        } else {
+            format!("macOS refused the drive: {e}")
+        })
+    })?;
     // Known once the system made it; else where it puts them.
     pair.path = theca_fileprovider::host::folder(&domain).unwrap_or_else(|_| {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_default();
         home.join("Library/CloudStorage")
-            .join(format!("Theca-{}", found.name))
+            .join(format!("Theca-{name}"))
     });
     pair.id = state.add_pair(&pair)?;
     Ok(pair)
+}
+
+/// A Mac drive's name in Finder, its folder's (`Theca-<name>`): the
+/// library's, unless another drive here has it (macOS refuses two folders of
+/// one name: two accounts' "Documents"), then with its organization's, then a
+/// number.
+#[cfg(target_os = "macos")]
+async fn mac_drive_name(account: &Account, found: &api::Library) -> Result<String> {
+    let taken: Vec<String> = theca_fileprovider::host::domains()
+        .map_err(|e| OpError::Refused(format!("macOS didn't list the drives: {e}")))?
+        .into_iter()
+        .map(|d| local::key(&d.name))
+        .collect();
+    let free = |name: &str| !taken.contains(&local::key(name));
+    if free(&found.name) {
+        return Ok(found.name.clone());
+    }
+    let organization = client(account)?
+        .me()
+        .await
+        .ok()
+        .and_then(|me| {
+            me.organizations
+                .into_iter()
+                .find(|o| o.organization == found.organization)
+        })
+        .map(|o| o.name);
+    let base = match organization {
+        Some(o) => format!("{} ({o})", found.name),
+        None => found.name.clone(),
+    };
+    Ok((1..)
+        .map(|n| {
+            if n == 1 {
+                base.clone()
+            } else {
+                format!("{base} {n}")
+            }
+        })
+        .find(|n| free(n))
+        .expect("a free name"))
 }
 
 /// A Mac's drive removed: macOS deletes its folder but for what wasn't
@@ -442,7 +517,9 @@ fn remove_mac_drive(state: &State, pair: &Pair) -> Result<usize> {
     let kept = theca_fileprovider::host::remove(&domain)
         .map_err(|e| OpError::Refused(format!("macOS didn't remove the drive: {e}")))?;
     state.remove_pair(pair)?;
-    let Some(kept) = kept else {
+    // The system names a folder even with nothing left in it to keep: none
+    // there is nothing kept.
+    let Some(kept) = kept.filter(|k| k.exists()) else {
         return Ok(0);
     };
     let folder = state
@@ -502,6 +579,38 @@ fn backing_folder(state: &State, pair: &Pair, holds: bool) -> Result<PathBuf> {
         std::fs::create_dir_all(&backing).map_err(failed)?;
     }
     Ok(backing)
+}
+
+/// The account's libraries not synced, each with its folder by default under
+/// `parent` (the first step's proposal, today's naming: two of one name told
+/// apart), in the server's order.
+pub async fn proposed_paths(
+    state: &State,
+    account: &Account,
+    parent: &Path,
+) -> Result<Vec<(Library, PathBuf)>> {
+    let client = client(account)?;
+    let libraries = libraries(state, account).await?;
+    let others: Vec<(Uuid, String)> = libraries
+        .iter()
+        .map(|l| (l.library.id, l.library.name.clone()))
+        .collect();
+    let mut taken: Vec<PathBuf> = state.pairs()?.into_iter().map(|p| p.path).collect();
+    let mut proposed = Vec::new();
+    for l in libraries.into_iter().filter(|l| l.pair.is_none()) {
+        let library = &l.library;
+        let path = default_path(
+            &client,
+            parent,
+            (library.id, &library.name, library.organization),
+            &others,
+            &taken,
+        )
+        .await;
+        taken.push(path.clone());
+        proposed.push((l, path));
+    }
+    Ok(proposed)
 }
 
 /// Where a library goes by default: `<folder>/<library>`, or
@@ -863,10 +972,18 @@ pub fn keep(state: &State, path: &Path, kept: bool) -> Result<Pair> {
 /// for a few seconds.
 #[cfg(target_os = "macos")]
 pub fn free(state: &State, path: &Path) -> Result<Pair> {
-    use std::time::{Duration, Instant};
     let (pair, entry, _) = in_drive(state, path, "free")?;
+    free_on_mac(state, &pair, entry)?;
+    Ok(pair)
+}
+
+/// A Mac drive's file or folder freed (`theca free`, Finder's Free Up
+/// Space): not kept anymore, the system told, then each file below evicted.
+#[cfg(target_os = "macos")]
+pub fn free_on_mac(state: &State, pair: &Pair, entry: crate::state::Entry) -> Result<()> {
+    use std::time::{Duration, Instant};
     state.set_kept(pair.id, entry.node, false)?;
-    let domain = crate::drive::provider::domain_of(&pair);
+    let domain = crate::drive::provider::domain_of(pair);
     let _ = theca_fileprovider::host::signal(&domain);
     let until = Instant::now() + Duration::from_secs(15);
     let evict = |node: &str| loop {
@@ -894,7 +1011,7 @@ pub fn free(state: &State, path: &Path) -> Result<Pair> {
             refused.join("; ")
         )));
     }
-    Ok(pair)
+    Ok(())
 }
 
 /// Refused while an edit below `path` isn't uploaded yet. A running engine
@@ -1013,7 +1130,8 @@ mod tests {
                 device: "d".into(),
                 password: Password::InState("p".into()),
                 default_folder: dir.to_owned(),
-                auto_sync_limit: None,
+                new_libraries: Default::default(),
+                auto_sync_limit: 0,
                 signed_out: false,
             })
             .unwrap();

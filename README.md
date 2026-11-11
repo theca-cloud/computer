@@ -14,6 +14,7 @@ npm --prefix ui ci             # the app's page, once
 cargo run -- --help            # the CLI (no app in this build)
 npm --prefix ui run build && cargo run --features gui,custom-protocol   # the app
 scripts/ci.sh [lint|test|app|deny]   # every CI check, or one step (app: Linux only)
+scripts/ci.sh test mac_drive         # the tests whose names match (the server built too)
 cargo fmt && npm --prefix ui run format   # fix formatting
 ```
 

@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::engine::{self, Handle};
 use crate::ops;
-use crate::state::{Mode, Notice, State, Update};
+use crate::state::{Mode, NewLibraries, Notice, State, Update};
 
 /// What the app keeps.
 struct App {
@@ -67,6 +67,7 @@ pub fn run(state_path: PathBuf, background: bool) -> Result<(), tauri::Error> {
         .invoke_handler(tauri::generate_handler![
             status,
             libraries,
+            first_step,
             proposed_folder,
             login,
             add,
@@ -166,7 +167,10 @@ fn forward_updates(app: &AppHandle) {
         loop {
             match updates.recv().await {
                 Ok(update) => {
-                    if !matches!(update, Update::Offered { .. }) {
+                    if let Update::NewLibrary { name, .. } = &update {
+                        notify_new_library(&app, name);
+                    }
+                    if !matches!(update, Update::Offered { .. } | Update::NewLibrary { .. }) {
                         refresh_tray(&app);
                         notify_stops(&app);
                     }
@@ -250,6 +254,9 @@ struct Tray {
     icon: TrayIcon,
     summary: MenuItem<tauri::Wry>,
     pause: MenuItem<tauri::Wry>,
+    /// What it shows: set again only when it changes (setting the same
+    /// icon redraws it, a blink in the menu bar).
+    shown: Option<(Overall, String, bool)>,
 }
 
 /// The tray: the overall state, Open, Pause all or Resume, Quit.
@@ -290,6 +297,7 @@ fn tray(app: &AppHandle) -> tauri::Result<Tray> {
         icon,
         summary,
         pause,
+        shown: None,
     })
 }
 
@@ -361,12 +369,24 @@ fn notify_stops(app: &AppHandle) {
     }
 }
 
+/// A library new to an account (`notify`): an OS notification, nothing to
+/// answer; the window lists it.
+fn notify_new_library(app: &AppHandle, name: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app
+        .notification()
+        .builder()
+        .title(format!("A new library: {name}"))
+        .body("Open Theca to sync it or make it a drive.")
+        .show();
+}
+
 /// The tray's icon and summary from the state: attention first (an account
 /// signed out, a pair stopped), then syncing, then paused.
 fn refresh_tray(app: &AppHandle) {
     let a = app.state::<App>();
-    let tray = a.tray.lock().expect("tray");
-    let Some(tray) = tray.as_ref() else {
+    let mut tray = a.tray.lock().expect("tray");
+    let Some(tray) = tray.as_mut() else {
         return;
     };
     let state = state(app);
@@ -389,14 +409,19 @@ fn refresh_tray(app: &AppHandle) {
     } else {
         (Overall::Idle, "Up to date".to_owned())
     };
+    let paused = !pairs.is_empty() && pairs.iter().all(|p| p.paused);
+    let now = (overall, summary, paused);
+    if tray.shown.as_ref() == Some(&now) {
+        return;
+    }
     let _ = tray.icon.set_icon(Some(tray_icon(overall)));
     let _ = tray.icon.set_icon_as_template(cfg!(target_os = "macos"));
-    let _ = tray.icon.set_tooltip(Some(format!("Theca: {summary}")));
-    let _ = tray.summary.set_text(summary);
-    let paused = !pairs.is_empty() && pairs.iter().all(|p| p.paused);
+    let _ = tray.icon.set_tooltip(Some(format!("Theca: {}", now.1)));
+    let _ = tray.summary.set_text(&now.1);
     let _ = tray
         .pause
         .set_text(if paused { "Resume" } else { "Pause all" });
+    tray.shown = Some(now);
 }
 
 /// A command's result: the page shows the error's text.
@@ -414,7 +439,9 @@ struct AccountView {
     email: String,
     device: String,
     default_folder: PathBuf,
-    auto_sync_limit: Option<i64>,
+    new_libraries: NewLibraries,
+    /// New libraries up to it sync (`sync`); 0: no limit.
+    auto_sync_limit: i64,
     signed_out: bool,
 }
 
@@ -528,6 +555,7 @@ fn status(app: AppHandle) -> Answer<Status> {
                 email: a.email,
                 device: a.device,
                 default_folder: a.default_folder,
+                new_libraries: a.new_libraries,
                 auto_sync_limit: a.auto_sync_limit,
                 signed_out: a.signed_out,
             })
@@ -602,6 +630,38 @@ async fn libraries(app: AppHandle, account: i64) -> Answer<Vec<LibraryView>> {
         .collect())
 }
 
+/// A library of the first step: not synced, with its size and its folder by
+/// default under the parent chosen.
+#[derive(Serialize)]
+struct Proposed {
+    id: Uuid,
+    name: String,
+    size: Option<i64>,
+    path: PathBuf,
+}
+
+/// The first step's libraries (those not synced), each with its folder by
+/// default under `parent`.
+#[tauri::command]
+async fn first_step(app: AppHandle, account: i64, parent: PathBuf) -> Answer<Vec<Proposed>> {
+    let state = state(&app);
+    let account = state
+        .account(account)
+        .map_err(err)?
+        .ok_or("no such account")?;
+    Ok(ops::proposed_paths(&state, &account, &parent)
+        .await
+        .map_err(err)?
+        .into_iter()
+        .map(|(l, path)| Proposed {
+            id: l.library.id,
+            name: l.library.name,
+            size: l.size,
+            path,
+        })
+        .collect())
+}
+
 /// The default folder a new account would get, and this device's name.
 #[derive(Serialize)]
 struct Proposal {
@@ -630,14 +690,30 @@ async fn login(
     let background = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = state(&background);
-        let result = ops::login(&state, &instance, &device, folder, None, true, |flow| {
-            let _ = shown.send(flow.clone());
-        })
+        // New here: the page shows its first step (an account signed in
+        // again keeps its choices).
+        let before: Vec<i64> = state
+            .accounts()
+            .map_or_else(|_| Vec::new(), |a| a.iter().map(|a| a.id).collect());
+        // Nothing added: the first step chooses; libraries new later notified.
+        let result = ops::login(
+            &state,
+            &instance,
+            &device,
+            folder,
+            None,
+            true,
+            None,
+            NewLibraries::Notify,
+            |flow| {
+                let _ = shown.send(flow.clone());
+            },
+        )
         .await;
         let outcome = match result {
             Ok(account) => {
                 background.state::<App>().engine.wake();
-                serde_json::json!({ "account": account.id })
+                serde_json::json!({ "account": account.id, "fresh": !before.contains(&account.id) })
             }
             Err(e) => serde_json::json!({ "error": e.to_string() }),
         };
@@ -828,18 +904,22 @@ fn dismiss(app: AppHandle, notice: i64) -> Answer<()> {
     state(&app).dismiss(notice).map_err(err)
 }
 
-/// An account's settings: its default folder, its auto-sync limit (none:
-/// never).
+/// An account's settings: its default folder, what libraries new to it do,
+/// and the size up to which they sync (0: no limit).
 #[tauri::command]
 fn set_account(
     app: AppHandle,
     account: i64,
     default_folder: PathBuf,
-    auto_sync_limit: Option<i64>,
+    new_libraries: NewLibraries,
+    auto_sync_limit: i64,
 ) -> Answer<()> {
     let state = state(&app);
     state
         .set_default_folder(account, &default_folder)
+        .map_err(err)?;
+    state
+        .set_new_libraries(account, new_libraries)
         .map_err(err)?;
     state
         .set_auto_sync_limit(account, auto_sync_limit)

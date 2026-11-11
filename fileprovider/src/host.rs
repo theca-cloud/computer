@@ -87,6 +87,10 @@ fn wait_coded(
 /// switched off, the user switches it on (System Settings).
 pub fn add(id: &str, name: &str) -> Result<(), String> {
     let domain = domain(id, name);
+    // No trash of its own: a delete goes to the server's.
+    // Left on, the system asks the extension for one again and again.
+    // SAFETY: a property setter on a fresh domain.
+    unsafe { domain.setSupportsSyncingTrash(false) };
     // SAFETY: a valid domain and block.
     wait(|block| unsafe { NSFileProviderManager::addDomain_completionHandler(&domain, block) })
 }
@@ -117,10 +121,19 @@ pub fn remove(id: &str) -> Result<Option<PathBuf>, String> {
         .map_err(|_| "no answer from the system".to_owned())?
 }
 
-/// The drive as macOS has it: none (removed), switched on or not.
-pub fn enabled(id: &str) -> Result<Option<bool>, String> {
+/// A drive as macOS lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Domain {
+    pub id: String,
+    /// Its name in Finder (its folder's: `Theca-<name>`).
+    pub name: String,
+    /// Switched on in System Settings.
+    pub enabled: bool,
+}
+
+/// Every drive of this app macOS has, whichever state added it.
+pub fn domains() -> Result<Vec<Domain>, String> {
     let (tx, rx) = mpsc::channel();
-    let wanted = id.to_owned();
     let block = RcBlock::new(
         move |list: NonNull<NSArray<NSFileProviderDomain>>, error: *mut NSError| {
             if let Some(error) = describe(error) {
@@ -132,8 +145,14 @@ pub fn enabled(id: &str) -> Result<Option<bool>, String> {
             let found = list
                 .iter()
                 // SAFETY: property getters.
-                .find(|d| unsafe { d.identifier() }.to_string() == wanted)
-                .map(|d| unsafe { d.userEnabled() });
+                .map(|d| unsafe {
+                    Domain {
+                        id: d.identifier().to_string(),
+                        name: d.displayName().to_string(),
+                        enabled: d.userEnabled(),
+                    }
+                })
+                .collect();
             let _ = tx.send(Ok(found));
         },
     );
@@ -141,6 +160,14 @@ pub fn enabled(id: &str) -> Result<Option<bool>, String> {
     unsafe { NSFileProviderManager::getDomainsWithCompletionHandler(&block) };
     rx.recv_timeout(WAIT)
         .map_err(|_| "no answer from the system".to_owned())?
+}
+
+/// The drive as macOS has it: none (removed), switched on or not.
+pub fn enabled(id: &str) -> Result<Option<bool>, String> {
+    Ok(domains()?
+        .into_iter()
+        .find(|d| d.id == id)
+        .map(|d| d.enabled))
 }
 
 fn manager(id: &str) -> Result<Retained<NSFileProviderManager>, String> {
@@ -166,6 +193,38 @@ pub fn signal(id: &str) -> Result<(), String> {
 pub struct Refused {
     pub why: String,
     pub kept: bool,
+}
+
+/// A drive's file downloaded now, by reading its first byte on this thread
+/// with downloads on (a thread may have them off: a service's): what
+/// keeping a file means. Asked through the File Provider instead, macOS
+/// queues it as a background task, which may wait (sprint 18, on a laptop).
+pub fn materialize(path: &std::path::Path) -> Result<(), String> {
+    use std::io::Read;
+    // sys/resource.h (not in the libc crate).
+    const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: libc::c_int = 3;
+    const IOPOL_SCOPE_THREAD: libc::c_int = 1;
+    const IOPOL_MATERIALIZE_DATALESS_FILES_ON: libc::c_int = 2;
+    unsafe extern "C" {
+        fn setiopolicy_np(
+            iotype: libc::c_int,
+            scope: libc::c_int,
+            policy: libc::c_int,
+        ) -> libc::c_int;
+    }
+    // SAFETY: a plain system call on this thread.
+    unsafe {
+        setiopolicy_np(
+            IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
+            IOPOL_SCOPE_THREAD,
+            IOPOL_MATERIALIZE_DATALESS_FILES_ON,
+        )
+    };
+    let mut byte = [0; 1];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read(&mut byte))
+        .map(|_| ())
+        .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// An item's content dropped (it stays listed); refused while it is open,

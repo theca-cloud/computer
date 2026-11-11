@@ -112,6 +112,16 @@ async fn sign_in_sync_and_an_error() {
     let _one = ONE_APP.lock().await;
     let w = world().await;
     w.upload(&w.library, "hello.txt", b"hello").await;
+    let photos = w
+        .admin
+        .create_library(w.organization, "Photos")
+        .await
+        .unwrap();
+    let archive = w
+        .admin
+        .create_library(w.organization, "Archive")
+        .await
+        .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let folder = dir.path().join("theca");
     let (_driver, client) = app(&dir.path().join("state.sqlite")).await;
@@ -132,8 +142,62 @@ async fn sign_in_sync_and_an_error() {
         .unwrap();
     approve(&w).await;
 
-    // Signed in: the library (under the auto-sync limit) syncs by itself.
+    // Signed in: the first step. Docs synced, Photos a drive (its choice
+    // greyed where this computer can't hold one: the CI image), Archive
+    // left; libraries added later listed quietly.
+    shown(&client, "Choose your libraries").await;
+    let choose = |library: uuid::Uuid, choice: &'static str| {
+        let client = client.clone();
+        async move {
+            // The list loads after the step shows.
+            client
+                .wait()
+                .at_most(Duration::from_secs(30))
+                .for_element(Locator::Id(&format!("choice-{library}-{choice}")))
+                .await
+                .unwrap()
+        }
+    };
+    choose(w.library.id, "sync").await.click().await.unwrap();
+    let drive = choose(photos.id, "drive").await;
+    if theca::drive::unavailable().is_some() {
+        assert!(drive.attr("disabled").await.unwrap().is_some());
+    } else {
+        drive.click().await.unwrap();
+    }
+    client
+        .find(Locator::Id("new-libraries"))
+        .await
+        .unwrap()
+        .select_by_value("silent")
+        .await
+        .unwrap();
+    client
+        .find(Locator::XPath("//button[normalize-space()='Add']"))
+        .await
+        .unwrap()
+        .click()
+        .await
+        .unwrap();
     shown(&client, "Up to date").await;
+    let state = theca::state::State::open(&dir.path().join("state.sqlite")).unwrap();
+    eventually("the choices stored", || async {
+        let pairs = state.pairs().unwrap();
+        let account = &state.accounts().unwrap()[0];
+        account.new_libraries == theca::state::NewLibraries::Silent
+            && pairs
+                .iter()
+                .any(|p| p.library == w.library.id && p.path == folder.join("Docs"))
+            && pairs.iter().any(|p| p.library == photos.id) == theca::drive::unavailable().is_none()
+    })
+    .await;
+    assert!(
+        !state
+            .pairs()
+            .unwrap()
+            .iter()
+            .any(|p| p.library == archive.id)
+    );
     let hello = folder.join("Docs").join("hello.txt");
     eventually("hello.txt synced", || async {
         std::fs::read(&hello).ok().as_deref() == Some(&b"hello"[..])
@@ -262,5 +326,44 @@ async fn the_logs_in_the_window() {
         (s.level.as_str(), s.days, s.max_size) == ("debug", 30, 200_000_000)
     })
     .await;
+    client.close().await.unwrap();
+}
+
+/// The first step's Later: nothing added, the step gone, the libraries
+/// listed; new ones notified (the window's default).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_step_later_adds_nothing() {
+    let _one = ONE_APP.lock().await;
+    let w = world().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (_driver, client) = app(&dir.path().join("state.sqlite")).await;
+    shown(&client, "Welcome to Theca").await;
+    let instance = client.find(Locator::Id("instance")).await.unwrap();
+    instance.send_keys(&w.server.url).await.unwrap();
+    client
+        .find(Locator::XPath("//button[normalize-space()='Sign in']"))
+        .await
+        .unwrap()
+        .click()
+        .await
+        .unwrap();
+    approve(&w).await;
+    shown(&client, "Choose your libraries").await;
+    client
+        .find(Locator::XPath("//button[normalize-space()='Later']"))
+        .await
+        .unwrap()
+        .click()
+        .await
+        .unwrap();
+    // The account's card, its library offered.
+    shown(&client, "Docs").await;
+    assert!(client.find(Locator::Id("first-step")).await.is_err());
+    let state = theca::state::State::open(&dir.path().join("state.sqlite")).unwrap();
+    assert!(state.pairs().unwrap().is_empty());
+    assert_eq!(
+        state.accounts().unwrap()[0].new_libraries,
+        theca::state::NewLibraries::Notify
+    );
     client.close().await.unwrap();
 }

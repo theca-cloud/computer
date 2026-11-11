@@ -10,10 +10,14 @@ export type Account = {
 	email: string;
 	device: string;
 	default_folder: string;
-	/** Bytes; null: never synced automatically. */
-	auto_sync_limit: number | null;
+	/** What libraries new to the account do. */
+	new_libraries: NewLibraries;
+	/** Bytes: new libraries up to it sync (`sync`); 0: no limit. */
+	auto_sync_limit: number;
 	signed_out: boolean;
 };
+
+export type NewLibraries = 'sync' | 'drive' | 'notify' | 'silent';
 
 export type Pair = {
 	id: number;
@@ -75,7 +79,8 @@ export type Library = {
 type Update =
 	| { kind: 'activity'; pair: number; activity: string }
 	| { kind: 'pairs' | 'accounts' | 'notices' | 'lagged' }
-	| { kind: 'offered'; account: number; libraries: Offer[] };
+	| { kind: 'offered'; account: number; libraries: Offer[] }
+	| { kind: 'new_library'; account: number; name: string };
 
 export const app = $state({
 	status: null as Status | null,
@@ -120,6 +125,8 @@ export function follow(): () => void {
 			if (payload.activity === 'up to date') void attempt(reload);
 		} else if (payload.kind === 'offered') {
 			app.offered[payload.account] = payload.libraries;
+		} else if (payload.kind === 'new_library') {
+			// The OS notification is Rust's; the list follows (`offered`).
 		} else {
 			void attempt(reload);
 		}
@@ -154,16 +161,19 @@ export function ask(title: string, text: string, choices: Choice[]): Promise<str
  * Starts the browser login (Rust opens the browser): the code to show, and
  * the account once approved (the `login` event).
  */
+/** The account signed in, and whether it is new here (its first step shows). */
+export type SignedIn = { account: number; fresh: boolean };
+
 export async function signIn(
 	instance: string,
 	device: string,
 	folder: string | null
-): Promise<{ code: string; account: Promise<number> }> {
+): Promise<{ code: string; account: Promise<SignedIn> }> {
 	let stop = () => {};
-	const account = new Promise<number>((resolve, reject) => {
-		const unlisten = listen<{ account: number } | { error: string }>('login', ({ payload }) => {
+	const account = new Promise<SignedIn>((resolve, reject) => {
+		const unlisten = listen<SignedIn | { error: string }>('login', ({ payload }) => {
 			stop();
-			if ('account' in payload) resolve(payload.account);
+			if ('account' in payload) resolve(payload);
 			else reject(payload.error);
 		});
 		stop = () => void unlisten.then((f) => f());

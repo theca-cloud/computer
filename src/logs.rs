@@ -447,6 +447,36 @@ mod tests {
         assert_eq!(names(folder), ["theca.2026-11-09.log.gz"]);
     }
 
+    /// Several processes pruning at the same moment (the app and `theca
+    /// run` starting together): every finished day ends gzipped once, whole.
+    #[test]
+    fn prunings_at_once_lose_no_line() {
+        for _ in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let folder = dir.path();
+            let lines = "a line of the day\n".repeat(20_000);
+            for d in 1..=6 {
+                day(folder, &format!("theca.2026-11-0{d}.log"), &lines, 60 * 30);
+            }
+            std::thread::scope(|s| {
+                for _ in 0..4 {
+                    s.spawn(|| prune(folder, 14, DEFAULT_MAX_SIZE, date("2026-11-11")).unwrap());
+                }
+            });
+            let days: Vec<String> = (1..=6)
+                .map(|d| format!("theca.2026-11-0{d}.log.gz"))
+                .collect();
+            assert_eq!(names(folder), days);
+            for d in days {
+                let mut read = String::new();
+                flate2::read::GzDecoder::new(File::open(folder.join(d)).unwrap())
+                    .read_to_string(&mut read)
+                    .unwrap();
+                assert!(read == lines, "a day's lines lost");
+            }
+        }
+    }
+
     /// Unset, invalid: the defaults; set: as given; `None` resets.
     #[test]
     fn settings_fall_back_to_their_defaults() {

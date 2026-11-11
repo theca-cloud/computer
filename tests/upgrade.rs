@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use serde_json::{Value, json};
 use theca::keychain;
-use theca::state::{Account, Entry, Mode, Pair, Password, RemoteState, State, StateError, Stop};
+use theca::state::{
+    Account, Entry, Mode, NewLibraries, Pair, Password, RemoteState, State, StateError, Stop,
+};
 use theca_common::api::Position;
 use uuid::Uuid;
 
@@ -74,6 +76,15 @@ fn every_release_state_reads_back() {
         assert_eq!(schema(&path), expected, "{}", release.display());
         let mut read = manifest_of(&state, &manifest["version"]);
         // An entry the migration made has a name of its own.
+        let pairs_of = |account: &Value| -> Vec<Value> {
+            manifest["pairs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|p| p["account"] == account["uuid"])
+                .map(|p| p["library"].clone())
+                .collect()
+        };
         for (a, expected) in read["accounts"]
             .as_array_mut()
             .unwrap()
@@ -82,6 +93,32 @@ fn every_release_state_reads_back() {
         {
             if expected["secret"].is_null() {
                 a["secret"] = Value::Null;
+            }
+            // Before version 4: a limit auto-synced (`sync` with it), none
+            // listed (`silent`, 500 MB); `seen` holds the declined libraries
+            // and the pairs'. Then read back in the release's terms.
+            if expected.get("new_libraries").is_none() {
+                let limit = &expected["auto_sync_limit"];
+                let (new, bytes) = match limit.as_i64() {
+                    Some(l) => ("sync", l),
+                    None => ("silent", 500 * 1024 * 1024),
+                };
+                assert_eq!(
+                    (a["new_libraries"].as_str(), a["auto_sync_limit"].as_i64()),
+                    (Some(new), Some(bytes)),
+                    "{}",
+                    release.display()
+                );
+                let mut seen: Vec<Value> = expected["declined"].as_array().unwrap().clone();
+                seen.extend(pairs_of(expected));
+                seen.sort_by_key(|v| v.to_string());
+                seen.dedup();
+                assert_eq!(a["seen"], Value::Array(seen), "{}", release.display());
+                let a = a.as_object_mut().unwrap();
+                a.remove("new_libraries");
+                a.remove("seen");
+                a.insert("auto_sync_limit".into(), limit.clone());
+                a.insert("declined".into(), expected["declined"].clone());
             }
         }
         // A release before the drive (version 4) has sync pairs only.
@@ -198,8 +235,8 @@ fn manifest_of(state: &State, version: &Value) -> Value {
     let account_json: Vec<Value> = accounts
         .iter()
         .map(|a| {
-            let mut declined = state.declined(a.id).unwrap();
-            declined.sort();
+            let mut seen: Vec<_> = state.seen(a.id).unwrap().into_iter().collect();
+            seen.sort();
             json!({
                 "instance": a.instance,
                 "uuid": a.uuid,
@@ -212,9 +249,10 @@ fn manifest_of(state: &State, version: &Value) -> Value {
                     Password::InState(_) => None,
                 },
                 "default_folder": a.default_folder,
+                "new_libraries": a.new_libraries,
                 "auto_sync_limit": a.auto_sync_limit,
                 "signed_out": a.signed_out,
-                "declined": declined,
+                "seen": seen,
             })
         })
         .collect();
@@ -319,7 +357,7 @@ fn fill() {
     let _ = std::fs::remove_file(&path);
     let state = State::open(&path).unwrap();
 
-    let account = |instance: &str, uuid, email: &str, password, limit| Account {
+    let account = |instance: &str, uuid, email: &str, password, new_libraries| Account {
         id: 0,
         instance: instance.into(),
         uuid,
@@ -327,7 +365,8 @@ fn fill() {
         device: "laptop".into(),
         password,
         default_folder: "/home/user/theca".into(),
-        auto_sync_limit: limit,
+        new_libraries,
+        auto_sync_limit: 500 * 1024 * 1024,
         signed_out: false,
     };
     // One in the keychain, one kept in the state.
@@ -339,7 +378,7 @@ fn fill() {
             id(1),
             "ada@example.com",
             Password::Keychain(secret.clone()),
-            Some(500 * 1024 * 1024),
+            NewLibraries::Sync,
         ))
         .unwrap();
     let b = state
@@ -348,7 +387,7 @@ fn fill() {
             id(2),
             "bob@example.org",
             Password::InState("app-password-b".into()),
-            None,
+            NewLibraries::Silent,
         ))
         .unwrap();
     state.set_signed_out(b).unwrap();

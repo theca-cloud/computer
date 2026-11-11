@@ -9,6 +9,7 @@
 	import AccountSettings from '#lib/components/account-settings.svelte';
 	import AskDialog from '#lib/components/ask-dialog.svelte';
 	import DriveSettings from '#lib/components/drive-settings.svelte';
+	import FirstStep from '#lib/components/first-step.svelte';
 	import LogsSettings from '#lib/components/logs-settings.svelte';
 	import Login from '#lib/components/login.svelte';
 	import { Button } from '#lib/components/ui/button/index.js';
@@ -16,13 +17,13 @@
 	import { Label } from '#lib/components/ui/label/index.js';
 	import { Separator } from '#lib/components/ui/separator/index.js';
 	import { Switch } from '#lib/components/ui/switch/index.js';
-	import { app, attempt, follow, reload, say } from '#lib/app.svelte.js';
+	import { app, attempt, follow, reload, say, type SignedIn } from '#lib/app.svelte.js';
 	import { formatDate } from '#lib/format.js';
 	import { m } from '#lib/paraglide/messages.js';
 
 	$effect(follow);
 
-	/** Just signed in: its libraries open. */
+	/** Just signed in: its first step shows, until Add or Later. */
 	let signedIn = $state<number | null>(null);
 	let adding = $state(false);
 	let autostart = $state(false);
@@ -43,8 +44,9 @@
 	);
 	const libraryOf = (pair: number | null) => pairs.find((p) => p.id === pair)?.library_name;
 
-	function onaccount(account: number) {
-		signedIn = account;
+	function onaccount({ account, fresh }: SignedIn) {
+		// Signed in again: its choices stand, no first step.
+		signedIn = fresh ? account : null;
 		adding = false;
 		void attempt(reload);
 	}
@@ -94,12 +96,15 @@
 		<section class="grid gap-3" aria-labelledby="accounts">
 			<h2 id="accounts" class="text-base font-medium">{m.accounts()}</h2>
 			{#each status.accounts as account (account.id)}
-				<AccountCard
-					{account}
-					pairs={pairs.filter((p) => p.account === account.id)}
-					offered={app.offered[account.id] ?? []}
-					browse={signedIn === account.id}
-				/>
+				{#if signedIn === account.id}
+					<FirstStep {account} ondone={() => (signedIn = null)} />
+				{:else}
+					<AccountCard
+						{account}
+						pairs={pairs.filter((p) => p.account === account.id)}
+						offered={app.offered[account.id] ?? []}
+					/>
+				{/if}
 			{/each}
 			{#if adding}
 				<Card.Root>

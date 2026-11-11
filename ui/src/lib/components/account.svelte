@@ -28,14 +28,11 @@
 	let {
 		account,
 		pairs,
-		offered,
-		browse = false
+		offered
 	}: {
 		account: Account;
 		pairs: Pair[];
 		offered: Offer[];
-		/** Opens the list of its libraries (just signed in). */
-		browse?: boolean;
 	} = $props();
 
 	const synced = $derived(new Set(pairs.map((p) => p.library)));
@@ -54,7 +51,6 @@
 	const mac = navigator.userAgent.includes('Mac');
 
 	onMount(() => {
-		if (browse) void list();
 		void attempt(() => invoke<string | null>('drive_support')).then(
 			(why) => (unavailable = why ?? null)
 		);

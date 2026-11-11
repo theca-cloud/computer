@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use common::*;
-use theca::drive::provider::{Provider, apply_remote, domain_of};
+use theca::drive::provider::{Provider, apply_remote, domain_of, kept_files, still_kept};
 use theca_common::api;
 use theca_fileprovider::protocol::{Item, ROOT, Reply, Request};
 
@@ -60,15 +60,16 @@ async fn the_app_answers_the_extension() {
         panic!("no anchor");
     };
 
-    // Finder's Keep Downloaded on a folder: kept itself, what is below kept;
+    // Finder's Always Keep on This Mac on a folder: kept itself, what is below kept;
     // the drive itself, or an item not in the library, refused, and then
     // nothing is kept.
     let keep = |ids: Vec<String>, kept: bool| {
-        ask(Request::Keep {
-            domain: domain.clone(),
-            ids,
-            kept,
-        })
+        let domain = domain.clone();
+        if kept {
+            ask(Request::Keep { domain, ids })
+        } else {
+            ask(Request::Free { domain, ids })
+        }
     };
     let listed = |container: String| {
         let ask = &ask;
@@ -112,7 +113,17 @@ async fn the_app_answers_the_extension() {
         panic!("no changes");
     };
     assert_eq!(names(&updated), ["d".to_owned()].into());
+    // What the engine downloads then: the kept folder's file, by its path in
+    // the drive; not once freed.
+    let b: uuid::Uuid = below[0].id.parse().unwrap();
+    assert_eq!(
+        kept_files(&state, &pair).unwrap(),
+        [(b, pair.path.join("d").join("b.txt"))]
+    );
+    assert!(still_kept(&state, &pair, b).unwrap());
     assert_eq!(keep(vec![folder.id.clone()], false).await, Reply::Done);
+    assert!(kept_files(&state, &pair).unwrap().is_empty());
+    assert!(!still_kept(&state, &pair, b).unwrap());
     assert!(listed(folder.id.clone()).await.iter().all(|i| !i.kept));
 
     // Fetched into the file the extension names.

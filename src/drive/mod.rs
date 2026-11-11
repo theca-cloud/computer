@@ -519,8 +519,7 @@ pub fn free_now(
 
 /// The entries by their path below the root (none for a node whose parents
 /// aren't all known).
-#[cfg(any(target_os = "linux", windows))]
-fn paths(
+pub(crate) fn paths(
     entries: &[crate::state::Entry],
     root: uuid::Uuid,
 ) -> std::collections::HashMap<std::path::PathBuf, &crate::state::Entry> {

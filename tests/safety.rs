@@ -206,7 +206,6 @@ async fn two_accounts_never_share_a_folder() {
     let a = w.device("a").await;
     w.converge(&[&a]).await;
     let (member, user) = w.member("m@test.theca").await;
-    w.set_member(&w.library, user, true).await;
     let created = member
         .create_app_password(&theca_common::api::CreateAppPassword {
             name: "a".into(),
@@ -224,11 +223,14 @@ async fn two_accounts_never_share_a_folder() {
         Some(a.folder.parent().unwrap().to_owned()),
         Some(created.password),
         true,
+        Some(theca::state::NewLibraries::Sync),
+        theca::state::NewLibraries::Sync,
         |_| panic!("a token needs no browser"),
     )
     .await
     .unwrap();
-    state.set_auto_sync_limit(b.id, Some(1 << 30)).unwrap();
+    // Shared once it is logged in: new to it, synced by itself.
+    w.set_member(&w.library, user, true).await;
     a.handle.wake();
     eventually("the second account's pair", || async {
         state.pairs().unwrap().iter().any(|p| p.account == b.id)

@@ -16,10 +16,10 @@ pub const SOCKET: &str = "theca.sock";
 pub const ROOT: &str = "NSFileProviderRootContainerItemIdentifier";
 /// The system's working set: what it asks changes for.
 pub const WORKING_SET: &str = "NSFileProviderWorkingSetContainerItemIdentifier";
-/// Finder's actions (the extension's `Info.plist`): Keep Downloaded, and
-/// Don't Keep Downloaded.
+/// Finder's actions (the extension's `Info.plist`): Always Keep on This Mac,
+/// and Free Up Space.
 pub const KEEP: &str = "rs.theca.computer.drive.keep";
-pub const UNKEEP: &str = "rs.theca.computer.drive.unkeep";
+pub const FREE: &str = "rs.theca.computer.drive.free";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "call", rename_all = "snake_case")]
@@ -63,13 +63,12 @@ pub enum Request {
     Delete { domain: String, id: String },
     /// The system's materialized items (downloaded), all of them.
     Materialized { domain: String, ids: Vec<String> },
-    /// Items kept downloaded, or not anymore (Finder's actions), as
-    /// `theca keep` does.
-    Keep {
-        domain: String,
-        ids: Vec<String>,
-        kept: bool,
-    },
+    /// Items kept on this Mac (Finder's Always Keep on This Mac), as `theca
+    /// keep` does.
+    Keep { domain: String, ids: Vec<String> },
+    /// Items freed (Finder's Free Up Space), as `theca free` does: not kept
+    /// anymore, their files evicted.
+    Free { domain: String, ids: Vec<String> },
 }
 
 impl Request {
@@ -84,7 +83,8 @@ impl Request {
             | Request::Modify { domain, .. }
             | Request::Delete { domain, .. }
             | Request::Materialized { domain, .. }
-            | Request::Keep { domain, .. } => domain,
+            | Request::Keep { domain, .. }
+            | Request::Free { domain, .. } => domain,
         }
     }
 }
@@ -103,8 +103,8 @@ pub struct Item {
     pub modified: Option<i64>,
     /// Kept downloaded (it, or a folder above it).
     pub kept: bool,
-    /// Kept itself (not only through a folder above): what Don't Keep
-    /// Downloaded undoes.
+    /// Kept itself (not only through a folder above): what Free Up
+    /// Space undoes.
     pub kept_itself: bool,
     /// Writable (a read-only library's aren't).
     pub writable: bool,

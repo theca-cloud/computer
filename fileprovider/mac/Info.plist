@@ -36,9 +36,9 @@
 		<true/>
 		<!--
 		  Finder's actions, on the items' userInfo (kept: it or a folder
-		  above; keptItself: it). Keep Downloaded while one isn't kept; Don't
-		  Keep Downloaded when all are kept themselves (what a folder keeps
-		  is undone on the folder). The identifiers: protocol::KEEP, UNKEEP.
+		  above; keptItself: it; never the drive itself, its root). Always Keep on This Mac while one isn't kept;
+		  Free Up Space when all are kept themselves (what a folder keeps
+		  is undone on the folder). The identifiers: protocol::KEEP, FREE.
 		-->
 		<key>NSExtensionFileProviderActions</key>
 		<array>
@@ -46,15 +46,15 @@
 				<key>NSExtensionFileProviderActionIdentifier</key>
 				<string>rs.theca.computer.drive.keep</string>
 				<key>NSExtensionFileProviderActionName</key>
-				<string>Keep Downloaded</string>
+				<string>Always Keep on This Mac</string>
 				<key>NSExtensionFileProviderActionActivationRule</key>
-				<string>fileproviderItems.@count &gt; 0 AND SUBQUERY(fileproviderItems, $item, $item.userInfo.kept == NO).@count &gt; 0</string>
+				<string>fileproviderItems.@count &gt; 0 AND SUBQUERY(fileproviderItems, $item, $item.userInfo.kept == NO).@count &gt; 0 AND SUBQUERY(fileproviderItems, $item, $item.itemIdentifier == "NSFileProviderRootContainerItemIdentifier").@count == 0</string>
 			</dict>
 			<dict>
 				<key>NSExtensionFileProviderActionIdentifier</key>
-				<string>rs.theca.computer.drive.unkeep</string>
+				<string>rs.theca.computer.drive.free</string>
 				<key>NSExtensionFileProviderActionName</key>
-				<string>Don't Keep Downloaded</string>
+				<string>Free Up Space</string>
 				<key>NSExtensionFileProviderActionActivationRule</key>
 				<string>fileproviderItems.@count &gt; 0 AND SUBQUERY(fileproviderItems, $item, $item.userInfo.keptItself == YES).@count == fileproviderItems.@count</string>
 			</dict>

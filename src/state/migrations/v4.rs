@@ -1,8 +1,11 @@
-//! Version 4, the drive (sprint 16), from 1.0.0's and 1.1.0's version 3: a pair is a
-//! sync pair or a drive; a drive's entries say whether they are kept, when
-//! last used, and when they last changed (macOS's anchors); settings for
-//! the whole computer. Every existing pair stays a sync pair. Released: never
-//! edited.
+//! Version 4, the drive (sprint 16) and choosing libraries (sprint 18), from
+//! 1.0.0's and 1.1.0's version 3: a pair is a sync pair or a drive; a
+//! drive's entries say whether they are kept, when last used, and when they
+//! last changed (macOS's anchors); settings for the whole computer; what an
+//! account does with a library new to it, and the libraries it knows
+//! (`seen`, replacing `declined`). Every existing pair stays a sync pair; an
+//! account auto-syncing goes on (`sync`), one that didn't lists (`silent`).
+//! Released with 1.2.0: never edited after.
 
 use rusqlite::Transaction;
 
@@ -104,6 +107,51 @@ CREATE TABLE setting (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE account_v4 (
+    id INTEGER PRIMARY KEY,
+    instance TEXT NOT NULL,
+    uuid TEXT NOT NULL,
+    email TEXT NOT NULL,
+    device TEXT NOT NULL,
+    -- The app password when it's kept here (no keychain, or `--no-keyring`).
+    password TEXT,
+    -- Else the name of its entry in the OS keychain (a random ID).
+    secret TEXT CHECK ((password IS NULL) <> (secret IS NULL)),
+    default_folder TEXT NOT NULL,
+    -- What a library new to the account does (one not in `seen`): synced (up
+    -- to auto_sync_limit), a drive, listed and notified, or listed only.
+    new_libraries TEXT NOT NULL DEFAULT 'notify'
+        CHECK (new_libraries IN ('sync', 'drive', 'notify', 'silent')),
+    -- New libraries up to this size (bytes) sync (new_libraries 'sync'); 0: no
+    -- limit.
+    auto_sync_limit INTEGER NOT NULL DEFAULT 524288000,
+    -- The server refused the app password (revoked): nothing runs until a new login.
+    signed_out INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (instance, uuid)
+);
+-- A limit set auto-synced: `sync` with it; none listed them: `silent`.
+INSERT INTO account_v4 (id, instance, uuid, email, device, password, secret, default_folder,
+                        new_libraries, auto_sync_limit, signed_out)
+    SELECT id, instance, uuid, email, device, password, secret, default_folder,
+           CASE WHEN auto_sync_limit IS NULL THEN 'silent' ELSE 'sync' END,
+           coalesce(auto_sync_limit, 524288000), signed_out
+    FROM account;
+DROP TABLE account;
+ALTER TABLE account_v4 RENAME TO account;
+
+-- The libraries an account knows: one not here is new, and gets the
+-- account's new_libraries once (then it's here). One removed stays: never
+-- added by itself again.
+CREATE TABLE seen (
+    account INTEGER NOT NULL REFERENCES account ON DELETE CASCADE,
+    library TEXT NOT NULL,
+    PRIMARY KEY (account, library)
+);
+INSERT INTO seen (account, library)
+    SELECT account, library FROM pair
+    UNION SELECT account, library FROM declined;
+DROP TABLE declined;
 "#,
     )?;
     Ok(())

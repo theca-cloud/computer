@@ -21,7 +21,9 @@ use crate::keychain::{self, KeychainError};
 use crate::local;
 use crate::ops;
 use crate::plan::{Action, Input, plan};
-use crate::state::{Account, Mode, Offer, Pair, RemoteState, State, StateError, Stop, Update};
+use crate::state::{
+    Account, Mode, NewLibraries, Offer, Pair, RemoteState, State, StateError, Stop, Update,
+};
 
 /// A full scan even without any sign of change: watchers drop events.
 const FULL_SCAN: Duration = Duration::from_secs(3600);
@@ -86,6 +88,17 @@ impl Default for Handle {
             provider: Arc::default(),
         }
     }
+}
+
+/// What a library new to an account came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Acted {
+    /// Synced, or a drive.
+    Added,
+    /// Listed (notified or not): decided.
+    Listed,
+    /// Not yet (no room, a failure): tried again, still new.
+    Again,
 }
 
 /// Runs every account until `shutdown`, picking up accounts added meanwhile:
@@ -248,6 +261,14 @@ struct Follower {
     provider_state: Arc<State>,
     #[cfg(target_os = "macos")]
     served: HashSet<i64>,
+    /// Per macOS drive, the system's last answer when it couldn't be asked
+    /// (said once, not every round).
+    #[cfg(target_os = "macos")]
+    unchecked: HashMap<i64, String>,
+    /// The macOS drives whose kept files are being downloaded (a thread
+    /// each, at most).
+    #[cfg(target_os = "macos")]
+    materializing: Arc<std::sync::Mutex<HashSet<i64>>>,
     /// Each pair's counter of changes to its entries, as last seen: a drive
     /// whose counter moved (a node kept, from another process) runs a round.
     seqs: HashMap<i64, i64>,
@@ -332,6 +353,10 @@ async fn follow(
         provider_state: Arc::new(State::open(state_path)?),
         #[cfg(target_os = "macos")]
         served: HashSet::new(),
+        #[cfg(target_os = "macos")]
+        unchecked: HashMap::new(),
+        #[cfg(target_os = "macos")]
+        materializing: Default::default(),
         stopped_at: HashMap::new(),
         stopping: shutdown.clone(),
         cancel,
@@ -570,7 +595,20 @@ impl Follower {
     #[cfg(target_os = "macos")]
     async fn provider_round(&mut self, p: &Pair) -> Result<(), EngineError> {
         let domain = drive::provider::domain_of(p);
-        match theca_fileprovider::host::enabled(&domain) {
+        let enabled = theca_fileprovider::host::enabled(&domain);
+        match &enabled {
+            Err(e) if self.unchecked.get(&p.id) != Some(e) => {
+                tracing::warn!(pair = p.id, "the drive not checked: {e}");
+                self.unchecked.insert(p.id, e.clone());
+            }
+            Err(_) => {}
+            Ok(_) => {
+                if self.unchecked.remove(&p.id).is_some() {
+                    tracing::info!(pair = p.id, "the drive checked again");
+                }
+            }
+        }
+        match enabled {
             Ok(None) => {
                 let why = "the drive was removed from this Mac".to_owned();
                 self.stop(p, Stop::Folder(why))?;
@@ -585,18 +623,85 @@ impl Follower {
                     self.state.set_pair_path(p.id, &folder, None)?;
                 }
             }
-            Ok(Some(false)) => {}
-            Err(e) => tracing::warn!(pair = p.id, "the drive not checked: {e}"),
+            Ok(Some(false)) | Err(_) => {}
         }
-        if p.position.is_none() && !self.resync(p).await? {
+        // A fresh listing wrote its own activity since `p` was read.
+        let listed = p.position.is_none();
+        if listed && !self.resync(p).await? {
             return Ok(());
         }
-        if drive::provider::apply_remote(&self.state, p)?
-            && let Err(e) = theca_fileprovider::host::signal(&domain)
-        {
+        self.materialize(p)?;
+        let changed = drive::provider::apply_remote(&self.state, p)?;
+        if changed && let Err(e) = theca_fileprovider::host::signal(&domain) {
             tracing::debug!(pair = p.id, "the system not told: {e}");
         }
-        self.state.set_activity(p.id, "up to date", true)?;
+        // Said when it changes (every Activity redraws the window and
+        // tray), which also ends an error the pair stopped on.
+        if p.activity != "up to date" || p.error.is_some() || listed || changed {
+            self.state.set_activity(p.id, "up to date", true)?;
+        }
+        Ok(())
+    }
+
+    /// A macOS drive's files kept and not downloaded (a keep from Finder or
+    /// `theca keep`, a file new in a kept folder): downloaded now by a read,
+    /// on a thread of the drive's own (macOS's own eager download is a
+    /// background task, which may wait long). Each file is tried once: one
+    /// kept meanwhile joins, one freed meanwhile is left; a failed one waits
+    /// for the drive's next round.
+    #[cfg(target_os = "macos")]
+    fn materialize(&self, p: &Pair) -> Result<(), EngineError> {
+        use drive::provider::{kept_files, still_kept};
+        fn locked(
+            busy: &std::sync::Mutex<HashSet<i64>>,
+        ) -> std::sync::MutexGuard<'_, HashSet<i64>> {
+            busy.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        let materialized = self.provider.materialized(p);
+        let mut wanted: Vec<_> = kept_files(&self.state, p)?
+            .into_iter()
+            .filter(|(node, _)| !materialized.contains(node))
+            .collect();
+        if wanted.is_empty() || !locked(&self.materializing).insert(p.id) {
+            return Ok(());
+        }
+        let (state, provider, pair) = (
+            self.provider_state.clone(),
+            self.provider.clone(),
+            p.clone(),
+        );
+        let busy = self.materializing.clone();
+        let span = tracing::Span::current();
+        std::thread::spawn(move || {
+            let _in = span.enter();
+            let mut tried = HashSet::new();
+            loop {
+                for (node, path) in wanted {
+                    tried.insert(node);
+                    if !matches!(still_kept(&state, &pair, node), Ok(true)) {
+                        continue;
+                    }
+                    match theca_fileprovider::host::materialize(&path) {
+                        Ok(()) => tracing::debug!(%node, "a kept file downloaded"),
+                        Err(e) => tracing::warn!(%node, "a kept file not downloaded: {e}"),
+                    }
+                }
+                // Looked at again with the drive still marked busy: a keep
+                // made now either is in this listing or starts a thread.
+                let mut busy = locked(&busy);
+                let materialized = provider.materialized(&pair);
+                wanted = kept_files(&state, &pair)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(node, _)| !materialized.contains(node) && !tried.contains(node))
+                    .collect();
+                if wanted.is_empty() {
+                    busy.remove(&pair.id);
+                    return;
+                }
+            }
+        });
         Ok(())
     }
 
@@ -795,17 +900,19 @@ impl Follower {
         Ok(())
     }
 
-    /// The libraries the account sees and doesn't sync: those small enough
-    /// (and never declined) are synced into the default folder; the others
-    /// are offered (`Update::Offered`, the GUI; `libraries`, the CLI).
+    /// The libraries the account sees and doesn't sync or mount: listed
+    /// (`Update::Offered`, the window; `libraries`, the CLI). One new to the
+    /// account (not in `seen`) gets its `new_libraries` once, then is seen:
+    /// synced into the default folder (up to the size limit: notified above
+    /// it), a drive (where one can't be: an error notice), notified, or only
+    /// listed.
     async fn auto_sync(&mut self) -> Result<(), EngineError> {
-        // The account as it is now: its limit and folder are settings.
+        // The account as it is now: its choice and folder are settings.
         if let Some(account) = self.state.account(self.account.id)? {
             self.account = account;
         }
-        let limit = self.account.auto_sync_limit;
         let pairs = self.pairs()?;
-        let declined = self.state.declined(self.account.id)?;
+        let seen = self.state.seen(self.account.id)?;
         let candidates: Vec<api::FeedLibrary> = self
             .libraries
             .iter()
@@ -824,63 +931,35 @@ impl Follower {
             let Ok(info) = self.client.library(l.id).await else {
                 continue;
             };
-            let path = ops::default_path(
-                &self.client,
-                &self.account.default_folder,
-                (l.id, &l.name, l.organization),
-                &others,
-                &taken,
-            )
-            .await;
-            let small = limit.is_some_and(|limit| info.size <= limit);
-            // A folder already there with content: offered, never merged unasked.
-            let occupied = std::fs::read_dir(&path).is_ok_and(|mut d| d.next().is_some());
-            let synced = small
-                && !declined.contains(&l.id)
-                && !occupied
-                && ops::check_path(&self.state, &path, None).is_ok()
-                && ops::has_room(&path, info.size)
-                // Created here, last: the pair's folder must exist before its
-                // first round (it would stop as missing otherwise).
-                && std::fs::create_dir_all(&path).is_ok();
-            if !synced {
+            let new = !seen.contains(&l.id);
+            let acted = match (new, self.account.new_libraries) {
+                (false, _) => Acted::Listed,
+                (true, NewLibraries::Silent) => Acted::Listed,
+                (true, NewLibraries::Notify) => {
+                    self.notify_new(&l.name);
+                    Acted::Listed
+                }
+                (true, NewLibraries::Sync) => {
+                    let acted = self.sync_new(&l, info.size, &others, &mut taken).await?;
+                    if acted == Acted::Listed {
+                        self.notify_new(&l.name);
+                    }
+                    acted
+                }
+                (true, NewLibraries::Drive) => self.drive_new(&l).await?,
+            };
+            // Seen once decided: a disk full, a network failure, is tried
+            // again the next time (1.1.0 retried every pass too).
+            if new && acted != Acted::Again {
+                self.state.see(self.account.id, &[l.id])?;
+            }
+            if acted != Acted::Added {
                 offered.push(Offer {
                     library: l.id,
                     name: l.name.clone(),
                     size: info.size,
                 });
-                continue;
             }
-            let id = self.state.add_pair(&Pair {
-                id: 0,
-                account: self.account.id,
-                library: l.id,
-                root: l.root,
-                library_name: l.name.clone(),
-                path: path.clone(),
-                root_file_id: None,
-                position: None,
-                position_event: None,
-                paused: false,
-                stop: None,
-                writable: l.writable,
-                activity: String::new(),
-                error: None,
-                synced_at: None,
-                mode: Mode::Sync,
-            })?;
-            self.state.notify(
-                Some(self.account.id),
-                Some(id),
-                "info",
-                Some(&path.to_string_lossy()),
-                &format!("{} is now synced here", l.name),
-                None,
-            )?;
-            self.state
-                .set_pair_path(id, &path, local::root_id(&path).as_deref())?;
-            taken.push(path);
-            self.dirty.insert(id);
         }
         self.offered
             .lock()
@@ -891,6 +970,122 @@ impl Follower {
             libraries: offered,
         });
         Ok(())
+    }
+
+    /// A new library said (the window shows an OS notification).
+    fn notify_new(&self, name: &str) {
+        tracing::info!(library = name, "a new library, listed");
+        self.state.publish(Update::NewLibrary {
+            account: self.account.id,
+            name: name.to_owned(),
+        });
+    }
+
+    /// A new library synced into the default folder: added; listed (to be
+    /// notified) when it is over the size limit (0: any), its folder holds
+    /// files or isn't one a pair may have; again later when the disk has no
+    /// room or the folder can't be made.
+    async fn sync_new(
+        &mut self,
+        l: &api::FeedLibrary,
+        size: i64,
+        others: &[(Uuid, String)],
+        taken: &mut Vec<PathBuf>,
+    ) -> Result<Acted, EngineError> {
+        let limit = self.account.auto_sync_limit;
+        let path = ops::default_path(
+            &self.client,
+            &self.account.default_folder,
+            (l.id, &l.name, l.organization),
+            others,
+            taken,
+        )
+        .await;
+        let fits = limit == 0 || size <= limit;
+        // A folder already there with content: listed, never merged unasked.
+        let occupied = std::fs::read_dir(&path).is_ok_and(|mut d| d.next().is_some());
+        if !fits || occupied || ops::check_path(&self.state, &path, None).is_err() {
+            return Ok(Acted::Listed);
+        }
+        // Created here, last: the pair's folder must exist before its first
+        // round (it would stop as missing otherwise).
+        if !ops::has_room(&path, size) || std::fs::create_dir_all(&path).is_err() {
+            tracing::info!(library = l.name, path = %path.display(), "not synced yet: no room, or no folder");
+            return Ok(Acted::Again);
+        }
+        let id = self.state.add_pair(&Pair {
+            id: 0,
+            account: self.account.id,
+            library: l.id,
+            root: l.root,
+            library_name: l.name.clone(),
+            path: path.clone(),
+            root_file_id: None,
+            position: None,
+            position_event: None,
+            paused: false,
+            stop: None,
+            writable: l.writable,
+            activity: String::new(),
+            error: None,
+            synced_at: None,
+            mode: Mode::Sync,
+        })?;
+        self.state.notify(
+            Some(self.account.id),
+            Some(id),
+            "info",
+            Some(&path.to_string_lossy()),
+            &format!("{} is now synced here", l.name),
+            None,
+        )?;
+        self.state
+            .set_pair_path(id, &path, local::root_id(&path).as_deref())?;
+        taken.push(path);
+        self.dirty.insert(id);
+        Ok(Acted::Added)
+    }
+
+    /// A new library added as a drive; where one can't be, an error notice
+    /// naming it and why, never synced instead; the add failing (the
+    /// server, the keychain), the notice too, and again later.
+    async fn drive_new(&mut self, l: &api::FeedLibrary) -> Result<Acted, EngineError> {
+        let (refused, acted) = match crate::drive::unavailable() {
+            Some(why) => (why, Acted::Listed),
+            None => match ops::add(
+                &self.state,
+                &self.account,
+                &l.id.to_string(),
+                None,
+                false,
+                Mode::Drive,
+            )
+            .await
+            {
+                Ok(pair) => {
+                    self.state.notify(
+                        Some(self.account.id),
+                        Some(pair.id),
+                        "info",
+                        Some(&pair.path.to_string_lossy()),
+                        &format!("{} is now a drive here", l.name),
+                        None,
+                    )?;
+                    self.dirty.insert(pair.id);
+                    return Ok(Acted::Added);
+                }
+                Err(e) => (e.to_string(), Acted::Again),
+            },
+        };
+        self.state.notify(
+            Some(self.account.id),
+            None,
+            "error",
+            None,
+            &format!("{} not added as a drive: {refused}", l.name),
+            None,
+        )?;
+        Ok(acted)
     }
 
     async fn changes(&mut self, changes: api::Changes) -> Result<(), EngineError> {
@@ -1034,6 +1229,12 @@ impl Follower {
             }
         }
         for p in self.pairs()? {
+            // A macOS drive: no scan (the system holds its folder), its
+            // rounds when something changes.
+            #[cfg(target_os = "macos")]
+            if p.mode == Mode::Drive {
+                continue;
+            }
             // The hourly full scan; and a folder gone (renamed: followed)
             // without the watcher, which watches its old path, telling.
             if self.full_at.get(&p.id).is_none_or(|at| *at <= now) || !p.path.is_dir() {
@@ -1547,7 +1748,8 @@ mod tests {
                 device: "d".into(),
                 password: crate::state::Password::InState("p".into()),
                 default_folder: dir.path().to_owned(),
-                auto_sync_limit: None,
+                new_libraries: Default::default(),
+                auto_sync_limit: 0,
                 signed_out: false,
             })
             .unwrap();

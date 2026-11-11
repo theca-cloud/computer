@@ -20,7 +20,7 @@ use sqlx::Connection;
 use sqlx::Executor;
 use theca::engine::{self, Handle};
 use theca::ops;
-use theca::state::{Account, Mode, Pair, State};
+use theca::state::{Account, Mode, NewLibraries, Pair, State};
 use theca_client::{Cancel, Client, DownloadOptions, MemorySink, download};
 use theca_common::api;
 use tokio::sync::watch;
@@ -459,12 +459,13 @@ impl World {
             Some(dir.path().join("theca")),
             Some(created.password),
             false,
+            // New libraries listed only, unless a test says otherwise.
+            Some(NewLibraries::Silent),
+            NewLibraries::Silent,
             |_| panic!("a token needs no browser"),
         )
         .await
         .unwrap();
-        // New libraries aren't synced by themselves unless a test says so.
-        state.set_auto_sync_limit(account.id, None).unwrap();
         (dir, state_path, account)
     }
 
@@ -544,20 +545,20 @@ impl World {
         let folder = dir.path().join("theca");
         let state = State::open(&state_path).unwrap();
         // The app password as a script gives it (`THECA_TOKEN`): no flow.
-        let mut account = ops::login(
+        let account = ops::login(
             &state,
             &self.server.url,
             name,
             Some(folder.clone()),
             Some(password.into()),
             keyring,
+            // New libraries listed only, unless a test says otherwise.
+            Some(NewLibraries::Silent),
+            NewLibraries::Silent,
             |_| panic!("a token needs no browser"),
         )
         .await
         .unwrap();
-        // New libraries aren't synced by themselves unless a test says so.
-        account.auto_sync_limit = None;
-        state.set_auto_sync_limit(account.id, None).unwrap();
         let pair = ops::add(
             &state,
             &account,

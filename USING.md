@@ -33,6 +33,19 @@ Logging in creates an app password for this computer, revocable from the web app
 
 On macOS, until the app is signed, each new version asks once for your password to read its keychain entry: click **Always Allow**.
 
+## Choosing libraries
+
+Right after signing in, the app lists the account's libraries: each one can be **synced** to a folder (`<the folder you chose>/<library>`, changeable per library), kept as a **drive**, or left (**Nothing**). Nothing is added until you click **Add**; **Later** adds nothing, and the libraries stay listed in the window.
+
+The same step asks what libraries added to the account later do, changeable in the settings:
+
+- **Show them, with a notification** (the default): listed in the window, with a system notification; nothing to answer.
+- **Show them, quietly**: listed only.
+- **Sync them by themselves**, into the account's folder, up to a size (500 MB by default, 0 for no limit): a larger one is shown, with a notification.
+- **Add them as drives**: where this computer can't hold a drive, it says so, and syncs nothing instead.
+
+A library you removed is never added again by itself.
+
 ## Ignore files
 
 A file named `.thecaignore` keeps what it names from being uploaded, in its folder and every folder below it. Its patterns are `.gitignore`'s, with git's rules:
@@ -54,13 +67,13 @@ A library can be a **drive** instead of a synced folder: your file manager shows
 | | Where it is | Needs |
 |---|---|---|
 | Windows | the folder you choose, as a synced one (NTFS only) | Windows 10 1709 or newer; Theca running for a file not downloaded to open |
-| macOS | `~/Library/CloudStorage/Theca-<library>`, where macOS puts it (in Finder's sidebar) | macOS 13; the app (its `theca` from the command line) running for a file not downloaded to open |
+| macOS | `~/Library/CloudStorage/Theca-<library>`, where macOS puts it (in Finder's sidebar); `Theca-<library> (<organization>)` when another drive has the library's name (then numbered) | macOS 13; the app (its `theca` from the command line) running for a file not downloaded to open |
 | Linux | the folder you choose, as a synced one | `fuse3`; Theca running for the folder to show anything (it is mounted while Theca runs) |
 
 **On a Mac, macOS adds a drive switched off**: switch it on in **System Settings → General → Login Items & Extensions → File Providers → Theca** (the app has a button to that pane; `theca status` says when a drive waits for it).
 
-- **Keep a file or folder on this computer** (downloaded, never freed, what arrives later in a folder kept too): **Keep…** in the app, `theca keep <path>`, Windows' **Always keep on this device**, or Finder's **Keep Downloaded** (and **Don't Keep Downloaded** to stop). Kept files don't count in the drive limit.
-- **Free its space now** (it stays listed, downloaded again when opened): **Free** in the app, `theca free <path>`. A file open in a program is freed once it is closed; an edit not uploaded yet is never freed.
+- **Keep a file or folder on this computer** (downloaded, never freed, what arrives later in a folder kept too): **Keep…** in the app, `theca keep <path>`, Windows' **Always keep on this device**, or Finder's **Always Keep on This Mac**. Kept files don't count in the drive limit.
+- **Free its space now** (it stays listed, downloaded again when opened, no longer kept): **Free** in the app, `theca free <path>`, Windows' **Free up space**, or Finder's **Free Up Space** (on what is kept). A file open in a program is freed once it is closed (on a Mac it is refused while open: free it again); an edit not uploaded yet is never freed.
 - **The drive limit**, one for the computer: `theca drive-limit` shows it, `theca drive-limit 20GB` (or `20GiB`) sets it, `theca drive-limit default` goes back to the default (10 GiB, or a tenth of the disk if smaller). Kept files and edits not uploaded yet don't count. Windows and macOS may free more on their own when the disk is low.
 - **What counts as a use** (the limit frees the least recently used first): every open on Linux; on Windows, an open by any program but Theca; on macOS, an open through Finder or "Open With" (a file read by a script isn't seen as used). A file never opened since its download counts from its download.
 - **Offline**, a file already downloaded opens; one that isn't fails to open (Theca says so on Windows and Linux; Finder shows its error on a Mac).
@@ -70,14 +83,16 @@ A library can be a **drive** instead of a synced folder: your file manager shows
 ## Headless use
 
 ```sh
-theca login https://cloud.example.com   # prints a page to open and a code to check
+theca login https://cloud.example.com   # prints a page to open and a code to check, then the libraries
 theca libraries                         # what the account can sync
 theca add Documents                     # into ~/theca/Documents by default
 theca run                               # syncs, in the foreground (what a service runs)
 theca status                            # what syncs, what it's doing, errors
 ```
 
-Every command and its options: `theca --help`, `theca <command> --help`. The commands: `login`, `accounts`, `account` (an account's default folder and the size up to which new libraries sync by themselves), `remove-account`, `libraries`, `add`, `remove`, `pause`, `resume`, `locate` (a folder moved or on another disk), `status`, `undo` (restores what the last deletion moved to the trash), `run`, `logs`; for drives, `keep`, `free`, `drive-limit`. A script logs in without a browser with an app password made in the web app: `THECA_TOKEN=… theca login <instance>`.
+A login adds no library: it lists them with the `theca add` lines to choose with. What libraries new to the account later do is `--new-libraries`: `silent` by default (listed only, `theca libraries`), `sync` (up to the size limit), or `drive`.
+
+Every command and its options: `theca --help`, `theca <command> --help`. The commands: `login`, `accounts`, `account` (an account's default folder, and what libraries new to it do: `--new-libraries sync|drive|notify|silent`, `--auto-sync-limit 2GB`, 0 for no limit), `remove-account`, `libraries`, `add`, `remove`, `pause`, `resume`, `locate` (a folder moved or on another disk), `status`, `undo` (restores what the last deletion moved to the trash), `run`, `logs`; for drives, `keep`, `free`, `drive-limit`. A script logs in without a browser with an app password made in the web app: `THECA_TOKEN=… theca login <instance>`.
 
 One `theca run`, or the app, syncs a state file at a time: a second one refuses to start. `run` stops within a few seconds on Ctrl-C or `SIGTERM`.
 

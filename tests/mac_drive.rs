@@ -49,7 +49,7 @@ fn read(path: &Path) -> String {
 /// The domain switched on as the user would in System Settings, by script:
 /// its `Enabled` in fileproviderd's Domains.plist, fileproviderd restarted
 /// (Experiment 3; private, and only for CI).
-fn switch_on(domain: &str) {
+fn switch_on(domain: &str, theca: &Path, state: &Path) {
     let plist = PathBuf::from(std::env::var("HOME").unwrap())
         .join("Library/Application Support/FileProvider/rs.theca.computer.drive/Domains.plist");
     for _ in 0..60 {
@@ -66,7 +66,24 @@ fn switch_on(domain: &str) {
             .status()
             .unwrap()
     };
-    assert!(set().success(), "{} not switched on", plist.display());
+    // A developer's Mac may refuse the edit: switched on by hand there
+    // (`ci/mac/ci.sh --drive` says so), waited for as the app sees it (only
+    // the app, with its extension, can ask macOS about its drives).
+    if !set().success() {
+        for _ in 0..240 {
+            let status = Command::new(theca)
+                .arg("--state")
+                .arg(state)
+                .arg("status")
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&status.stdout).contains("a drive, switched on") {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        panic!("{} not switched on, by script or by hand", plist.display());
+    }
     let _ = Command::new("killall")
         .args(["-9", "fileproviderd"])
         .status();
@@ -83,6 +100,21 @@ impl Drop for Running {
     }
 }
 
+/// The test's drives removed from macOS when dropped, the test failed or
+/// not: one left would keep its folder's name, and the next run's drive of
+/// that name would be refused.
+struct Removed(PathBuf, PathBuf);
+
+impl Drop for Removed {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.0)
+            .arg("--state")
+            .arg(&self.1)
+            .arg("remove-drives")
+            .output();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mac_drive_is_the_library() {
     let Some(app) = app() else {
@@ -96,6 +128,22 @@ async fn a_mac_drive_is_the_library() {
     w.converge(&[&s]).await;
 
     let (_dir, state_path, _account) = w.logged_in("mac").await;
+    let _removed = Removed(theca.clone(), state_path.clone());
+    // Its `theca`s' logs where ci/mac/ci.sh collects them, if it says where.
+    if let Some(logs) = std::env::var_os("THECA_TEST_LOGS") {
+        let set = Command::new(&theca)
+            .arg("--state")
+            .arg(&state_path)
+            .args(["logs", "--level", "debug", "--path"])
+            .arg(logs)
+            .output()
+            .unwrap();
+        assert!(
+            set.status.success(),
+            "{}",
+            String::from_utf8_lossy(&set.stderr)
+        );
+    }
     let added = Command::new(&theca)
         .arg("--state")
         .arg(&state_path)
@@ -110,7 +158,7 @@ async fn a_mac_drive_is_the_library() {
     );
     assert!(said.contains("Switch it on"), "{said}");
     let pair = State::open(&state_path).unwrap().pairs().unwrap().remove(0);
-    switch_on(&domain_of(&pair));
+    switch_on(&domain_of(&pair), &theca, &state_path);
     let _run = Running(
         Command::new(&theca)
             .arg("--state")
@@ -192,4 +240,18 @@ async fn a_mac_drive_is_the_library() {
         !s.path("a.txt").exists()
     })
     .await;
+
+    // Removed: macOS names a folder for what it kept even when nothing was
+    // left: the removal still succeeds.
+    let removed = Command::new(&theca)
+        .arg("--state")
+        .arg(&state_path)
+        .args(["remove", "Docs"])
+        .output()
+        .unwrap();
+    assert!(
+        removed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
 }

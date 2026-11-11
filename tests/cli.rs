@@ -10,6 +10,7 @@ use std::process::{Command, Output};
 
 use common::*;
 use theca::exit;
+use theca::state::NewLibraries;
 use theca::state::Stop;
 
 fn theca(state: &Path, args: &[&str]) -> Output {
@@ -190,6 +191,68 @@ async fn a_script_logs_in_without_the_keychain() {
     );
 }
 
+/// `login` adds nothing: it lists the libraries with the `theca add` lines;
+/// libraries new later are `silent`, or `--new-libraries`; `notify` (no
+/// window to notify in) is refused. Every library there at login is seen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_login_adds_nothing_and_lists() {
+    let w = world().await;
+    let password = || async {
+        w.admin
+            .create_app_password(&theca_common::api::CreateAppPassword {
+                name: "script".into(),
+                organization: None,
+                library: None,
+                read_only: false,
+            })
+            .await
+            .unwrap()
+            .password
+    };
+    let login = |state: &Path, token: String, new: Option<&str>| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_theca"));
+        c.arg("--state").arg(state).args(["login", &w.server.url]);
+        if let Some(new) = new {
+            c.args(["--new-libraries", new]);
+        }
+        c.env("THECA_TOKEN", token)
+            .env("THECA_NO_KEYRING", "1")
+            .output()
+            .unwrap()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state.sqlite");
+    let out = login(&state, password().await, None);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains(r#"theca add "Docs""#), "{said}");
+    assert!(said.contains("listed only"), "{said}");
+    let s = theca::state::State::open(&state).unwrap();
+    assert!(s.pairs().unwrap().is_empty());
+    let account = &s.accounts().unwrap()[0];
+    assert_eq!(account.new_libraries, NewLibraries::Silent);
+    assert!(s.seen(account.id).unwrap().contains(&w.library.id));
+    // Signed in again: a library shared meanwhile is still new to it.
+    let later = w
+        .admin
+        .create_library(w.organization, "Later")
+        .await
+        .unwrap();
+    let out = login(&state, password().await, None);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!s.seen(account.id).unwrap().contains(&later.id));
+
+    let other = tempfile::tempdir().unwrap();
+    let state = other.path().join("state.sqlite");
+    let out = login(&state, password().await, Some("drive"));
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let s = theca::state::State::open(&state).unwrap();
+    assert_eq!(s.accounts().unwrap()[0].new_libraries, NewLibraries::Drive);
+    let out = login(&state, password().await, Some("notify"));
+    assert_eq!(code(&out), exit::USAGE);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("needs the app's window"));
+}
+
 /// `theca account` shows an account's settings, and changes them.
 #[tokio::test(flavor = "multi_thread")]
 async fn account_settings() {
@@ -212,14 +275,42 @@ async fn account_settings() {
     assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
     let account = a.state().account(a.account.id).unwrap().unwrap();
     assert_eq!(account.default_folder, folder);
-    assert_eq!(account.auto_sync_limit, Some(10 * 1024 * 1024));
+    // 1.0's flag keeps its meaning: synced up to 10 MiB, 0 none.
+    assert_eq!(
+        (account.new_libraries, account.auto_sync_limit),
+        (NewLibraries::Sync, 10 * 1024 * 1024)
+    );
     assert!(String::from_utf8_lossy(&out.stdout).contains("10 MiB"));
     let out = theca(&a.state_path, &["account", &email, "--auto-sync-mb", "0"]);
     assert_eq!(code(&out), 0);
     let account = a.state().account(a.account.id).unwrap().unwrap();
-    assert_eq!(account.auto_sync_limit, None);
+    assert_eq!(account.new_libraries, NewLibraries::Silent);
     assert_eq!(account.default_folder, folder);
-    assert!(String::from_utf8_lossy(&out.stdout).contains("never synced by themselves"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("listed only"));
+    // The new flags: what new libraries do, and the size, 0 for none.
+    let out = theca(
+        &a.state_path,
+        &[
+            "account",
+            &email,
+            "--new-libraries",
+            "drive",
+            "--auto-sync-limit",
+            "0",
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    let account = a.state().account(a.account.id).unwrap().unwrap();
+    assert_eq!(
+        (account.new_libraries, account.auto_sync_limit),
+        (NewLibraries::Drive, 0)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("added as drives"));
+    let out = theca(
+        &a.state_path,
+        &["account", &email, "--new-libraries", "loud"],
+    );
+    assert_eq!(code(&out), exit::USAGE);
 }
 
 /// A section of `USING.md`: the first cell of each row of its table.
@@ -279,4 +370,51 @@ fn using_lists_the_environment_variables() {
     // The log's filter: tracing's, not clap's.
     variables.insert("RUST_LOG".into());
     assert_eq!(using("Environment variables"), variables);
+}
+
+/// Every flag `USING.md` shows (on a `theca` command, or alone) is one a
+/// command has: a flag renamed, or the page ahead of the code, fails here.
+#[test]
+fn using_shows_flags_the_commands_have() {
+    let help = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_theca"))
+            .args(args)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let main = help(&["--help"]);
+    let commands: Vec<&str> = main
+        .split("Commands:\n")
+        .nth(1)
+        .unwrap()
+        .lines()
+        .take_while(|l| !l.is_empty())
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|c| *c != "help")
+        .collect();
+    let mut known = main.clone();
+    for c in &commands {
+        known.push_str(&help(&[c, "--help"]));
+    }
+    let flag = |c: char| c.is_ascii_lowercase() || c == '-';
+    let known: BTreeSet<&str> = known.split(|c| !flag(c)).collect();
+    let page = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/USING.md")).unwrap();
+    let mut checked = 0;
+    // Every other piece between backticks is code.
+    for code in page.split('`').skip(1).step_by(2).flat_map(str::lines) {
+        let words: Vec<&str> = code.split_whitespace().collect();
+        if !words
+            .first()
+            .is_some_and(|w| *w == "theca" || w.starts_with("--"))
+        {
+            continue;
+        }
+        for word in words.iter().filter(|w| w.starts_with("--")) {
+            let shown: String = word.chars().take_while(|c| flag(*c)).collect();
+            assert!(known.contains(shown.as_str()), "`{code}`: no {shown}");
+            checked += 1;
+        }
+    }
+    assert!(checked >= 10, "only {checked} flags found in USING.md");
 }

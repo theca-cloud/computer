@@ -94,6 +94,11 @@ enum Command {
         /// `THECA_NO_KEYRING`: anything but empty, 0, false, no or off.
         #[arg(long, env = "THECA_NO_KEYRING", value_parser = clap::builder::FalseyValueParser::new())]
         no_keyring: bool,
+        /// What libraries new to the account do: sync (up to the size
+        /// limit), drive, or silent (listed only: `theca libraries`).
+        /// Default: silent. Its libraries now are added with `theca add`.
+        #[arg(long, value_parser = headless_new_libraries)]
+        new_libraries: Option<state::NewLibraries>,
     },
     /// The accounts on this device.
     Accounts,
@@ -103,9 +108,17 @@ enum Command {
         /// Where its libraries go by default.
         #[arg(long)]
         folder: Option<PathBuf>,
-        /// Libraries up to this many MB appearing later are synced by
-        /// themselves (0: never).
-        #[arg(long)]
+        /// What libraries new to the account do: sync (up to the size
+        /// limit), drive, notify (the app shows it), or silent (listed only).
+        #[arg(long, value_parser = clap::value_parser!(state::NewLibraries))]
+        new_libraries: Option<state::NewLibraries>,
+        /// New libraries up to this size sync (`--new-libraries sync`):
+        /// 500MB, 2GiB, or 0 for no limit.
+        #[arg(long, value_parser = limit_value)]
+        auto_sync_limit: Option<LimitValue>,
+        /// 1.0's flag, kept: libraries up to this many MB sync by
+        /// themselves, 0 none (`--new-libraries silent`).
+        #[arg(long, hide = true)]
         auto_sync_mb: Option<i64>,
     },
     /// Remove an account from this device.
@@ -201,7 +214,12 @@ enum Command {
     /// Every drive removed, as `remove` does (the Windows uninstaller runs
     /// it: no sync root stays registered).
     #[command(hide = true)]
-    RemoveDrives,
+    RemoveDrives {
+        /// On a Mac, also every other Theca drive macOS has, whatever state
+        /// added it (an earlier one's, a test's): the checks' clean start.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -270,6 +288,7 @@ async fn command(cli: Cli) -> Result<()> {
             folder,
             token,
             no_keyring,
+            new_libraries,
         } => {
             let name = name.unwrap_or_else(ops::device_name);
             let account = ops::login(
@@ -279,7 +298,9 @@ async fn command(cli: Cli) -> Result<()> {
                 folder,
                 token,
                 !no_keyring,
-                |flow| {
+                new_libraries,
+                state::NewLibraries::Silent,
+                |flow: &theca_common::api::LoginFlow| {
                     println!("Open this page to allow \"{name}\": {}", flow.url);
                     println!("Check it shows the code {}", flow.code);
                 },
@@ -297,7 +318,39 @@ async fn command(cli: Cli) -> Result<()> {
                 account.instance,
                 account.default_folder.display()
             );
-            println!("Next: theca libraries, then theca add <library>");
+            println!(
+                "Libraries new to it later: {}.",
+                new_libraries_said(account.new_libraries, account.auto_sync_limit)
+            );
+            // Nothing added by the login: each chosen with `theca add` (the
+            // login worked even if this list can't be had).
+            match ops::libraries(&state, &account).await {
+                Ok(libraries) => {
+                    let unsynced: Vec<_> = libraries.iter().filter(|l| l.pair.is_none()).collect();
+                    if !unsynced.is_empty() {
+                        println!("Its libraries, to add as a synced folder or a drive:");
+                    }
+                    for l in &unsynced {
+                        let size = l.size.map_or_else(|| "?".into(), size);
+                        // Two of one name: by its ID (`add` refuses the name).
+                        let twins = libraries
+                            .iter()
+                            .filter(|o| {
+                                theca::local::key(&o.library.name)
+                                    == theca::local::key(&l.library.name)
+                            })
+                            .count();
+                        let which = if twins > 1 {
+                            l.library.id.to_string()
+                        } else {
+                            format!("{:?}", l.library.name)
+                        };
+                        let organization = l.organization.as_deref().unwrap_or("?");
+                        println!("  theca add {which}  (or --drive)  # {size}, {organization}");
+                    }
+                }
+                Err(e) => println!("Its libraries: theca libraries ({e})."),
+            }
         }
         Command::Accounts => {
             for a in state.accounts()? {
@@ -315,6 +368,8 @@ async fn command(cli: Cli) -> Result<()> {
         Command::Account {
             account,
             folder,
+            new_libraries,
+            auto_sync_limit,
             auto_sync_mb,
         } => {
             let account = ops::find_account(&state, Some(&account))?;
@@ -323,19 +378,32 @@ async fn command(cli: Cli) -> Result<()> {
                 let folder = std::path::absolute(&folder).unwrap_or(folder);
                 state.set_default_folder(account.id, &folder)?;
             }
+            // 1.0's meaning: MB synced by themselves, 0 none.
             if let Some(mb) = auto_sync_mb {
-                state.set_auto_sync_limit(account.id, (mb > 0).then_some(mb * 1024 * 1024))?;
+                if mb > 0 {
+                    state.set_new_libraries(account.id, state::NewLibraries::Sync)?;
+                    state.set_auto_sync_limit(account.id, mb * 1024 * 1024)?;
+                } else {
+                    state.set_new_libraries(account.id, state::NewLibraries::Silent)?;
+                }
+            }
+            if let Some(new) = new_libraries {
+                state.set_new_libraries(account.id, new)?;
+            }
+            if let Some(limit) = auto_sync_limit {
+                let bytes = match limit {
+                    LimitValue::Bytes(b) => i64::try_from(b).unwrap_or(i64::MAX),
+                    LimitValue::Default => ops::AUTO_SYNC_LIMIT,
+                };
+                state.set_auto_sync_limit(account.id, bytes)?;
             }
             let a = state.account(account.id)?.unwrap_or(account);
             println!("{} on {}", a.email, a.instance);
             println!("  libraries go into {}", a.default_folder.display());
-            match a.auto_sync_limit {
-                Some(limit) => println!(
-                    "  new libraries up to {} are synced by themselves",
-                    size(limit)
-                ),
-                None => println!("  new libraries are offered, never synced by themselves"),
-            }
+            println!(
+                "  new libraries: {}",
+                new_libraries_said(a.new_libraries, a.auto_sync_limit)
+            );
         }
         Command::RemoveAccount {
             account,
@@ -416,7 +484,7 @@ async fn command(cli: Cli) -> Result<()> {
             }
         }
         Command::Status => status(&state)?,
-        Command::RemoveDrives => {
+        Command::RemoveDrives { all } => {
             for pair in state.pairs()? {
                 if pair.mode == state::Mode::Drive {
                     let kept = ops::remove(&state, &pair, false)?;
@@ -426,6 +494,31 @@ async fn command(cli: Cli) -> Result<()> {
                     }
                 }
             }
+            #[cfg(target_os = "macos")]
+            if all {
+                let domains = theca_fileprovider::host::domains().map_err(ops::OpError::Refused)?;
+                let mut refused = Vec::new();
+                for d in domains {
+                    match theca_fileprovider::host::remove(&d.id) {
+                        Ok(left) => {
+                            println!("The drive {} is removed from this Mac.", d.name);
+                            if let Some(left) = left {
+                                println!("What wasn't uploaded is in {}.", left.display());
+                            }
+                        }
+                        Err(e) => refused.push(format!("{}: {e}", d.name)),
+                    }
+                }
+                if !refused.is_empty() {
+                    return Err(ops::OpError::Refused(format!(
+                        "macOS didn't remove: {}",
+                        refused.join("; ")
+                    ))
+                    .into());
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = all;
         }
         Command::Free { paths } => {
             for path in paths {
@@ -603,8 +696,15 @@ fn status(state: &State) -> Result<()> {
             #[cfg(target_os = "macos")]
             if p.mode == state::Mode::Drive {
                 let domain = theca::drive::provider::domain_of(p);
-                if theca_fileprovider::host::enabled(&domain) == Ok(Some(false)) {
-                    println!("    a drive waiting to be switched on: {SWITCH_ON}");
+                match theca_fileprovider::host::enabled(&domain) {
+                    Ok(Some(true)) => println!("    a drive, switched on"),
+                    Ok(Some(false)) => {
+                        println!("    a drive waiting to be switched on: {SWITCH_ON}")
+                    }
+                    Ok(None) => {
+                        println!("    a drive macOS doesn't have (removed in System Settings?)")
+                    }
+                    Err(e) => println!("    a drive macOS doesn't say about yet ({e})"),
                 }
             }
             #[cfg(any(target_os = "linux", windows))]
@@ -658,6 +758,31 @@ fn status(state: &State) -> Result<()> {
 }
 
 /// `1.2 MiB`: as the app and the web app show sizes.
+/// What libraries new to an account do, said.
+fn new_libraries_said(new: state::NewLibraries, limit: i64) -> String {
+    use state::NewLibraries::*;
+    match new {
+        Sync if limit == 0 => "synced by themselves (sync, no size limit)".into(),
+        Sync => format!(
+            "synced by themselves up to {}, notified above (sync)",
+            limit_size(limit.max(0) as u64)
+        ),
+        Drive => "added as drives (drive)".into(),
+        Notify => "listed, with a notification from the app (notify)".into(),
+        Silent => "listed only: theca libraries (silent)".into(),
+    }
+}
+
+/// `login --new-libraries`: what a computer without the app's window can do.
+fn headless_new_libraries(value: &str) -> std::result::Result<state::NewLibraries, String> {
+    match value.parse()? {
+        state::NewLibraries::Notify => {
+            Err("notify needs the app's window: sync, drive or silent".into())
+        }
+        new => Ok(new),
+    }
+}
+
 /// A setting's value, or `default`: back to it.
 #[derive(Clone)]
 enum Reset<T> {

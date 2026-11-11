@@ -21,9 +21,21 @@ Files on Windows, and on macOS a minimal `Theca.app` with the drive's extension,
 installed before the tests (`ci/mac-app.sh`), its domain switched on by script. Woodpecker's
 image has no FUSE: the drive's scenarios skip there. The packages check what each OS's drive
 needs: the `.deb` depends on `fuse3`, the Windows uninstaller removes a drive, the `.dmg`'s
-app carries its extension, signed and still sandboxed. Before a release, a developer's Mac
-runs `ci/mac-drive-check.sh` (a download quarantined, opened through Gatekeeper, a drive
-added and switched on): no runner quarantines what it builds.
+app carries its extension, signed and still sandboxed.
+
+Before a release, a developer's Mac runs `ci/mac/drive-check.sh <the .dmg>`: no runner
+quarantines what it builds. It sets up what it can itself (a fresh local server,
+`ci/mac/server.sh` with CE's compose and its data in `ci/mac/data/`, on `THECA_PORT`, 8080 by default; its admin; a test
+library and its files; the app's login with an app password; the app copied in, its
+quarantine removed), and asks only what a person does: the drive's switch, Finder's two
+actions. `--as-downloaded` installs it as a user gets it instead (quarantined, dragged
+into Applications, Gatekeeper's Open Anyway): once before a release. Each step is PASS or FAIL in `summary.txt`; it stops at the first
+failure the rest depends on. For a quicker turn than GitHub's queue, the same Mac runs
+`ci/mac/ci.sh` from a git bundle of the branch: the lint and the tests as the macOS job does
+(`--drive`: the macOS drive's test, which replaces `/Applications/Theca.app` with a test app,
+removes every Theca drive from the Mac and restarts `fileproviderd`: not on a Mac whose drives
+are in use),
+or `ci/mac/ci.sh dmg`, the `.dmg` as `release.yml` builds it.
 
 Watching GitHub: `gh run list -R theca-cloud/computer` (the latest runs),
 `gh run view -R theca-cloud/computer <id> --log-failed` (what failed). `scripts/release.sh`

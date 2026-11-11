@@ -35,7 +35,7 @@ use objc2_foundation::{
 use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 
 use crate::ipc::{self, log};
-use crate::protocol::{Code, Item as Entry, KEEP, Reply, Request, UNKEEP};
+use crate::protocol::{Code, FREE, Item as Entry, KEEP, Reply, Request};
 
 /// Lets a completion block cross to the worker thread.
 struct Unsend<T>(T);
@@ -478,7 +478,13 @@ define_class!(
                 id,
             });
             // SAFETY: NSObject's init.
-            unsafe { msg_send![super(this), init] }
+            let this: Retained<Self> = unsafe { msg_send![super(this), init] };
+            // Copies an extension killed mid-upload left.
+            let staging = this.staging();
+            std::thread::spawn(move || {
+                crate::staged::sweep(&staging, crate::staged::STALE, std::time::SystemTime::now());
+            });
+            this
         }
 
         #[unsafe(method(invalidate))]
@@ -567,14 +573,15 @@ define_class!(
                     folder,
                 )
             };
+            let staged = self.stage(contents);
             let asked = Request::Create {
                 domain: self.ivars().id.clone(),
                 parent,
                 name,
                 folder,
-                contents: path_of(contents),
+                contents: staged.as_ref().map(|(_, copy)| copy.clone()),
             };
-            answer_changed(asked, done);
+            answer_changed(asked, staged, done);
             progress()
         }
 
@@ -591,6 +598,11 @@ define_class!(
                 dyn Fn(*mut NSFileProviderItem, NSFileProviderItemFields, Bool, *mut NSError),
             >,
         ) -> Retained<NSProgress> {
+            let staged = if fields.contains(NSFileProviderItemFields::Contents) {
+                self.stage(contents)
+            } else {
+                None
+            };
             // SAFETY: required properties of the item protocol; lastUsedDate
             // optional, checked.
             let asked = unsafe {
@@ -611,15 +623,11 @@ define_class!(
                     parent: fields
                         .contains(NSFileProviderItemFields::ParentItemIdentifier)
                         .then(|| item.parentItemIdentifier().to_string()),
-                    contents: if fields.contains(NSFileProviderItemFields::Contents) {
-                        path_of(contents)
-                    } else {
-                        None
-                    },
+                    contents: staged.as_ref().map(|(_, copy)| copy.clone()),
                     used,
                 }
             };
-            answer_changed(asked, done);
+            answer_changed(asked, staged, done);
             progress()
         }
 
@@ -695,7 +703,8 @@ define_class!(
     }
 
     unsafe impl NSFileProviderCustomAction for Extension {
-        /// Keep Downloaded, or Don't: the app records it, then the system
+        /// Always Keep on This Mac, or Free Up Space: the app records it (and
+        /// frees), then the system
         /// is signaled, reads the items again and applies their policy.
         #[unsafe(method_id(performActionWithIdentifier:onItemsWithIdentifiers:completionHandler:))]
         fn perform_action(
@@ -704,16 +713,13 @@ define_class!(
             items: &NSArray<NSString>,
             done: &DynBlock<dyn Fn(*mut NSError)>,
         ) -> Retained<NSProgress> {
-            let kept = match action.to_string().as_str() {
-                KEEP => Some(true),
-                UNKEEP => Some(false),
+            let domain = self.ivars().id.clone();
+            let ids: Vec<String> = items.iter().map(|i| i.to_string()).collect();
+            let asked = match action.to_string().as_str() {
+                KEEP => Some(Request::Keep { domain, ids }),
+                FREE => Some(Request::Free { domain, ids }),
                 _ => None,
             };
-            let asked = kept.map(|kept| Request::Keep {
-                domain: self.ivars().id.clone(),
-                ids: items.iter().map(|i| i.to_string()).collect(),
-                kept,
-            });
             // SAFETY: a class method on a valid domain.
             let manager =
                 Unsend(unsafe { NSFileProviderManager::managerForDomain(&self.ivars().domain) });
@@ -770,15 +776,27 @@ fn answer_item(asked: Request, done: &DynBlock<dyn Fn(*mut NSFileProviderItem, *
 }
 
 /// A local change answered with the item as it is now (no fields left to
-/// apply, no content to fetch again).
+/// apply, no content to fetch again). Its content (`staged`: the system's
+/// file, and where it goes) copied first, removed after.
 fn answer_changed(
     asked: Request,
+    staged: Option<(PathBuf, PathBuf)>,
     done: &DynBlock<dyn Fn(*mut NSFileProviderItem, NSFileProviderItemFields, Bool, *mut NSError)>,
 ) {
     let done = Unsend(done.copy());
     std::thread::spawn(move || {
         let done = done.into_inner();
-        match ipc::ask(&asked) {
+        let copied = match &staged {
+            Some((from, to)) => std::fs::copy(from, to)
+                .map(|_| ())
+                .map_err(|e| (Code::CannotSynchronize, format!("not staged: {e}"))),
+            None => Ok(()),
+        };
+        let answer = copied.and_then(|()| ipc::ask(&asked));
+        if let Some((_, copy)) = &staged {
+            let _ = std::fs::remove_file(copy);
+        }
+        match answer {
             Ok(Reply::Item(entry)) => done.call((
                 Item::new(entry).as_item(),
                 NSFileProviderItemFields::empty(),
@@ -808,6 +826,15 @@ fn unique() -> String {
 }
 
 impl Extension {
+    /// Where a local change's content is copied for the app: the system's
+    /// file, in this sandbox, is one the app may not read (a developer's
+    /// Mac refused it: "Operation not permitted"); the staging folder, where
+    /// fetches land, it can.
+    fn stage(&self, contents: Option<&NSURL>) -> Option<(PathBuf, PathBuf)> {
+        let from = path_of(contents)?;
+        Some((from, self.staging().join(format!("upload-{}", unique()))))
+    }
+
     fn answer_item(
         &self,
         asked: Request,
