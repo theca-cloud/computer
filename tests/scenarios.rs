@@ -895,7 +895,9 @@ async fn a_tree_moved_in_uploads_nothing_its_ignore_file_names() {
         settle(&full);
     }
     std::fs::rename(outside.join("proj"), a.path("proj")).unwrap();
+    // Both up: they upload side by side, either first.
     marked(&w, "proj/sub/kept.txt").await;
+    marked(&w, "proj/sub/.thecaignore").await;
     let remote = w.remote(&w.library).await;
     let names: Vec<&str> = remote.keys().map(String::as_str).collect();
     assert_eq!(
