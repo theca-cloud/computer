@@ -866,7 +866,8 @@ impl Follower {
                 Some(l) => {
                     self.library_there(&p, &l.name, l.writable)?;
                     // A server restored from a backup: its tree is older than
-                    // the base, so the resync has no base (decisions.md, Sync).
+                    // the base, so the resync has no base (wiki: Sync client,
+                    // Reconciliation).
                     if l.reset {
                         self.state.forget_base(p.id)?;
                     }

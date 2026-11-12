@@ -1,7 +1,7 @@
 //! Reconciliation, three-way and pure: what was last in sync (the base), what
 //! the local folder holds now (a scan), what the server holds now (the base
 //! with the remote states received since) give the actions that make both
-//! sides identical (docs/decisions.md, Sync).
+//! sides identical (wiki: Sync client, Reconciliation).
 //!
 //! - One side changed: it wins.
 //! - Both changed a file: the local content is uploaded on the version it was

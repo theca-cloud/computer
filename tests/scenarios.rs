@@ -561,7 +561,8 @@ async fn access_removed_and_given_back() {
 }
 
 /// A library renamed: the pair's name follows, its folder keeps its name
-/// (decisions.md, Sync: a rename never renames the local folder).
+/// (wiki: Sync client, New libraries and removal: a rename never
+/// renames the local folder).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_library_renamed_keeps_its_folder() {
     let w = world().await;

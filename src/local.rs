@@ -1,5 +1,6 @@
 //! The local side: scanning a pair's folder (one `stat` per entry, no reads),
-//! names compared like the server's, file IDs (docs/decisions.md, Sync).
+//! names compared like the server's, file IDs (wiki: Sync client, Local
+//! changes and Names).
 
 use std::collections::HashSet;
 use std::fs::Metadata;

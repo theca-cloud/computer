@@ -1,5 +1,6 @@
 //! App passwords in the OS keychain: macOS's login keychain, Windows'
-//! Credential Manager, Secret Service on Linux (docs/decisions.md, Sync). One
+//! Credential Manager, Secret Service on Linux (wiki: Sync client, The app
+//! password). One
 //! entry per account, named by a random ID its row keeps (`Password::Keychain`),
 //! under the app's identifier: two states on one computer never share one.
 

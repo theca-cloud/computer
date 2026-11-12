@@ -49,7 +49,7 @@ last_release() {
 }
 
 # What a released client state depends on is never edited nor deleted
-# (decisions.md, Sync): its migration steps, and the release states the
+# (wiki: Sync client, The client state): its migration steps, and the release states the
 # upgrade test reads back. Against the working tree, so an uncommitted edit
 # fails too; renames count as a deletion.
 released_guard() {

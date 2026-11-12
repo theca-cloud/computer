@@ -1,4 +1,5 @@
-//! What the CLI promises (docs/decisions.md, Sync): its commands and flags,
+//! What the CLI promises (wiki: Sync client, What the CLI
+//! promises from 1.0): its commands and flags,
 //! its exit codes (only 0 or not is promised, `USING.md` lists them), and
 //! `USING.md` in step with both.
 
