@@ -14,7 +14,15 @@ Download it from the [releases](https://github.com/theca-cloud/computer/releases
 
 The app also answers the CLI (`theca --help`). Headless, unpack the archive and put `theca` on your `PATH` (`sudo install theca-headless-*/theca /usr/local/bin/`), then `theca login`. On a Mac used from the command line, install the app and use its `theca`: `/Applications/Theca.app/Contents/MacOS/theca` (a Mac's drives need the app's extension; there is no headless Mac archive from 1.2.0). Linux builds run on Ubuntu 22.04 and Debian 12 or newer; drives on Linux need `fuse3` (the `.deb` installs it; elsewhere, install it).
 
-To update, install the new version over the old one: what the app keeps is upgraded the first time the new version starts.
+### Updating
+
+The app and headless update themselves from Theca's releases, except the `.deb`, which `apt` updates with the rest of the system (`theca update` says so there). An update is checked against Theca's release key before anything is replaced, and none is installed while one of your accounts is on a server older than it needs, or one that can't be reached (tried again at the next check). What the app keeps is upgraded the first time the new version starts; installing the new version over the old one by hand still works.
+
+- **When**: at start, then every 6 hours, in the app and in `theca run`, as its setting says: `auto` installs and restarts (the app's default), `ask` says a new version is out (a notification, the window and the tray; headless, the log and `theca status`; headless' default), `off` never checks by itself.
+- **In the app**: Settings, Updates: the setting, **Check for updates**, and a new version with its release notes and **Install and restart**. The tray has **Check for updates…**, and says **Update to X.Y.Z** while one waits: click it to install.
+- **Headless**: `theca updates auto`, `ask` or `off` sets it (`theca updates` shows it). `theca update` checks and installs now, whatever the setting: the binary is replaced where it is, by a user who can write it (`sudo theca update` for `/usr/local/bin/theca`); a running `theca run` goes on with the old version until it starts again. In `auto`, `theca run` installs the new version and starts it in its place, when it can write its binary.
+- **`theca update` with the app open** hands over: the app installs and restarts. Without a display (a server over ssh), there is no app to hand over to: it installs itself, and says so.
+- **What it leaves**: on Windows, the binary it replaced, set aside as `theca.exe.old` beside it (it may still be running), removed at the next update. `theca status` waits 3 seconds at most to say a new version is out: offline, it says nothing of it.
 
 ### Opening an unsigned app
 
@@ -92,7 +100,7 @@ theca status                            # what syncs, what it's doing, errors
 
 A login adds no library: it lists them with the `theca add` lines to choose with. What libraries new to the account later do is `--new-libraries`: `silent` by default (listed only, `theca libraries`), `sync` (up to the size limit), or `drive`.
 
-Every command and its options: `theca --help`, `theca <command> --help`. The commands: `login`, `accounts`, `account` (an account's default folder, and what libraries new to it do: `--new-libraries sync|drive|notify|silent`, `--auto-sync-limit 2GB`, 0 for no limit), `remove-account`, `libraries`, `add`, `remove`, `pause`, `resume`, `locate` (a folder moved or on another disk), `status`, `undo` (restores what the last deletion moved to the trash), `run`, `logs`; for drives, `keep`, `free`, `drive-limit`. A script logs in without a browser with an app password made in the web app: `THECA_TOKEN=… theca login <instance>`.
+Every command and its options: `theca --help`, `theca <command> --help`. The commands: `login`, `accounts`, `account` (an account's default folder, and what libraries new to it do: `--new-libraries sync|drive|notify|silent`, `--auto-sync-limit 2GB`, 0 for no limit), `remove-account`, `libraries`, `add`, `remove`, `pause`, `resume`, `locate` (a folder moved or on another disk), `status`, `undo` (restores what the last deletion moved to the trash), `run`, `logs`, `update` and `updates` (above); for drives, `keep`, `free`, `drive-limit`. A script logs in without a browser with an app password made in the web app: `THECA_TOKEN=… theca login <instance>`.
 
 One `theca run`, or the app, syncs a state file at a time: a second one refuses to start. `run` stops within a few seconds on Ctrl-C or `SIGTERM`.
 

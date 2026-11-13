@@ -12,6 +12,7 @@ pub mod logs;
 pub mod ops;
 pub mod plan;
 pub mod state;
+pub mod update;
 
 /// The CLI's exit codes besides 0, success. Indications only: what 1.x
 /// promises is 0 or not (`USING.md` lists them).

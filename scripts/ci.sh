@@ -64,8 +64,23 @@ released_guard() {
     fi
 }
 
+# A release never trusts a test key: ci/package.sh, run as on a tag with the
+# test key's variable set, refuses it before building anything.
+test_key_guard() {
+    version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+    status=0
+    out=$(GITHUB_REF_TYPE=tag GITHUB_REF_NAME="$version" THECA_TEST_UPDATER_PUBKEY=test \
+        ci/package.sh linux x86_64 2>&1) || status=$?
+    if [ "$status" != 1 ] || ! echo "$out" | grep -q THECA_TEST_UPDATER_PUBKEY; then
+        echo "ci/package.sh on a tag didn't refuse the test key (exit $status):" >&2
+        echo "$out" >&2
+        exit 1
+    fi
+}
+
 if [ "$step" = all ] || [ "$step" = lint ]; then
     released_guard
+    test_key_guard
     cargo fmt --all --check
     cargo clippy --features crash-points --all-targets -- -D warnings
     # macOS's File Provider extension and calls (a stub elsewhere: its
@@ -77,7 +92,8 @@ if [ "$step" = all ] || [ "$step" = lint ]; then
     npm --prefix ui run lint
     npm --prefix ui run check
     npm --prefix ui run build
-    cargo clippy --features gui,custom-protocol --all-targets -- -D warnings
+    # With self-update, as every app package but the .deb.
+    cargo clippy --features gui,custom-protocol,self-update --all-targets -- -D warnings
 fi
 if [ "$step" = all ] || [ "$step" = test ]; then
     # The end-to-end tests run the real server: built from the pinned core unless
@@ -94,6 +110,10 @@ if [ "$step" = all ] || [ "$step" = test ]; then
     else
         cargo test --features crash-points
         cargo test -p theca-fileprovider
+        # The updater's own tests in a self-updating build (the embedded key,
+        # the commands).
+        cargo test --features self-update --lib update::
+        cargo test --features self-update --test update with_the_feature
     fi
 fi
 # Only Linux has a WebDriver for WebKit: elsewhere, `all` skips it, and the app
@@ -102,6 +122,18 @@ if [ "$step" = app ] || { [ "$step" = all ] && [ "$(uname)" = Linux ]; }; then
     server
     npm --prefix ui run build
     dbus-run-session -- xvfb-run -a cargo test --features gui,custom-protocol --test app
+    # The app's own unit tests (the tray's summary).
+    cargo test --features gui,custom-protocol,self-update --lib gui::
+    # The app with self-update, built with a key made for this run (never
+    # stored): its tests sign releases with it, as release.yml signs.
+    key_dir=$(mktemp -d)
+    # Removed however the tests end.
+    trap 'rm -rf "$key_dir"' EXIT
+    ui/node_modules/.bin/tauri signer generate --ci -p "" -w "$key_dir/updater.key" >/dev/null
+    THECA_TEST_UPDATER_PUBKEY=$(cat "$key_dir/updater.key.pub") \
+        THECA_TEST_UPDATER_KEY="$key_dir/updater.key" \
+        dbus-run-session -- xvfb-run -a \
+        cargo test --features gui,custom-protocol,self-update --test app self_update
 fi
 if [ "$step" = all ] || [ "$step" = deny ]; then
     cargo deny --all-features check

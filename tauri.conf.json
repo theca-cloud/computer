@@ -15,6 +15,14 @@
       "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "windows": {
+        "installMode": "quiet"
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "linux": {

@@ -803,3 +803,45 @@ fn names(tree: &BTreeMap<String, Option<Vec<u8>>>) -> Vec<String> {
 fn pair_id(state: &State) -> i64 {
     state.pairs().unwrap()[0].id
 }
+
+/// The files `files` makes for the base URL they're served on, served on
+/// 127.0.0.1 until the process ends; that URL, and the requests counted.
+pub fn serve(
+    files: impl FnOnce(&str) -> std::collections::HashMap<&'static str, Vec<u8>>,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let files = files(&base);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = requests.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let mut request = String::new();
+            let mut reader = std::io::BufReader::new(&stream);
+            if std::io::BufRead::read_line(&mut reader, &mut request).is_err() {
+                continue;
+            }
+            // The headers, up to the empty line.
+            let mut line = String::new();
+            while std::io::BufRead::read_line(&mut reader, &mut line).is_ok_and(|n| n > 2) {
+                line.clear();
+            }
+            let path = request.split(' ').nth(1).unwrap_or("");
+            let response = match files.get(path) {
+                Some(body) => {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    [head.as_bytes(), body].concat()
+                }
+                None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            };
+            let _ = stream.write_all(&response);
+        }
+    });
+    (base, requests)
+}

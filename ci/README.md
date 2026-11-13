@@ -69,9 +69,33 @@ woodpecker-cli repo secret add --repository theca/computer --name github_deploy_
 rm /tmp/computer-mirror /tmp/computer-mirror.pub
 ```
 
-GitHub's release job needs no secret: its own `GITHUB_TOKEN` creates the release.
+GitHub's release job needs no other secret: its own `GITHUB_TOKEN` creates the release.
 
-## 3. Keeping it up
+## 3. The updater's key
+
+The packages that update themselves (all but the `.deb`; ADR 0006) are signed with one
+minisign key: its public half is `ci/updater.pub`, built into every one; its private half
+and password are `theca-cloud/computer`'s secrets `TAURI_SIGNING_PRIVATE_KEY` and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, given only to `release.yml`'s packaging step and on a
+pushed version tag only (a run by hand from a branch signs with a throwaway key; on a tag,
+`ci/package.sh` refuses to package without the release key), with an offline copy in the
+developer's password manager. Lost, no install could update again;
+leaked, it would sign updates for every install. Made once by the developer:
+
+```sh
+npx @tauri-apps/cli signer generate -w ~/.tauri/theca-updater.key   # asks for a password
+gh secret set TAURI_SIGNING_PRIVATE_KEY -R theca-cloud/computer < ~/.tauri/theca-updater.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD -R theca-cloud/computer   # prompts
+```
+
+`ci/package.sh` signs each package (a `.sig` beside it; without the secret, by hand, a
+throwaway key, never on a tag), the `manifest` job writes `latest.json` from them
+(`ci/manifest.py`, on every run, kept with it) and the release attaches it. Every run also
+checks the update itself, without a release: `ci/update-check.sh` builds A and B (B's
+version bumped) with a key made for the run, installs A and updates it to B through a
+manifest it serves, after seeing A refuse B signed by another key and stay A.
+
+## 4. Keeping it up
 
 - **Rust bumped**: the CI image (step 1), then its tag in `.woodpecker/linux.yaml`.
 - **The actions** are pinned to exact versions (`actions/*`, `Swatinem/rust-cache`): bumped

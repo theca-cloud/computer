@@ -132,6 +132,17 @@
 	"logs_save": "Save",
 	"logs_saved": "Saved: it applies the next time Theca starts.",
 	"logs_hint": "What Theca did, a file per day, to read or send when something goes wrong. They name your files, never your passwords. Changes apply the next time Theca starts.",
+	"updates": "Updates",
+	"updates_version": "Theca {version}",
+	"updates_mode": "New versions",
+	"updates_auto": "Install them by themselves",
+	"updates_ask": "Ask before installing",
+	"updates_off": "Don't check",
+	"updates_check": "Check for updates",
+	"updates_available": "Theca {version} is available",
+	"updates_notes": "Release notes",
+	"updates_install": "Install and restart",
+	"updates_latest": "This is the latest version.",
 	"autostart": "Start Theca when you log in",
 	"quit": "Quit Theca"
 }

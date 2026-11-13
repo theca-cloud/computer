@@ -15,6 +15,8 @@ name = "theca"
 path = "src/main.rs"
 
 [dependencies]
+# The updater's keys and signatures, as Tauri writes them.
+base64 = "0.23.1"
 bytesize = "2.7.0"
 chrono = "0.4.45"
 flate2 = "1.1.10"
@@ -29,14 +31,19 @@ gethostname = "1.1.0"
 # each OS below (the `keyring` crate would set its own store, and tests use
 # the core's mock).
 keyring-core = "1.0.1"
+# Updates verified as Tauri's updater verifies them (ADR 0006).
+minisign-verify = "0.3.0"
 notify = "8.2.1"
 # A rename that never replaces a file put there meanwhile, atomic where the
 # OS and disk can (renameat2, renamex_np, MoveFileExW): no unsafe code here.
 renamore = "0.3.2"
+# The updates' downloads, as theca-client's requests (its TLS, ring).
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider"] }
 # C (SQLite), against the pure-Rust preference: no pure-Rust SQLite is mature
 # enough for the only copy of what was synced. Bundled: the same SQLite on
 # every OS, nothing to install.
 rusqlite = { version = "0.41.1", features = ["bundled"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 # The server's version against the oldest this client works with.
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -59,6 +66,8 @@ tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.29.0", features = ["v4", "serde"] }
+# The app updated on macOS and Windows (with `self-update`; ADR 0006).
+tauri-plugin-updater = { version = "2.14.1", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
@@ -67,6 +76,11 @@ apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 cloud-filter = "0.0.7"
 nt-time = "0.15"
 windows-native-keyring-store = "1.1.0"
+# The headless archive is a .zip here, a .tar.gz elsewhere.
+zip = { version = "9.5.1", default-features = false, features = ["deflate"] }
+
+[target.'cfg(not(windows))'.dependencies]
+tar = "0.4.46"
 
 # Secret Service over zbus: pure Rust.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
@@ -87,10 +101,11 @@ all = { level = "warn", priority = -1 }
 uuid = { version = "1.29.0", features = ["v7"] }
 dotenvy = "0.15.7"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres"] }
-reqwest = { version = "0.13", default-features = false }
 fantoccini = { version = "0.22", default-features = false }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 proptest = "1.12.0"
+# Test updates signed with a key of the test's own.
+minisign = "0.10.0"
 
 [features]
 # The app: the window, the tray (ADR 0004). Without it, the CLI and daemon,
@@ -103,12 +118,18 @@ gui = [
     "dep:tauri-plugin-notification",
     "dep:tauri-plugin-opener",
     "dep:tauri-plugin-single-instance",
+    # Used with `self-update` only; linked by every app build (a feature
+    # can't enable a dependency only when another one is on).
+    "dep:tauri-plugin-updater",
 ]
 # The page embedded in the binary (a build); without it, the app loads Vite's
 # dev server (tauri dev). The Tauri CLI turns it on for builds, by this name.
 custom-protocol = ["tauri/custom-protocol"]
 # Named points where the crash tests abort the process (tests/crash.rs).
 crash-points = []
+# The package replaces itself with a newer release (src/update.rs): every
+# package but the .deb, which apt updates (ADR 0006; ci/package.sh).
+self-update = []
 
 [build-dependencies]
 tauri-build = { version = "2", optional = true }

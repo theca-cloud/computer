@@ -32,6 +32,56 @@ struct App {
     /// The tray and the menu items it updates, when the desktop has one
     /// (stock GNOME doesn't).
     tray: Mutex<Option<Tray>>,
+    /// The newer release found and not installed (`ask`, `auto` that
+    /// couldn't, a check asked for): offered in the window and the tray.
+    #[cfg(feature = "self-update")]
+    offered: Mutex<Option<Waiting>>,
+    /// An update installed: how to start it once the engine has stopped.
+    #[cfg(feature = "self-update")]
+    restart: Mutex<Option<Restart>>,
+    /// Held while an update installs: one at a time, wherever it was asked
+    /// (the schedule, the button, the tray).
+    #[cfg(feature = "self-update")]
+    installing: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Where the releases are (`update::MANIFEST`, or `--manifest`'s).
+    #[cfg(feature = "self-update")]
+    manifest_url: String,
+}
+
+/// A release offered, and why it wasn't installed by itself, if it was
+/// tried (`auto`).
+#[cfg(feature = "self-update")]
+#[derive(Clone)]
+struct Waiting {
+    manifest: crate::update::Manifest,
+    why: Option<String>,
+}
+
+/// The window's Updates section: this version, and in a build that updates
+/// itself, the mode and the release waiting.
+#[derive(Serialize, Clone)]
+struct Updates {
+    version: &'static str,
+    self_update: bool,
+    mode: Option<&'static str>,
+    offered: Option<OfferedView>,
+}
+
+#[derive(Serialize, Clone)]
+struct OfferedView {
+    version: String,
+    notes: String,
+    why: Option<String>,
+}
+
+/// How the app starts again after an update.
+#[cfg(feature = "self-update")]
+enum Restart {
+    /// The `.AppImage` our code replaced, in this process's place.
+    Exec(crate::update::Installed),
+    /// The `.app` Tauri's updater replaced (macOS; Windows' installer starts
+    /// the app itself).
+    Tauri,
 }
 
 /// Kept for the app's life: the engine runs alone on this state.
@@ -41,12 +91,32 @@ struct Lock(
 
 /// Runs the app until it quits. `background`: started at login, the window
 /// stays closed.
-pub fn run(state_path: PathBuf, background: bool) -> Result<(), tauri::Error> {
+pub fn run(
+    state_path: PathBuf,
+    background: bool,
+    manifest_url: Option<String>,
+) -> Result<(), tauri::Error> {
+    #[cfg(not(feature = "self-update"))]
+    let _ = manifest_url;
     let engine = Handle::default();
     let (stop, stopped) = watch::channel(false);
-    let app = tauri::Builder::default()
-        // Launched again: the running app's window comes forward.
-        .plugin(tauri_plugin_single_instance::init(|app, _, _| {
+    let builder = tauri::Builder::default();
+    // The key handed over from here (`tauri.conf.json` has an empty one).
+    #[cfg(feature = "self-update")]
+    let builder = builder.plugin(
+        tauri_plugin_updater::Builder::new()
+            .pubkey(crate::update::PUBLIC_KEY)
+            .build(),
+    );
+    let app = builder
+        // Launched again: the running app's window comes forward; by
+        // `theca update`, the app updates (`hand_over`).
+        .plugin(tauri_plugin_single_instance::init(|app, args, _| {
+            #[cfg(feature = "self-update")]
+            if let Some(manifest_url) = update_asked(&args) {
+                return update_now(app, manifest_url);
+            }
+            let _ = args;
             open_window(app)
         }))
         .plugin(tauri_plugin_autostart::init(
@@ -63,6 +133,14 @@ pub fn run(state_path: PathBuf, background: bool) -> Result<(), tauri::Error> {
             notified: Mutex::default(),
             running: Mutex::new(None),
             tray: Mutex::new(None),
+            #[cfg(feature = "self-update")]
+            offered: Mutex::new(None),
+            #[cfg(feature = "self-update")]
+            restart: Mutex::new(None),
+            #[cfg(feature = "self-update")]
+            installing: std::sync::Arc::default(),
+            #[cfg(feature = "self-update")]
+            manifest_url: manifest_url.unwrap_or_else(|| crate::update::MANIFEST.to_owned()),
         })
         .invoke_handler(tauri::generate_handler![
             status,
@@ -87,6 +165,10 @@ pub fn run(state_path: PathBuf, background: bool) -> Result<(), tauri::Error> {
             logs,
             set_logs,
             open_logs,
+            updates,
+            set_updates,
+            check_updates,
+            install_update,
             quit,
         ])
         .setup(move |app| {
@@ -95,6 +177,8 @@ pub fn run(state_path: PathBuf, background: bool) -> Result<(), tauri::Error> {
             // forward) instead of failing on the lock.
             app.manage(Lock(crate::lock(&state_path)?));
             let handle = app.handle().clone();
+            #[cfg(feature = "self-update")]
+            keep_updated(&handle, stopped.clone());
             let running = tauri::async_runtime::spawn(async move {
                 if let Err(e) = engine::run(state_path, engine, stopped).await {
                     tracing::error!("the engine stopped: {e}");
@@ -144,10 +228,374 @@ pub fn run(state_path: PathBuf, background: bool) -> Result<(), tauri::Error> {
         }
         RunEvent::Exit => {
             let _ = app.state::<App>().stop.send(true);
+            #[cfg(feature = "self-update")]
+            match app.state::<App>().restart.lock().expect("restart").take() {
+                Some(Restart::Exec(installed)) => {
+                    tracing::error!("the update didn't start: {}", installed.restart());
+                }
+                Some(Restart::Tauri) => tauri::process::restart(&app.env()),
+                None => {}
+            }
         }
         _ => {}
     });
     Ok(())
+}
+
+/// The app's checks (`update::schedule`) as the state's mode says: a release
+/// found is notified; installed (`auto`), the app quits as Quit does (the
+/// engine stopped first) and starts again (`RunEvent::Exit`).
+#[cfg(feature = "self-update")]
+fn keep_updated(app: &AppHandle, stopped: watch::Receiver<bool>) {
+    use crate::update::{self, Checked};
+    use std::ops::ControlFlow;
+    let app = app.clone();
+    let tick = move || {
+        let app = app.clone();
+        async move {
+            let to = app.clone();
+            let url = app.state::<App>().manifest_url.clone();
+            let checked = update::tick(&state(&app), &url, |manifest, servers| {
+                install(to, manifest, servers)
+            })
+            .await;
+            match checked {
+                Checked::Installed(manifest) => {
+                    start_installed(&app, &manifest);
+                    ControlFlow::Break(())
+                }
+                Checked::Offered { manifest, why } => {
+                    offer(&app, &manifest, why.as_ref());
+                    ControlFlow::Continue(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    };
+    tauri::async_runtime::spawn(update::schedule(tick, stopped));
+}
+
+/// An update installed, and how the app starts it: the `.AppImage` by our
+/// code, the `.app` and the installer by Tauri's updater.
+#[cfg(feature = "self-update")]
+async fn install(
+    app: AppHandle,
+    manifest: crate::update::Manifest,
+    servers: Vec<(String, Option<String>)>,
+) -> Result<(), crate::update::UpdateError> {
+    use crate::update::{self, Installed, UpdateError};
+    let installing = app.state::<App>().installing.clone();
+    let Ok(_one) = installing.try_lock_owned() else {
+        return Err(UpdateError::Busy);
+    };
+    // One installed, waiting for the app to start it: not again.
+    if app
+        .state::<App>()
+        .restart
+        .lock()
+        .expect("restart")
+        .is_some()
+    {
+        return Err(UpdateError::Busy);
+    }
+    let restart = match Installed::this() {
+        Some(installed) => {
+            update::install(&manifest, update::PUBLIC_KEY, &servers, &installed).await?;
+            Restart::Exec(installed)
+        }
+        None if cfg!(any(target_os = "macos", windows)) => {
+            let url = app.state::<App>().manifest_url.clone();
+            let stop = app.state::<App>().stop.clone();
+            tauri_install(&app, &url, &manifest, &servers, Some(stop)).await?;
+            Restart::Tauri
+        }
+        None => return Err(UpdateError::NotInstalled),
+    };
+    *app.state::<App>().restart.lock().expect("restart") = Some(restart);
+    Ok(())
+}
+
+/// Tauri's updater, on the manifest at `url` and the same key
+/// (`min_server` checked here: Tauri doesn't know it). On Windows the
+/// installer closes the app and starts it again: the engine is told to stop
+/// first (`stop`).
+#[cfg(feature = "self-update")]
+async fn tauri_install<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    url: &str,
+    manifest: &crate::update::Manifest,
+    servers: &[(String, Option<String>)],
+    stop: Option<watch::Sender<bool>>,
+) -> Result<(), crate::update::UpdateError> {
+    use crate::update::UpdateError;
+    use tauri_plugin_updater::UpdaterExt;
+    manifest.check_servers(servers)?;
+    let error = |e: tauri_plugin_updater::Error| UpdateError::Updater(e.to_string());
+    let endpoint = url
+        .parse()
+        .map_err(|e| UpdateError::Updater(format!("{url}: {e}")))?;
+    let updater = app
+        .updater_builder()
+        .endpoints(vec![endpoint])
+        .map_err(error)?
+        .on_before_exit(move || {
+            if let Some(stop) = &stop {
+                let _ = stop.send(true);
+            }
+        })
+        .build()
+        .map_err(error)?;
+    let found = updater.check().await.map_err(error)?;
+    let found = found.ok_or_else(|| UpdateError::Updater("no newer release".into()))?;
+    found
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(error)
+}
+
+/// Whether a release not installed, for `why`, is offered: not while another
+/// install is under way (`Busy`), which installs it.
+#[cfg(feature = "self-update")]
+fn worth_offering(why: Option<&crate::update::UpdateError>) -> bool {
+    !matches!(why, Some(crate::update::UpdateError::Busy))
+}
+
+/// An update installed: the app quits as Quit does (the engine stopped
+/// first), then starts it (`RunEvent::Exit`).
+#[cfg(feature = "self-update")]
+fn start_installed(app: &AppHandle, release: &crate::update::Manifest) {
+    tracing::info!(version = release.version, "installed: starting it");
+    app.exit(0);
+}
+
+/// `theca update`'s arguments, forwarded by the single-instance plugin: the
+/// manifest it reads (`--manifest`'s, else the app's), when it is one.
+#[cfg(feature = "self-update")]
+fn update_asked(args: &[String]) -> Option<Option<String>> {
+    let mut words = args.iter().skip(1);
+    let mut manifest = None;
+    let mut update = false;
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "--manifest" => manifest = words.next().cloned(),
+            "--state" => {
+                words.next();
+            }
+            "update" => update = true,
+            w => {
+                if let Some(m) = w.strip_prefix("--manifest=") {
+                    manifest = Some(m.to_owned());
+                }
+            }
+        }
+    }
+    update.then_some(manifest)
+}
+
+/// `theca update` handed over: a newer release installed at once, whatever
+/// the mode, and the app started again; one that can't be is notified.
+#[cfg(feature = "self-update")]
+fn update_now(app: &AppHandle, manifest_url: Option<String>) {
+    use crate::update;
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let url = manifest_url.unwrap_or_else(|| app.state::<App>().manifest_url.clone());
+        let release = match update::check(&url).await {
+            Ok(Some(release)) => release,
+            Ok(None) => return,
+            Err(e) => return tracing::warn!("theca update: {e}"),
+        };
+        let servers = update::servers(&state(&app)).await;
+        match install(app.clone(), release.clone(), servers).await {
+            Ok(()) => start_installed(&app, &release),
+            Err(e) => offer(&app, &release, Some(&e)),
+        }
+    });
+}
+
+/// A display the app could be on: on Linux, X11's or Wayland's (without
+/// one, GTK can't start, and a Tauri app panics); elsewhere always.
+#[cfg(feature = "self-update")]
+pub fn has_display() -> bool {
+    !cfg!(target_os = "linux")
+        || display_in(
+            std::env::var_os("DISPLAY"),
+            std::env::var_os("WAYLAND_DISPLAY"),
+        )
+}
+
+/// `DISPLAY` and `WAYLAND_DISPLAY` name a display: either set, not empty.
+#[cfg(feature = "self-update")]
+fn display_in(display: Option<std::ffi::OsString>, wayland: Option<std::ffi::OsString>) -> bool {
+    [display, wayland]
+        .iter()
+        .any(|v| v.as_ref().is_some_and(|d| !d.is_empty()))
+}
+
+/// `theca update` while the state is taken: its arguments handed over to
+/// the running app by the single-instance plugin, which ends this process.
+/// Returns when no app answered (`theca run` holds the state).
+#[cfg(feature = "self-update")]
+pub fn hand_over() -> Result<(), tauri::Error> {
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|_, _, _| {}))
+        .build(tauri::generate_context!())?;
+    drop(app);
+    Ok(())
+}
+
+/// `theca update` with no app open, on macOS and Windows: Tauri's updater in
+/// an app without a window, which starts nothing (Windows' installer starts
+/// the app again by itself).
+#[cfg(feature = "self-update")]
+pub async fn install_now(
+    url: &str,
+    manifest: &crate::update::Manifest,
+    servers: &[(String, Option<String>)],
+) -> Result<(), crate::update::UpdateError> {
+    use crate::update::UpdateError;
+    let app = tauri::Builder::default()
+        .plugin(
+            tauri_plugin_updater::Builder::new()
+                .pubkey(crate::update::PUBLIC_KEY)
+                .build(),
+        )
+        .build(tauri::generate_context!())
+        .map_err(|e| UpdateError::Updater(e.to_string()))?;
+    tauri_install(app.handle(), url, manifest, servers, None).await
+}
+
+/// A newer release offered: kept for the window and the tray, notified
+/// once a version (`ask`, or `auto` that couldn't install it, saying why).
+#[cfg(feature = "self-update")]
+fn offer(
+    app: &AppHandle,
+    manifest: &crate::update::Manifest,
+    why: Option<&crate::update::UpdateError>,
+) {
+    use tauri_plugin_notification::NotificationExt;
+    if !worth_offering(why) {
+        return;
+    }
+    let waiting = Waiting {
+        manifest: manifest.clone(),
+        why: why.map(ToString::to_string),
+    };
+    let known = app
+        .state::<App>()
+        .offered
+        .lock()
+        .expect("offered")
+        .replace(waiting)
+        .is_some_and(|w| w.manifest.version == manifest.version);
+    let _ = app.emit("updates", updates(app.clone()));
+    refresh_tray(app);
+    if known {
+        return;
+    }
+    let body = match why {
+        Some(why) => format!("It couldn't be installed: {why}"),
+        None => "Open Theca to install it.".to_owned(),
+    };
+    let _ = app
+        .notification()
+        .builder()
+        .title(format!("Theca {} is available", manifest.version))
+        .body(body)
+        .show();
+}
+
+#[tauri::command]
+fn updates(app: AppHandle) -> Updates {
+    #[cfg(feature = "self-update")]
+    {
+        let offered = app.state::<App>().offered.lock().expect("offered").clone();
+        Updates {
+            version: env!("CARGO_PKG_VERSION"),
+            self_update: true,
+            mode: crate::update::mode(&state(&app)).ok().map(|m| m.as_str()),
+            offered: offered.map(|w| OfferedView {
+                notes: w.manifest.notes_url(),
+                version: w.manifest.version,
+                why: w.why,
+            }),
+        }
+    }
+    #[cfg(not(feature = "self-update"))]
+    {
+        let _ = app;
+        Updates {
+            version: env!("CARGO_PKG_VERSION"),
+            self_update: false,
+            mode: None,
+            offered: None,
+        }
+    }
+}
+
+#[tauri::command]
+fn set_updates(app: AppHandle, mode: String) -> Answer<()> {
+    #[cfg(feature = "self-update")]
+    {
+        let mode = crate::update::Mode::parse(&mode)?;
+        crate::update::set_mode(&state(&app), mode).map_err(err)
+    }
+    #[cfg(not(feature = "self-update"))]
+    {
+        let _ = (app, mode);
+        Err(crate::update::NOT_SELF_UPDATING.to_owned())
+    }
+}
+
+/// Check for updates: the manifest asked now, whatever the mode; a newer
+/// release offered (never installed from here: Install does).
+#[tauri::command]
+async fn check_updates(app: AppHandle) -> Answer<Updates> {
+    #[cfg(feature = "self-update")]
+    {
+        let url = app.state::<App>().manifest_url.clone();
+        match crate::update::check(&url).await.map_err(err)? {
+            Some(manifest) => offer(&app, &manifest, None),
+            None => {
+                app.state::<App>().offered.lock().expect("offered").take();
+                refresh_tray(&app);
+            }
+        }
+        Ok(updates(app))
+    }
+    #[cfg(not(feature = "self-update"))]
+    {
+        let _ = app;
+        Err(crate::update::NOT_SELF_UPDATING.to_owned())
+    }
+}
+
+/// Install: the release offered installed, and the app started again.
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Answer<()> {
+    #[cfg(feature = "self-update")]
+    {
+        let waiting = app.state::<App>().offered.lock().expect("offered").clone();
+        let Some(waiting) = waiting else {
+            return Err("no update to install: check for updates first".to_owned());
+        };
+        let servers = crate::update::servers(&state(&app)).await;
+        match install(app.clone(), waiting.manifest.clone(), servers).await {
+            Ok(()) => {
+                start_installed(&app, &waiting.manifest);
+                Ok(())
+            }
+            Err(e) => {
+                offer(&app, &waiting.manifest, Some(&e));
+                Err(e.to_string())
+            }
+        }
+    }
+    #[cfg(not(feature = "self-update"))]
+    {
+        let _ = app;
+        Err(crate::update::NOT_SELF_UPDATING.to_owned())
+    }
 }
 
 /// The state, publishing its changes to the window.
@@ -270,6 +718,11 @@ fn tray(app: &AppHandle) -> tauri::Result<Tray> {
         app,
         &[&summary, &separator, &open, &pause, &separator, &quit],
     )?;
+    #[cfg(feature = "self-update")]
+    menu.insert(
+        &MenuItem::with_id(app, "check", "Check for updates…", true, None::<&str>)?,
+        4,
+    )?;
     let icon = TrayIconBuilder::with_id("theca")
         .icon(tray_icon(Overall::Idle))
         .icon_as_template(cfg!(target_os = "macos"))
@@ -290,6 +743,23 @@ fn tray(app: &AppHandle) -> tauri::Result<Tray> {
                 app.state::<App>().engine.wake();
             }
             "quit" => app.exit(0),
+            // Its summary says "Update to X.Y.Z" while one waits: installed.
+            #[cfg(feature = "self-update")]
+            "summary" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = install_update(app).await {
+                        tracing::warn!("the update from the tray: {e}");
+                    }
+                });
+            }
+            #[cfg(feature = "self-update")]
+            "check" => {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    checked_from_tray(&app, check_updates(app.clone()).await);
+                });
+            }
             _ => {}
         })
         .build(app)?;
@@ -381,8 +851,61 @@ fn notify_new_library(app: &AppHandle, name: &str) {
         .show();
 }
 
-/// The tray's icon and summary from the state: attention first (an account
-/// signed out, a pair stopped), then syncing, then paused.
+/// The tray's icon and summary: attention first (an account signed out, a
+/// pair stopped), then an update waiting, then syncing, then paused; and
+/// whether clicking it installs (it names the update).
+fn summary(
+    accounts: &[crate::state::Account],
+    pairs: &[crate::state::Pair],
+    waiting: Option<&str>,
+) -> (Overall, String, bool) {
+    if accounts.iter().any(|a| a.signed_out) {
+        (
+            Overall::Attention,
+            "Signed out: open Theca".to_owned(),
+            false,
+        )
+    } else if pairs.iter().any(|p| p.stop.is_some()) {
+        (
+            Overall::Attention,
+            "A folder stopped syncing".to_owned(),
+            false,
+        )
+    } else if let Some(version) = waiting {
+        (Overall::Idle, format!("Update to {version}"), true)
+    } else if pairs
+        .iter()
+        .any(|p| !p.paused && p.activity != "up to date" && p.activity != "waiting")
+    {
+        (Overall::Syncing, "Syncing…".to_owned(), false)
+    } else if !pairs.is_empty() && pairs.iter().all(|p| p.paused) {
+        (Overall::Paused, "Paused".to_owned(), false)
+    } else if pairs.is_empty() {
+        (Overall::Idle, "Nothing synced yet".to_owned(), false)
+    } else {
+        (Overall::Idle, "Up to date".to_owned(), false)
+    }
+}
+
+/// Check for updates… in the tray: what it found, said by a notification.
+#[cfg(feature = "self-update")]
+fn checked_from_tray(app: &AppHandle, checked: Answer<Updates>) {
+    use tauri_plugin_notification::NotificationExt;
+    let (title, body) = match checked {
+        // A release found was notified by `offer`.
+        Ok(Updates {
+            offered: Some(_), ..
+        }) => return,
+        Ok(_) => (
+            "Theca is up to date".to_owned(),
+            format!("{} is the latest.", env!("CARGO_PKG_VERSION")),
+        ),
+        Err(e) => ("No update check".to_owned(), e),
+    };
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
+/// The tray's icon and summary from the state (`summary`).
 fn refresh_tray(app: &AppHandle) {
     let a = app.state::<App>();
     let mut tray = a.tray.lock().expect("tray");
@@ -393,22 +916,16 @@ fn refresh_tray(app: &AppHandle) {
     let (Ok(accounts), Ok(pairs)) = (state.accounts(), state.pairs()) else {
         return;
     };
-    let (overall, summary) = if accounts.iter().any(|a| a.signed_out) {
-        (Overall::Attention, "Signed out: open Theca".to_owned())
-    } else if pairs.iter().any(|p| p.stop.is_some()) {
-        (Overall::Attention, "A folder stopped syncing".to_owned())
-    } else if pairs
-        .iter()
-        .any(|p| !p.paused && p.activity != "up to date" && p.activity != "waiting")
-    {
-        (Overall::Syncing, "Syncing…".to_owned())
-    } else if !pairs.is_empty() && pairs.iter().all(|p| p.paused) {
-        (Overall::Paused, "Paused".to_owned())
-    } else if pairs.is_empty() {
-        (Overall::Idle, "Nothing synced yet".to_owned())
-    } else {
-        (Overall::Idle, "Up to date".to_owned())
-    };
+    #[cfg(feature = "self-update")]
+    let waiting = a
+        .offered
+        .lock()
+        .expect("offered")
+        .as_ref()
+        .map(|w| w.manifest.version.clone());
+    #[cfg(not(feature = "self-update"))]
+    let waiting: Option<String> = None;
+    let (overall, summary, installs) = summary(&accounts, &pairs, waiting.as_deref());
     let paused = !pairs.is_empty() && pairs.iter().all(|p| p.paused);
     let now = (overall, summary, paused);
     if tray.shown.as_ref() == Some(&now) {
@@ -418,6 +935,8 @@ fn refresh_tray(app: &AppHandle) {
     let _ = tray.icon.set_icon_as_template(cfg!(target_os = "macos"));
     let _ = tray.icon.set_tooltip(Some(format!("Theca: {}", now.1)));
     let _ = tray.summary.set_text(&now.1);
+    // Clickable while it names the update (installs it), only then.
+    let _ = tray.summary.set_enabled(installs);
     let _ = tray
         .pause
         .set_text(if paused { "Resume" } else { "Pause all" });
@@ -945,4 +1464,90 @@ async fn remove_account(app: AppHandle, account: i64, delete_files: bool) -> Ans
 #[tauri::command]
 fn quit(app: AppHandle) {
     app.exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(signed_out: bool) -> crate::state::Account {
+        crate::state::Account {
+            id: 1,
+            instance: "https://cloud.example".into(),
+            uuid: Uuid::nil(),
+            email: "a@example.com".into(),
+            device: "laptop".into(),
+            password: crate::state::Password::InState("x".into()),
+            default_folder: "/home/a/theca".into(),
+            new_libraries: NewLibraries::Notify,
+            auto_sync_limit: 0,
+            signed_out,
+        }
+    }
+
+    /// A release not installed is offered, but for another install under
+    /// way: that one installs it.
+    #[cfg(feature = "self-update")]
+    #[test]
+    fn busy_is_not_offered() {
+        use crate::update::UpdateError;
+        assert!(worth_offering(None));
+        assert!(worth_offering(Some(&UpdateError::OtherKey)));
+        assert!(!worth_offering(Some(&UpdateError::Busy)));
+    }
+
+    /// A display named by X11's variable or Wayland's, either; an empty one
+    /// names none.
+    #[cfg(feature = "self-update")]
+    #[test]
+    fn a_display_is_either_variable_set() {
+        let some = |v: &str| Some(std::ffi::OsString::from(v));
+        assert!(display_in(some(":0"), None));
+        assert!(display_in(None, some("wayland-0")));
+        assert!(display_in(some(":0"), some("wayland-0")));
+        assert!(display_in(some(""), some("wayland-0")));
+        assert!(!display_in(some(""), None));
+        assert!(!display_in(None, None));
+    }
+
+    /// The tray says an update waiting ("Update to X.Y.Z"), after what
+    /// needs the user's attention.
+    #[test]
+    fn the_tray_says_an_update_waiting() {
+        let (overall, said, installs) = summary(&[account(false)], &[], Some("9.0.0"));
+        assert!(overall == Overall::Idle);
+        assert_eq!((said.as_str(), installs), ("Update to 9.0.0", true));
+        let (_, said, installs) = summary(&[account(false)], &[], None);
+        assert_eq!((said.as_str(), installs), ("Nothing synced yet", false));
+        // Signed out, an update waiting: the summary says the first, and a
+        // click doesn't install.
+        let (overall, said, installs) = summary(&[account(true)], &[], Some("9.0.0"));
+        assert!(overall == Overall::Attention);
+        assert_eq!((said.as_str(), installs), ("Signed out: open Theca", false));
+        // A folder stopped, an update waiting: the same.
+        let stopped = crate::state::Pair {
+            id: 1,
+            account: 1,
+            library: Uuid::nil(),
+            root: Uuid::nil(),
+            library_name: "Docs".into(),
+            path: "/home/a/theca/Docs".into(),
+            root_file_id: None,
+            position: None,
+            position_event: None,
+            paused: false,
+            stop: Some(crate::state::Stop::LibraryDeleted),
+            writable: true,
+            activity: "up to date".into(),
+            error: None,
+            synced_at: None,
+            mode: Mode::Sync,
+        };
+        let (overall, said, installs) = summary(&[account(false)], &[stopped], Some("9.0.0"));
+        assert!(overall == Overall::Attention);
+        assert_eq!(
+            (said.as_str(), installs),
+            ("A folder stopped syncing", false)
+        );
+    }
 }

@@ -4,6 +4,12 @@
 # a tag). Used by .github/workflows/release.yml, one runner per OS and
 # architecture:
 #   ci/package.sh <macos|windows|linux> <arm64|x86_64>
+# Every package updates itself (the `self-update` feature) but the .deb, which
+# apt updates (ADR 0006): each is signed for the updater (a .sig beside it,
+# which ci/manifest.py lists in latest.json), with TAURI_SIGNING_PRIVATE_KEY
+# and its _PASSWORD (release.yml's secrets; a run without them, by hand,
+# signs with a throwaway key; a tag never). THECA_TEST_UPDATER_PUBKEY, a test
+# key's public half, replaces ci/updater.pub in the builds: refused on a tag.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -19,6 +25,10 @@ esac
 version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
 if [ "${GITHUB_REF_TYPE:-}" = tag ] && [ "$GITHUB_REF_NAME" != "$version" ]; then
     echo "the tag $GITHUB_REF_NAME isn't Cargo.toml's version $version" >&2
+    exit 1
+fi
+if [ "${GITHUB_REF_TYPE:-}" = tag ] && [ -n "${THECA_TEST_UPDATER_PUBKEY:-}" ]; then
+    echo "THECA_TEST_UPDATER_PUBKEY is set: a release embeds ci/updater.pub only" >&2
     exit 1
 fi
 name=theca-$version-$os-$arch
@@ -39,10 +49,30 @@ check() {
 # would run beforeBuildCommand from ui/, where `npm --prefix ui` finds nothing.
 npm --prefix ui ci
 npm --prefix ui run build
+# The public half of the key that signs, for Tauri's bundler (it reads it
+# from the configuration when it signs; tauri.conf.json has none).
+signing_pub=$(cat ci/updater.pub)
+if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+    if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
+        echo "no TAURI_SIGNING_PRIVATE_KEY: a release is signed with the release key" >&2
+        exit 1
+    fi
+    ui/node_modules/.bin/tauri signer generate --ci -p "" -w "$tmp/throwaway.key" >/dev/null
+    TAURI_SIGNING_PRIVATE_KEY=$(cat "$tmp/throwaway.key")
+    signing_pub=$(cat "$tmp/throwaway.key.pub")
+    TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
+    export TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+    echo "no TAURI_SIGNING_PRIVATE_KEY: signed with a throwaway key (no install takes these)" >&2
+fi
+# A file's .sig beside it, as Tauri signs its own packages.
+sign() {
+    ui/node_modules/.bin/tauri signer sign "$1" >/dev/null
+}
 case $os in
-macos) bundles=dmg ;;
+# The .app too: the updater's .app.tar.gz is made from it.
+macos) bundles=app,dmg ;;
 windows) bundles=nsis ;;
-linux) bundles=appimage,deb ;;
+linux) bundles=appimage ;;
 esac
 # macOS's drive: its extension built and signed first, for Tauri to copy
 # into the app (tauri.conf.json, bundle.macOS.files) without signing it with
@@ -51,12 +81,23 @@ if [ "$os" = macos ]; then
     cargo build --release -p theca-fileprovider --bin theca-drive
     ci/mac-app.sh appex target/release/theca-drive target/appex/ThecaDrive.appex
 fi
-ui/node_modules/.bin/tauri build --bundles "$bundles" --config '{"build":{"beforeBuildCommand":""}}'
+# $1: the configuration merged into tauri.conf.json.
+tauri_build() {
+    config=$1
+    shift
+    ui/node_modules/.bin/tauri build --config "$config" "$@"
+}
+tauri_build "{\"build\":{\"beforeBuildCommand\":\"\"},\"bundle\":{\"createUpdaterArtifacts\":true},\"plugins\":{\"updater\":{\"pubkey\":\"$signing_pub\"}}}" \
+    --bundles "$bundles" --features self-update
+# Linux's app a second time, without self-update: the .deb.
+if [ "$os" = linux ]; then
+    tauri_build '{"build":{"beforeBuildCommand":""}}' --bundles deb
+fi
 
 # Headless: no GUI library linked (ADR 0004). Not on macOS since 1.2.0: a
 # Mac's CLI is the app's own `theca` (its drive needs the app's extension).
 if [ "$os" != macos ]; then
-    cargo build --release --target-dir target/headless
+    cargo build --release --features self-update --target-dir target/headless
     mkdir "$tmp/$headless"
     cp LICENSE README.md USING.md "$tmp/$headless/"
 fi
@@ -108,6 +149,9 @@ PY
 case $os in
 macos)
     cp "$bundle"/dmg/Theca_"$version"_*.dmg "dist/$name.dmg"
+    # What the updater replaces the .app with.
+    cp "$bundle"/macos/Theca.app.tar.gz "dist/$name.app.tar.gz"
+    cp "$bundle"/macos/Theca.app.tar.gz.sig "dist/$name.app.tar.gz.sig"
     mnt=$tmp/dmg
     hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "dist/$name.dmg" >/dev/null
     check "$mnt/Theca.app/Contents/MacOS/theca"
@@ -124,6 +168,7 @@ macos)
     ;;
 windows)
     cp "$bundle"/nsis/Theca_"$version"_*-setup.exe "dist/$name.exe"
+    cp "$bundle"/nsis/Theca_"$version"_*-setup.exe.sig "dist/$name.exe.sig"
     # NSIS, silently, waited for: per user, under %LOCALAPPDATA%.
     powershell -NoProfile -Command \
         "Start-Process -Wait -FilePath '$(cygpath -w "dist/$name.exe")' -ArgumentList '/S'"
@@ -134,6 +179,7 @@ windows)
     ;;
 linux)
     cp "$bundle"/appimage/Theca_"$version"_*.AppImage "dist/$name.AppImage"
+    cp "$bundle"/appimage/Theca_"$version"_*.AppImage.sig "dist/$name.AppImage.sig"
     cp "$bundle"/deb/Theca_"$version"_*.deb "dist/$name.deb"
     # No FUSE on the runner: the AppImage unpacks itself instead.
     APPIMAGE_EXTRACT_AND_RUN=1 check "dist/$name.AppImage"
@@ -153,12 +199,16 @@ if [ "$os" = macos ]; then
 elif [ "$os" = windows ]; then
     cp target/headless/release/theca.exe "$tmp/$headless/"
     (cd "$tmp" && 7z a -tzip -bso0 "$dist/$headless.zip" "$headless")
+    sign "dist/$headless.zip"
     7z x -bso0 -o"$check_dir" "dist/$headless.zip"
     check "$check_dir/$headless/theca.exe"
 else
     cp target/headless/release/theca "$tmp/$headless/"
     tar -czf "dist/$headless.tar.gz" -C "$tmp" "$headless"
+    sign "dist/$headless.tar.gz"
     tar -xzf "dist/$headless.tar.gz" -C "$check_dir"
     check "$check_dir/$headless/theca"
 fi
 ls -l dist
+# The update itself, A to B, with a test key (no release needed).
+ci/update-check.sh "$os" "$arch"

@@ -2,8 +2,10 @@
 # pushes here with prod once its checks passed: the tests on the other
 # platforms (test.yml), on this very commit, then every package built natively
 # on its runner and checked (ci/package.sh), then one GitHub release with them
-# all, created only once every package passed. By hand (workflow_dispatch), it
-# tests, builds and checks the packages without releasing: they stay on the run.
+# all, created only once every package passed. By hand (workflow_dispatch) on a
+# branch, it tests, builds and checks the packages without releasing, signed
+# with a throwaway key: they stay on the run. By hand on a tag, the packaging
+# refuses: without the release key it signs nothing (ci/package.sh).
 name: release
 
 on:
@@ -47,15 +49,49 @@ jobs:
           sudo apt-get install -yq --no-install-recommends \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf file
       - run: ci/package.sh ${{ matrix.os }} ${{ matrix.arch }}
+        # The updater's signatures (ADR 0006): the release key, here only, and
+        # on a pushed version tag only. A run by hand gets none: from a branch
+        # it signs with a throwaway key (ci/package.sh), its artifacts,
+        # downloadable from a public repository, no install's update; on a tag,
+        # ci/package.sh refuses to package without the release key.
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ matrix.os }}-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
+  # latest.json, the updater's manifest (ci/manifest.py), from every
+  # package's .sig: on every run, a manual one included (kept with the run),
+  # so a release's is known good before one is made.
+  manifest:
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: latest.json
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          # This version's section of the changelog (none on a manual run).
+          awk -v h="## [$version]" 'index($0, h) == 1 {on = 1; next} /^## \[/ {on = 0} on' CHANGELOG.md > notes.md
+          ci/manifest.py "$version" \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/$version" dist notes.md > latest.json
+          cat latest.json
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: manifest
+          path: latest.json
+          if-no-files-found: error
+
   release:
     if: github.ref_type == 'tag'
-    needs: package
+    needs: manifest
     runs-on: ubuntu-24.04
     permissions:
       contents: write

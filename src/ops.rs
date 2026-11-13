@@ -45,7 +45,7 @@ fn refused<T>(why: impl Into<String>) -> Result<T> {
 /// `core` it runs), and the community edition shipping it: `0.2.0` sends
 /// positions with their event's ID, which an older server refuses. Moves with
 /// the client's needs, never with each `core` release.
-const MIN_SERVER: (&str, &str) = ("1.4.0", "1.4.4");
+pub const MIN_SERVER: (&str, &str) = ("1.4.0", "1.4.4");
 
 /// Why a server of this version is too old for this client, if it is (a
 /// version it can't read too).
