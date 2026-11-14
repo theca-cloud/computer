@@ -1123,6 +1123,14 @@ async fn new_libraries_follow_the_account() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_library_becomes_a_drive() {
+    // Where FUSE is, this engine mounts the drive in this very process: only
+    // where `THECA_TEST_DRIVE` asks for it (tests/drive.rs says why). Without
+    // FUSE nothing is mounted, and the notice is checked everywhere.
+    let asked = std::env::var("THECA_TEST_DRIVE").is_ok_and(|v| !v.is_empty() && v != "0");
+    if theca::drive::unavailable().is_none() && !asked {
+        eprintln!("skipped: THECA_TEST_DRIVE isn't set");
+        return;
+    }
     let w = world().await;
     let mut a = w.device("a").await;
     let state = a.state();
