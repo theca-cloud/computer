@@ -5,7 +5,9 @@
 #         errors), the app's page, the app built
 #   test  every test (the end-to-end ones need a Postgres, scripts/dev.sh's or
 #         DATABASE_URL's, and the server, built from the pinned core);
-#         `test <filter>`: only those whose names match
+#         `test <filter>`: only those whose names match. Built first, then
+#         each run given THECA_TEST_TIMEOUT (20m by default) where coreutils'
+#         `timeout` is
 #   app   the app driven through its window (Linux: tauri-driver, under a
 #         virtual screen; the CI image has them)
 #   deny  licenses, advisories, sources (Rust and the page's npm packages)
@@ -40,6 +42,39 @@ server() {
     THECA_SERVER="$(cd "$target" && { pwd -W 2>/dev/null || pwd; })/debug/theca-server"
     [ -f "$THECA_SERVER.exe" ] && THECA_SERVER="$THECA_SERVER.exe"
     export THECA_SERVER
+}
+
+# `cargo test <args>`, built first (`--no-run`: the build isn't timed), then
+# run within THECA_TEST_TIMEOUT, so no test hangs a machine: `timeout` kills
+# the whole run past it (what the tests started under tests/common/child.sh
+# ends with them). Where `timeout` isn't (macOS), the job's limit stands.
+tests() {
+    # Each step checked: set -e is off in a function called left of `||`.
+    cargo test --no-run "$@" || return
+    if ! command -v timeout >/dev/null; then
+        cargo test "$@"
+        return
+    fi
+    # `timeout` puts the run in a group of its own, which a terminal's Ctrl-C
+    # doesn't reach, and a command started with `&` ignores SIGINT: each
+    # signal is passed on, and the wait taken up again after it.
+    timeout -k 30 "${THECA_TEST_TIMEOUT:-20m}" cargo test "$@" &
+    run=$!
+    trap 'kill -INT "$run" 2>/dev/null' INT
+    trap 'kill -TERM "$run" 2>/dev/null' TERM
+    # Waited for once whatever happened (a run already ended has its status
+    # kept for this wait); again while a trapped signal cut the wait short
+    # (above 128, the run still there).
+    if wait "$run"; then status=0; else status=$?; fi
+    while [ "$status" -gt 128 ] && kill -0 "$run" 2>/dev/null; do
+        if wait "$run"; then status=0; else status=$?; fi
+    done
+    trap - INT TERM
+    case "$status" in
+        124) echo "cargo test $*: stopped after ${THECA_TEST_TIMEOUT:-20m} (THECA_TEST_TIMEOUT)" >&2 ;;
+        137) echo "cargo test $*: killed (SIGKILL: THECA_TEST_TIMEOUT's last resort, or another)" >&2 ;;
+    esac
+    return "$status"
 }
 
 # The last release's tag (none yet: nothing to guard).
@@ -104,16 +139,18 @@ if [ "$step" = all ] || [ "$step" = test ]; then
     server
     # The crash tests' named points (tests/crash.rs) built in: inert unless
     # THECA_CRASH_AT names one.
+    # `|| exit`: set -e doesn't stop at a function's failure on the left of
+    # `||`; `tests` returns its first failing step's status itself.
     if [ -n "$filter" ]; then
-        cargo test --features crash-points -- "$filter"
-        cargo test -p theca-fileprovider -- "$filter"
+        tests --features crash-points -- "$filter" || exit
+        tests -p theca-fileprovider -- "$filter" || exit
     else
-        cargo test --features crash-points
-        cargo test -p theca-fileprovider
+        tests --features crash-points || exit
+        tests -p theca-fileprovider || exit
         # The updater's own tests in a self-updating build (the embedded key,
         # the commands).
-        cargo test --features self-update --lib update::
-        cargo test --features self-update --test update with_the_feature
+        tests --features self-update --lib update:: || exit
+        tests --features self-update --test update with_the_feature || exit
     fi
 fi
 # Only Linux has a WebDriver for WebKit: elsewhere, `all` skips it, and the app

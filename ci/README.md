@@ -15,12 +15,15 @@ repositories. Every test builds and runs its own server from the pinned `core`, 
 platform: the tests' Postgres is a Woodpecker service on Linux, `scripts/dev.sh` on GitHub's
 Linux, and a native one on macOS and Windows (`ci/postgres.sh`: they have no Docker).
 
-**Drives are tested where `THECA_TEST_DRIVE=1` asks for it** (a missing backend is then
-a failure; without the variable the drive's scenarios skip, FUSE there or not, until they
-can no longer hang a machine: theca/computer#1): FUSE on GitHub's Linux runner (`fuse3`
-installed), Cloud Files on Windows, and on macOS a minimal `Theca.app` with the drive's
+**Drives are tested where each OS's backend is** (`THECA_TEST_DRIVE=1` makes a missing
+one a failure, not a skip): FUSE on GitHub's Linux runner (`fuse3` installed) and on a
+developer's Linux, Cloud Files on Windows, and on macOS a minimal `Theca.app` with the drive's
 extension, built and installed before the tests (`ci/mac-app.sh`), its domain switched on by
-script. Woodpecker and a developer's machine don't set it. The packages check what each OS's drive
+script. Woodpecker's image has no FUSE: the drive's scenarios skip there. A failed or killed
+drive test can't hang its machine: a Linux drive's engine is a child process of the test,
+ended with it (`tests/common/child.sh`, theca/computer#1), and `scripts/ci.sh test` runs each
+`cargo test` under `timeout` (`THECA_TEST_TIMEOUT`, 20 minutes), GitHub's job within 45
+minutes. The packages check what each OS's drive
 needs: the `.deb` depends on `fuse3`, the Windows uninstaller removes a drive, the `.dmg`'s
 app carries its extension, signed and still sandboxed.
 

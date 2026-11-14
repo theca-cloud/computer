@@ -1123,21 +1123,25 @@ async fn new_libraries_follow_the_account() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_library_becomes_a_drive() {
-    // Where FUSE is, this engine mounts the drive in this very process: only
-    // where `THECA_TEST_DRIVE` asks for it (tests/drive.rs says why). Without
-    // FUSE nothing is mounted, and the notice is checked everywhere.
-    let asked = std::env::var("THECA_TEST_DRIVE").is_ok_and(|v| !v.is_empty() && v != "0");
-    if theca::drive::unavailable().is_none() && !asked {
-        eprintln!("skipped: THECA_TEST_DRIVE isn't set");
-        return;
-    }
+    // Where FUSE is, a drive is mounted; without it, the notice.
+    let mounts = theca::drive::unavailable().is_none();
     let w = world().await;
-    let mut a = w.device("a").await;
+    // An engine that mounts is a child's, never this process's; it reads its
+    // account's setting when it starts, the other when woken.
+    let mut a = if mounts {
+        w.device_in_a_child("a", false).await
+    } else {
+        w.device("a").await
+    };
     let state = a.state();
     state
         .set_new_libraries(a.account.id, NewLibraries::Drive)
         .unwrap();
-    a.handle.wake();
+    if mounts {
+        a.restart();
+    } else {
+        a.handle.wake();
+    }
     let photos = w
         .admin
         .create_library(w.organization, "Photos")
@@ -1145,12 +1149,12 @@ async fn a_new_library_becomes_a_drive() {
         .unwrap();
     match theca::drive::unavailable() {
         None => {
-            eventually("Photos a drive", || async {
-                state
-                    .pairs()
-                    .unwrap()
-                    .iter()
-                    .any(|p| p.library == photos.id && p.mode == theca::state::Mode::Drive)
+            eventually("Photos a drive, mounted", || async {
+                state.pairs().unwrap().iter().any(|p| {
+                    p.library == photos.id
+                        && p.mode == theca::state::Mode::Drive
+                        && theca::drive::fuse::mounted(&p.path)
+                })
             })
             .await;
         }
@@ -1171,7 +1175,94 @@ async fn a_new_library_becomes_a_drive() {
             );
         }
     }
-    // Stopped before its folder goes: a mount's own engine can't serve its
-    // removal.
     a.stop().await;
+}
+
+/// An engine that calls into a drive it serves says so: the thread making
+/// that call waits on its own process, which then can't be killed
+/// (theca/computer#1), and the harness fails any scenario whose engine said
+/// it. Made here on purpose: the account's default folder inside its own
+/// drive, a new library then looked for there before it is refused
+/// (theca/computer#42).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_engine_calling_into_its_own_drive_says_so() {
+    if let Some((_w, mut a)) = own_call(true).await {
+        a.stop().await;
+    }
+}
+
+/// The harness fails a scenario whose engine called into its own drive,
+/// unless the test said it would: at its stop, and at its drop when it was
+/// never stopped.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scenario_whose_engine_called_its_own_drive_fails() {
+    if !fuse() {
+        return;
+    }
+    let stopped = tokio::spawn(async {
+        let (_w, mut a) = own_call(false).await.unwrap();
+        a.stop().await;
+        // Past a stop that let it through: its drop's check proves nothing here.
+        a.expect_own_calls();
+    });
+    let dropped = tokio::spawn(async {
+        let (_w, a) = own_call(false).await.unwrap();
+        drop(a);
+    });
+    for (how, ended) in [("stopped", stopped.await), ("dropped", dropped.await)] {
+        let failed = ended.expect_err(how);
+        let why = panic_message(failed);
+        assert!(why.contains("called into its own drive"), "{how}: {why}");
+    }
+}
+
+/// The account's default folder inside its own drive, a new library: the
+/// engine looks for its folder there, and said so. `expected`: the test says
+/// so first. Its world and its device, running (none without FUSE).
+#[cfg(target_os = "linux")]
+async fn own_call(expected: bool) -> Option<(World, Device)> {
+    if !fuse() {
+        return None;
+    }
+    let w = world().await;
+    let mut a = w.device_in_a_child("a", false).await;
+    let state = a.state();
+    state
+        .set_new_libraries(a.account.id, NewLibraries::Drive)
+        .unwrap();
+    a.restart();
+    let photos = w
+        .admin
+        .create_library(w.organization, "Photos")
+        .await
+        .unwrap();
+    let drive = || {
+        state
+            .pairs()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.library == photos.id && theca::drive::fuse::mounted(&p.path))
+    };
+    eventually("Photos a drive, mounted", || async { drive().is_some() }).await;
+    let inside = drive().unwrap().path.join("elsewhere");
+    a.stop().await;
+    assert!(!a.called_its_own_drive(), "before it was made to");
+
+    state.set_default_folder(a.account.id, &inside).unwrap();
+    state
+        .set_new_libraries(a.account.id, NewLibraries::Sync)
+        .unwrap();
+    if expected {
+        a.expect_own_calls();
+    }
+    a.restart();
+    eventually("Photos mounted again", || async { drive().is_some() }).await;
+    w.admin
+        .create_library(w.organization, "Music")
+        .await
+        .unwrap();
+    eventually("its own call said", || async { a.called_its_own_drive() }).await;
+    Some((w, a))
 }

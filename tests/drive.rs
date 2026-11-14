@@ -18,25 +18,6 @@ use theca::drive::is_placeholder;
 #[cfg(target_os = "linux")]
 use theca::state::Pair;
 
-/// The scenarios run only where `THECA_TEST_DRIVE` asks for them (GitHub's
-/// runners), and then need the drive's backend (Linux: `/dev/fuse` and
-/// `fusermount3`; Windows: always). Never because FUSE happens to be there:
-/// one deadlocked in its own mount can't be killed, and blocked a whole
-/// workspace (theca/computer#1).
-fn fuse() -> bool {
-    let asked = std::env::var("THECA_TEST_DRIVE").is_ok_and(|v| !v.is_empty() && v != "0");
-    if !asked {
-        eprintln!("skipped: THECA_TEST_DRIVE isn't set");
-        return false;
-    }
-    #[cfg(target_os = "linux")]
-    assert!(
-        Path::new("/dev/fuse").exists() && theca::drive::fuse::available(),
-        "THECA_TEST_DRIVE: no FUSE here"
-    );
-    true
-}
-
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
@@ -92,12 +73,9 @@ async fn a_drive_shows_everything_and_fetches_what_is_opened() {
     })
     .await;
 
-    let folder = state
-        .entry_at(pair.id, pair.root, &["d".to_owned()])
-        .unwrap()
-        .unwrap();
-    state.set_kept(pair.id, folder.node, true).unwrap();
-    d.handle.wake();
+    // As `theca keep` does it, from another process than the engine's: the
+    // pair's counter tells it.
+    theca::ops::keep(&state, &d.folder.join("d"), true).unwrap();
     eventually("a kept folder's file downloaded", || async {
         read(&b) == "inside"
     })
@@ -111,15 +89,10 @@ async fn a_drive_shows_everything_and_fetches_what_is_opened() {
     .await;
 }
 
-/// `f` on a blocking thread: the mount is served by this same process.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    tokio::task::spawn_blocking(f).await.unwrap()
-}
-
 /// What the drive's folder lists, through the mount.
 async fn listed(folder: &Path) -> BTreeSet<String> {
     let folder = folder.to_owned();
-    blocking(move || {
+    in_drive("the drive listed", move || {
         theca::local::scan(&folder)
             .map(|s| s.items.into_iter().map(|i| i.path.join("/")).collect())
             .unwrap_or_default()
@@ -145,7 +118,7 @@ async fn a_placeholder_renamed_over_another_opens_as_itself() {
     let folder = d.folder.clone();
     eventually("listed", || async { listed(&folder).await.len() == 2 }).await;
     let (a, b) = (folder.join("a.txt"), folder.join("b.txt"));
-    let opened = blocking(move || {
+    let opened = in_drive("b.txt renamed over a.txt, then opened", move || {
         std::fs::rename(&b, &a).unwrap();
         std::fs::read_to_string(&a).unwrap()
     })
@@ -177,15 +150,19 @@ async fn a_mounted_drive_is_the_library() {
     .await;
     let a = folder.join("a.txt");
     assert_eq!(
-        blocking(move || std::fs::read_to_string(a)).await.unwrap(),
+        in_drive("a.txt opened", move || std::fs::read_to_string(a))
+            .await
+            .unwrap(),
         "hello"
     );
     assert!(!is_placeholder(&d.backing().join("a.txt")), "fetched");
 
     let new = folder.join("d/new.txt");
-    blocking(move || std::fs::write(&new, "made in the drive"))
-        .await
-        .unwrap();
+    in_drive("d/new.txt written", move || {
+        std::fs::write(&new, "made in the drive")
+    })
+    .await
+    .unwrap();
     eventually("a file made in the drive uploaded", || async {
         read(&s.path("d/new.txt")) == "made in the drive"
     })
@@ -200,17 +177,19 @@ async fn a_mounted_drive_is_the_library() {
         .unwrap();
     assert_eq!(w.admin.versions(fetched.node).await.unwrap().len(), 1);
     let (from, to) = (folder.join("d/b.txt"), folder.join("renamed.txt"));
-    blocking(move || std::fs::rename(from, to)).await.unwrap();
+    in_drive("d/b.txt renamed", move || std::fs::rename(from, to))
+        .await
+        .unwrap();
     let gone = folder.join("a.txt");
-    blocking(move || std::fs::remove_file(gone)).await.unwrap();
+    in_drive("a.txt deleted", move || std::fs::remove_file(gone))
+        .await
+        .unwrap();
     eventually("a rename and a delete in the drive synced", || async {
         read(&s.path("renamed.txt")) == "inside"
             && !s.path("d/b.txt").exists()
             && !s.path("a.txt").exists()
     })
     .await;
-    // Unmounted before the test's folders go: deleting them through the
-    // mount would wait on this very process.
     d.stop().await;
 }
 
@@ -279,7 +258,9 @@ async fn the_limit_evicts_the_least_recently_used() {
     eventually("listed", || async { listed(&folder).await.len() == 4 }).await;
     let open = |name: &str| {
         let path = folder.join(name);
-        blocking(move || std::fs::read_to_string(path).unwrap())
+        in_drive("a file opened", move || {
+            std::fs::read_to_string(path).unwrap()
+        })
     };
     for name in ["a.txt", "b.txt", "c.txt"] {
         assert_eq!(open(name).await.len(), 1000);
@@ -391,7 +372,10 @@ async fn free_frees_now() {
     let evicted = |name: &str| is_placeholder(&backing.join(name));
     for name in ["a.txt", "b.txt"] {
         let path = folder.join(name);
-        blocking(move || std::fs::read_to_string(path).unwrap()).await;
+        in_drive("a file opened", move || {
+            std::fs::read_to_string(path).unwrap()
+        })
+        .await;
         assert!(!evicted(name));
     }
     let state = d.state();
@@ -405,25 +389,18 @@ async fn free_frees_now() {
         freed.elapsed()
     );
 
-    // Held open (on a thread, through the mount): it waits for the close.
-    let (close, closed) = std::sync::mpsc::channel::<()>();
+    // Held open through the mount: it waits for the close.
     let path = folder.join("b.txt");
-    let holder = std::thread::spawn(move || {
-        let file = std::fs::File::open(path).unwrap();
-        closed.recv().unwrap();
-        drop(file);
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let held = in_drive("b.txt opened", move || std::fs::File::open(path).unwrap()).await;
     theca::ops::free(&state, &folder.join("b.txt")).unwrap();
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     assert!(!evicted("b.txt"), "never under an open file");
-    close.send(()).unwrap();
-    blocking(move || holder.join().unwrap()).await;
+    in_drive("b.txt closed", move || drop(held)).await;
     eventually("freed once closed", || async { evicted("b.txt") }).await;
 
     // Stopped: nothing mounted, so it goes here; an edit waits for its upload.
     let a = folder.join("a.txt");
-    blocking(move || std::fs::read_to_string(a).unwrap()).await;
+    in_drive("a.txt opened", move || std::fs::read_to_string(a).unwrap()).await;
     d.stop().await;
     theca::ops::free(&state, &folder.join("a.txt")).unwrap();
     assert!(evicted("a.txt"), "at once, with no engine");
@@ -456,7 +433,10 @@ async fn a_file_made_here_and_freed_opens_again() {
     eventually("listed", || async { listed(&folder).await.len() == 1 }).await;
     let made = folder.join("made.txt");
     let path = made.clone();
-    blocking(move || std::fs::write(path, "made here").unwrap()).await;
+    in_drive("made.txt written", move || {
+        std::fs::write(path, "made here").unwrap()
+    })
+    .await;
     let state = d.state();
     let pair = d.pair();
     eventually("uploaded and recorded", || async {
@@ -477,7 +457,10 @@ async fn a_file_made_here_and_freed_opens_again() {
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     assert!(evicted(), "not downloaded again");
     let path = made.clone();
-    let opened = blocking(move || std::fs::read_to_string(path).unwrap()).await;
+    let opened = in_drive("made.txt opened", move || {
+        std::fs::read_to_string(path).unwrap()
+    })
+    .await;
     assert_eq!(opened, "made here");
     // A drive's folder can't be located elsewhere: it is the system's.
     let refused = theca::ops::locate(&state, &d.pair(), &folder, true).unwrap_err();
@@ -504,7 +487,10 @@ async fn an_open_is_a_use() {
     .await;
     let path = folder.join("a.txt");
     let fetched = path.clone();
-    assert_eq!(blocking(move || read(&fetched)).await, "hello");
+    assert_eq!(
+        in_drive("a.txt opened", move || read(&fetched)).await,
+        "hello"
+    );
     let (state, pair) = (d.state(), d.pair());
     let node = state
         .entry_at(pair.id, pair.root, &["a.txt".to_owned()])
@@ -512,7 +498,7 @@ async fn an_open_is_a_use() {
         .unwrap()
         .node;
     state.set_used(pair.id, node, 100).unwrap();
-    let out = blocking(move || {
+    let out = in_drive("a.txt read by another program", move || {
         #[cfg(windows)]
         let mut program = {
             let mut c = std::process::Command::new("cmd");

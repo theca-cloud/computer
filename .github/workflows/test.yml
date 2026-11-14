@@ -21,6 +21,9 @@ jobs:
       matrix:
         os: [macos-15, windows-2025, ubuntu-22.04-arm]
     runs-on: ${{ matrix.os }}
+    # A run takes 6 to 13 minutes: one past 45 is hung, and fails rather than
+    # waiting out GitHub's 6 hours (macOS has no `timeout` for scripts/ci.sh).
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
