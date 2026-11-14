@@ -258,16 +258,21 @@ async fn a_local_delete_killed_before_its_record_converges() {
     assert_eq!(w.admin.library_trash(w.library.id).await.unwrap().len(), 1);
 }
 
-/// The drive's backend here: its crash tests need it (as `tests/drive.rs`).
+/// The drive's crash tests run only where `THECA_TEST_DRIVE` asks for them,
+/// and then need its backend (as `tests/drive.rs`, which says why).
 #[cfg(any(target_os = "linux", windows))]
 fn fuse() -> bool {
+    let asked = std::env::var("THECA_TEST_DRIVE").is_ok_and(|v| !v.is_empty() && v != "0");
+    if !asked {
+        eprintln!("skipped: THECA_TEST_DRIVE isn't set");
+        return false;
+    }
     #[cfg(target_os = "linux")]
-    let here = Path::new("/dev/fuse").exists() && theca::drive::fuse::available();
-    #[cfg(windows)]
-    let here = true;
-    let required = std::env::var("THECA_TEST_DRIVE").is_ok_and(|v| !v.is_empty() && v != "0");
-    assert!(here || !required, "THECA_TEST_DRIVE: no FUSE here");
-    here
+    assert!(
+        Path::new("/dev/fuse").exists() && theca::drive::fuse::available(),
+        "THECA_TEST_DRIVE: no FUSE here"
+    );
+    true
 }
 
 /// A drive's file downloaded (kept, then no longer), its engine stopped.

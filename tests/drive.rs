@@ -18,20 +18,23 @@ use theca::drive::is_placeholder;
 #[cfg(target_os = "linux")]
 use theca::state::Pair;
 
-/// The drive's backend here (Linux: `/dev/fuse` and `fusermount3`; Windows:
-/// always): the scenarios are skipped without it, unless `THECA_TEST_DRIVE`
-/// says it must be there (GitHub's runners).
+/// The scenarios run only where `THECA_TEST_DRIVE` asks for them (GitHub's
+/// runners), and then need the drive's backend (Linux: `/dev/fuse` and
+/// `fusermount3`; Windows: always). Never because FUSE happens to be there:
+/// one deadlocked in its own mount can't be killed, and blocked a whole
+/// workspace (theca/computer#1).
 fn fuse() -> bool {
-    #[cfg(target_os = "linux")]
-    let here = Path::new("/dev/fuse").exists() && theca::drive::fuse::available();
-    #[cfg(windows)]
-    let here = true;
-    let required = std::env::var("THECA_TEST_DRIVE").is_ok_and(|v| !v.is_empty() && v != "0");
-    assert!(here || !required, "THECA_TEST_DRIVE: no FUSE here");
-    if !here {
-        eprintln!("skipped: no FUSE here");
+    let asked = std::env::var("THECA_TEST_DRIVE").is_ok_and(|v| !v.is_empty() && v != "0");
+    if !asked {
+        eprintln!("skipped: THECA_TEST_DRIVE isn't set");
+        return false;
     }
-    here
+    #[cfg(target_os = "linux")]
+    assert!(
+        Path::new("/dev/fuse").exists() && theca::drive::fuse::available(),
+        "THECA_TEST_DRIVE: no FUSE here"
+    );
+    true
 }
 
 fn read(path: &Path) -> String {
