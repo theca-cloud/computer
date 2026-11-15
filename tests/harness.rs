@@ -82,9 +82,11 @@ fn a_closed_pipe_stops_the_command() {
 /// keeps every file open): the command is stopped once the limit passed.
 #[test]
 fn silence_stops_the_command() {
+    // Before the script starts: its silence counts from its own start, and
+    // finding its `sleep` can take a while on a loaded runner.
+    let started = Instant::now();
     let (mut child, pipe) = script(2, 5, &["sleep", "600"]);
     let sleep = command_of(child.id(), "sleep");
-    let started = Instant::now();
     let status = ended(&mut child, Duration::from_secs(6));
     assert_eq!(status.code(), Some(143));
     assert!(
