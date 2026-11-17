@@ -31,6 +31,18 @@ jobs:
           - { runner: ubuntu-22.04, os: linux, arch: x86_64 }
           - { runner: ubuntu-22.04-arm, os: linux, arch: arm64 }
     runs-on: ${{ matrix.runner }}
+    # Every signing secret lives in the `signing` environment, which GitHub
+    # lets only version tags use: a branch can't reach them by editing this
+    # file. The job names it on a pushed version tag only (the same condition
+    # as THECA_SIGNING_RUN, which can't be read here); '' runs it without an
+    # environment, its packages unsigned (tried: theca/computer#36).
+    environment: ${{ github.event_name == 'push' && github.ref_type == 'tag' && 'signing' || '' }}
+    # Which runs get the developer's signing credentials (the packaging
+    # step's env). Our prefix: the job's env reaches every tool, and
+    # linuxdeploy's AppImage plugin GPG-signs whenever SIGN is set, even to
+    # "false" (its src/main.cpp), and failed without a key.
+    env:
+      THECA_SIGNING_RUN: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     defaults:
       run:
         shell: bash
@@ -48,15 +60,34 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -yq --no-install-recommends \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf file
+      # What signs Windows' files against Certum's cloud (ci/package.sh, and
+      # Tauri's signCommand), on the runs that sign only.
+      - name: ssign
+        if: runner.os == 'Windows' && env.THECA_SIGNING_RUN == 'true'
+        run: cargo install --locked ssign@0.1.11
       - run: ci/package.sh ${{ matrix.os }} ${{ matrix.arch }}
         # The updater's signatures (ADR 0006): the release key, here only, and
         # on a pushed version tag only. A run by hand gets none: from a branch
         # it signs with a throwaway key (ci/package.sh), its artifacts,
         # downloadable from a public repository, no install's update; on a tag,
         # ci/package.sh refuses to package without the release key.
+        #
+        # The developer's signatures (Apple's Developer ID and notarization;
+        # Certum's certificate, through SimplySign's TOTP seed, for Windows),
+        # on the runners that sign with them only: on a pushed version tag,
+        # as the updater key. Anywhere else (a manual run, from a branch)
+        # ci/package.sh builds the packages unsigned, and refuses to on a tag.
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ matrix.os == 'macos' && env.THECA_SIGNING_RUN == 'true' && vars.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_CERTIFICATE: ${{ matrix.os == 'macos' && env.THECA_SIGNING_RUN == 'true' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ matrix.os == 'macos' && env.THECA_SIGNING_RUN == 'true' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_API_KEY: ${{ matrix.os == 'macos' && env.THECA_SIGNING_RUN == 'true' && secrets.APPLE_API_KEY || '' }}
+          APPLE_API_ISSUER: ${{ matrix.os == 'macos' && env.THECA_SIGNING_RUN == 'true' && secrets.APPLE_API_ISSUER || '' }}
+          APPLE_API_PRIVATE_KEY: ${{ matrix.os == 'macos' && env.THECA_SIGNING_RUN == 'true' && secrets.APPLE_API_PRIVATE_KEY || '' }}
+          CERTUM_EMAIL: ${{ matrix.os == 'windows' && env.THECA_SIGNING_RUN == 'true' && secrets.CERTUM_EMAIL || '' }}
+          CERTUM_OTP: ${{ matrix.os == 'windows' && env.THECA_SIGNING_RUN == 'true' && secrets.CERTUM_OTP || '' }}
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ matrix.os }}-${{ matrix.arch }}
@@ -107,9 +138,6 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
-          # This version's section of the changelog, and how to open an
-          # unsigned app (signing comes with Distribution).
+          # This version's section of the changelog.
           awk -v h="## [$TAG]" 'index($0, h) == 1 {on = 1; next} /^## \[/ {on = 0} on' CHANGELOG.md > notes.md
-          printf '\nThe apps are not signed yet: [how to open them](https://github.com/%s/blob/%s/USING.md#opening-an-unsigned-app).\n' \
-            "$GITHUB_REPOSITORY" "$TAG" >> notes.md
           gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md --verify-tag

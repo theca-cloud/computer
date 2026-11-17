@@ -8,7 +8,10 @@
 #
 #   ./ci.sh [lint|test|all] [--drive] [<test name filter>]
 #   ./ci.sh dmg          the .dmg, as release.yml builds it (ci/package.sh),
-#                        into dl/arm64/ for drive-check.sh
+#                        into dl/arm64/ for drive-check.sh; signed and
+#                        notarized when APPLE_SIGNING_IDENTITY, APPLE_API_KEY,
+#                        APPLE_API_ISSUER and APPLE_API_PRIVATE_KEY (the .p8's
+#                        text) are exported, the identity in your keychain
 #
 # Never your keychain: the tests' app passwords stay in memory. --drive
 # installs a minimal Theca.app in /Applications (over yours), removes every

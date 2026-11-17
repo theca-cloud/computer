@@ -33,7 +33,8 @@ quarantines what it builds. It sets up what it can itself (a fresh local server,
 library and its files; the app's login with an app password; the app copied in, its
 quarantine removed), and asks only what a person does: the drive's switch, Finder's two
 actions. `--as-downloaded` installs it as a user gets it instead (quarantined, dragged
-into Applications, Gatekeeper's Open Anyway): once before a release. Each step is PASS or FAIL in `summary.txt`; it stops at the first
+into Applications, opened with no Open Anyway, Gatekeeper's verdict checked): once before a
+release, with a signed `.dmg`. Each step is PASS or FAIL in `summary.txt`; it stops at the first
 failure the rest depends on. For a quicker turn than GitHub's queue, the same Mac runs
 `ci/mac/ci.sh` from a git bundle of the branch: the lint and the tests as the macOS job does
 (`--drive`: the macOS drive's test, which replaces `/Applications/Theca.app` with a test app,
@@ -75,22 +76,56 @@ rm /tmp/computer-mirror /tmp/computer-mirror.pub
 
 GitHub's release job needs no other secret: its own `GITHUB_TOKEN` creates the release.
 
-## 3. The updater's key
+## 3. The signing secrets
 
-The packages that update themselves (all but the `.deb`; ADR 0006) are signed with one
-minisign key: its public half is `ci/updater.pub`, built into every one; its private half
-and password are `theca-cloud/computer`'s secrets `TAURI_SIGNING_PRIVATE_KEY` and
-`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, given only to `release.yml`'s packaging step and on a
-pushed version tag only (a run by hand from a branch signs with a throwaway key; on a tag,
-`ci/package.sh` refuses to package without the release key), with an offline copy in the
-developer's password manager. Lost, no install could update again;
-leaked, it would sign updates for every install. Made once by the developer:
+Every key that signs a package is a secret of `theca-cloud/computer`'s **`signing`
+environment**, none a repository secret: GitHub hands them only to a job naming the
+environment, and the environment's rule lets only version tags (`*.*.*`) name it, so a branch
+can't reach them, even by editing a workflow. `release.yml`'s `package` job names it on a
+pushed version tag only (anywhere else, a manual run included, `''`: no environment, unsigned packages), and its
+packaging step passes each OS's credentials to that OS's runners only. On a tag,
+`ci/package.sh` refuses to build without them, or with a part of them. Each has an offline
+copy in the developer's password manager: a secret can't be read back. Set from the
+developer's machine, never through a session:
 
 ```sh
-npx @tauri-apps/cli signer generate -w ~/.tauri/theca-updater.key   # asks for a password
-gh secret set TAURI_SIGNING_PRIVATE_KEY -R theca-cloud/computer < ~/.tauri/theca-updater.key
-gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD -R theca-cloud/computer   # prompts
+gh secret set <NAME> --env signing -R theca-cloud/computer   # prompts; < file for a file
 ```
+
+Without them, by hand, `ci/package.sh` builds ad hoc and unsigned (a throwaway updater key),
+and says so. Local builds are ad hoc; `ci/update-check.sh`'s A and B are never signed by the
+developer.
+
+**macOS: Apple's Developer ID**, enrolled as an individual. The `.app` and its drive's
+extension are signed and the `.app` notarized by Tauri and `ci/mac-app.sh`, the `.dmg`
+notarized by `ci/package.sh`, every ticket stapled and checked (`spctl`, `stapler`):
+`APPLE_CERTIFICATE` (the Developer ID Application certificate and its key, exported from
+Keychain Access as a `.p12`, base64: `base64 -i <file>.p12 | gh secret set ...`),
+`APPLE_CERTIFICATE_PASSWORD` (the `.p12`'s), `APPLE_API_KEY`, `APPLE_API_ISSUER` and
+`APPLE_API_PRIVATE_KEY` (an App Store Connect API key with the Developer role, Users and
+Access → Integrations: its ID, its issuer, its `.p8`, downloadable once), and the
+environment's variable `APPLE_SIGNING_IDENTITY` ("Developer ID Application: <name> (<team>)").
+On the developer's Mac, `ci/mac/ci.sh dmg` signs with the identity in their keychain
+(`APPLE_SIGNING_IDENTITY` and the API key exported, no certificate).
+
+**Windows: Certum's Open Source Code Signing in the cloud** (a year, at most 459 days; its
+RSA 4096 key generated in SimplySign, where it stays). `ssign` (installed by `release.yml`,
+pinned) signs against it over HTTPS: Tauri calls it on `theca.exe`, NSIS's plugins, the
+uninstaller and the installer (`bundle.windows.signCommand`), `ci/package.sh` on the headless
+`theca.exe`; `signtool verify /pa` checks each, by "Open Source Developer", timestamped.
+`CERTUM_EMAIL` (the SimplySign login) and `CERTUM_OTP` (the `otpauth://` URI of SimplySign's
+QR code, read from a screenshot with `zbarimg -q --raw` before the phone scans it): with the
+email, the seed signs anything as the developer; leaked, a new QR (Certum's "regain access")
+makes it useless. A login code works once: `ssign` keeps its session 20 minutes, for every
+file of a build.
+
+**The updater's key** (ADR 0006): the packages that update themselves (all but the `.deb`)
+are signed with one minisign key, its public half `ci/updater.pub`, built into every one;
+`TAURI_SIGNING_PRIVATE_KEY` is its private half, with an empty password (so no
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: `release.yml` passes `''`). Lost, no install could
+update again; leaked, it would sign updates for every install. Made once:
+`npx @tauri-apps/cli signer generate -w ~/.tauri/theca-updater.key`, then
+`gh secret set TAURI_SIGNING_PRIVATE_KEY --env signing -R theca-cloud/computer < ~/.tauri/theca-updater.key`.
 
 `ci/package.sh` signs each package (a `.sig` beside it; without the secret, by hand, a
 throwaway key, never on a tag), the `manifest` job writes `latest.json` from them

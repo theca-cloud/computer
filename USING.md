@@ -24,12 +24,9 @@ The app and headless update themselves from Theca's releases, except the `.deb`,
 - **`theca update` with the app open** hands over: the app installs and restarts. Without a display (a server over ssh), there is no app to hand over to: it installs itself, and says so.
 - **What it leaves**: on Windows, the binary it replaced, set aside as `theca.exe.old` beside it (it may still be running), removed at the next update. `theca status` waits 3 seconds at most to say a new version is out: offline, it says nothing of it.
 
-### Opening an unsigned app
+### Windows' SmartScreen
 
-The apps aren't signed by Apple or Microsoft yet, so the first time:
-
-- **macOS** says Apple could not verify Theca. Open **System Settings → Privacy & Security**, scroll to Security, click **Open Anyway** next to Theca, and confirm.
-- **Windows** SmartScreen says "Windows protected your PC": click **More info**, then **Run anyway**.
+The apps are signed by their developer: macOS opens them without a warning, Apple having checked them. On Windows, the installer and the app name their publisher, "Open Source Developer Pascal Perrenoud"; until that certificate has earned a reputation with Microsoft, SmartScreen may still say "Windows protected your PC": click **More info**, check the publisher, then **Run anyway**.
 
 ### Checking a download
 
@@ -39,7 +36,7 @@ Each release lists the SHA-256 of every file in `SHA256SUMS`: `shasum -a 256 -c 
 
 Logging in creates an app password for this computer, revocable from the web app (**Account → App passwords**). It is kept in the system's keychain: the login keychain on macOS, the Credential Manager on Windows, the Secret Service (GNOME Keyring, KWallet) on Linux. Where there is none, as on most headless servers, it is kept in the app's state file instead, readable by you alone, and the login says so; `theca login --no-keyring` keeps it there by choice.
 
-On macOS, until the app is signed, each new version asks once for your password to read its keychain entry: click **Always Allow**.
+On macOS, the first signed version (after 1.2 or earlier) asks once for your password to read its keychain entry: click **Always Allow**. The versions after it shouldn't ask again.
 
 ## Choosing libraries
 

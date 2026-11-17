@@ -10,13 +10,27 @@
 #   ci/update-check.sh <macos|windows|linux> <arm64|x86_64>
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# A and B ad hoc, whatever ci/package.sh was given: Tauri signs and notarizes
+# whenever these are set, which would double the macOS job for packages no
+# one installs (the signed ones are ci/package.sh's to check). Certum's login
+# and seed too: nothing in these builds signs on Windows, and what builds them
+# has no use for the seed.
+unset APPLE_SIGNING_IDENTITY APPLE_API_KEY APPLE_API_ISSUER APPLE_API_KEY_PATH \
+    APPLE_API_PRIVATE_KEY APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD \
+    CERTUM_EMAIL CERTUM_OTP
 
 os=$1
 arch=$2
 version_in() { sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1; }
 version=$(version_in)
 next=$(echo "$version" | awk -F. '{ print $1 "." $2 "." $3 + 1 }')
-tmp=${RUNNER_TEMP:-$(mktemp -d)}/update-check
+tmp=${RUNNER_TEMP:-$(mktemp -d)}
+# On macOS by its real path: Tauri's updater refuses to run from a path
+# through a symlink, and a Mac's mktemp folder is under /var, a link to
+# /private/var. Not on Windows: Git Bash's real path (/d/a/_temp) means
+# nothing to the native programs given it, its conversion being off below.
+if [ "$os" = macos ]; then tmp=$(cd "$tmp" && pwd -P); fi
+tmp=$tmp/update-check
 rm -rf "$tmp"
 # What is served: B signed by the test key (good/), and by another (other/).
 dist=$tmp/serve/good

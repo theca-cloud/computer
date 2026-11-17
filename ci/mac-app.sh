@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# macOS's drive extension bundled and signed ad hoc, inside out (no --deep:
-# it would give the extension the app's entitlements).
+# macOS's drive extension bundled and signed, inside out (no --deep: it
+# would give the extension the app's entitlements): with APPLE_SIGNING_IDENTITY
+# when it is set, ad hoc otherwise. The tests' app (`app`) is always ad hoc.
 #   ci/mac-app.sh appex <theca-drive binary> <ThecaDrive.appex>
 #   ci/mac-app.sh app <theca binary> <theca-drive binary> <Theca.app>
 #     a minimal Theca.app (the tests'): the theca binary, the extension in
@@ -17,7 +18,15 @@ appex() {
     plutil -replace CFBundleShortVersionString -string "$version" "$appex/Contents/Info.plist"
     plutil -replace CFBundleVersion -string "$version" "$appex/Contents/Info.plist"
     cp "$binary" "$appex/Contents/MacOS/theca-drive"
-    codesign --force --sign - --entitlements fileprovider/mac/drive.entitlements "$appex"
+    # The developer's identity when given (ci/package.sh, a signed run):
+    # with the hardened runtime and a secure timestamp, as notarization wants
+    # of every executable (Tauri passes no --timestamp, and doesn't sign it).
+    if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+        codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" \
+            --entitlements fileprovider/mac/drive.entitlements "$appex"
+    else
+        codesign --force --sign - --entitlements fileprovider/mac/drive.entitlements "$appex"
+    fi
     codesign --verify --strict "$appex"
 }
 
@@ -45,7 +54,7 @@ app)
 </plist>
 PLIST
     cp "$2" "$app/Contents/MacOS/theca"
-    appex "$3" "$app/Contents/PlugIns/ThecaDrive.appex"
+    APPLE_SIGNING_IDENTITY='' appex "$3" "$app/Contents/PlugIns/ThecaDrive.appex"
     codesign --force --sign - "$app"
     codesign --verify --strict "$app"
     ;;
