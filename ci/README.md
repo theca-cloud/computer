@@ -111,7 +111,7 @@ On the developer's Mac, `ci/mac/ci.sh dmg` signs with the identity in their keyc
 **Windows: Certum's Open Source Code Signing in the cloud** (a year, at most 459 days; its
 RSA 4096 key generated in SimplySign, where it stays). `ssign` (installed by `release.yml`,
 pinned) signs against it over HTTPS: Tauri calls it on `theca.exe`, NSIS's plugins, the
-uninstaller and the installer (`bundle.windows.signCommand`), `ci/package.sh` on the headless
+uninstaller and the installer (`bundle.windows.signCommand`), `ci/package.sh` on the CLI
 `theca.exe`; `signtool verify /pa` checks each, by "Open Source Developer", timestamped.
 `CERTUM_EMAIL` (the SimplySign login) and `CERTUM_OTP` (the `otpauth://` URI of SimplySign's
 QR code, read from a screenshot with `zbarimg -q --raw` before the phone scans it): with the

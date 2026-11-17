@@ -76,7 +76,7 @@ apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 cloud-filter = "0.0.7"
 nt-time = "0.15"
 windows-native-keyring-store = "1.1.0"
-# The headless archive is a .zip here, a .tar.gz elsewhere.
+# The CLI archive is a .zip here, a .tar.gz elsewhere.
 zip = { version = "9.5.1", default-features = false, features = ["deflate"] }
 
 [target.'cfg(not(windows))'.dependencies]

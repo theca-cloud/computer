@@ -1,4 +1,4 @@
-//! Self-update (sprint Self-update; wiki: Sync client): the app and headless
+//! Self-update (sprint Self-update; wiki: Sync client): the app and the CLI
 //! replacing their own package with a newer release, in the packages whose
 //! channel doesn't update them (ADR 0006).
 
@@ -21,7 +21,7 @@ const KEY: &str = "updates";
 
 /// The key every release's packages and manifest are signed with (minisign,
 /// as Tauri writes it: the base64 of the `.pub` file), for the app and
-/// headless alike. A test build takes a test key's instead, at build time;
+/// the CLI alike. A test build takes a test key's instead, at build time;
 /// `ci/package.sh` refuses that on a tag.
 #[cfg(feature = "self-update")]
 pub const PUBLIC_KEY: &str = match option_env!("THECA_TEST_UPDATER_PUBKEY") {
@@ -31,7 +31,7 @@ pub const PUBLIC_KEY: &str = match option_env!("THECA_TEST_UPDATER_PUBKEY") {
 .trim_ascii();
 
 impl Mode {
-    /// `auto` for the app; `ask` headless, whose user usually can't write the
+    /// `auto` for the app; `ask` the CLI, whose user usually can't write the
     /// binary and whose admin chooses when a server changes.
     pub const DEFAULT: Mode = if cfg!(feature = "gui") {
         Mode::Auto
@@ -133,8 +133,8 @@ pub enum UpdateError {
     Busy,
 }
 
-/// A release's `latest.json`: Tauri's updater format, plus the headless
-/// archives (`<os>-<arch>-headless`) and `min_server`. It only grows (every
+/// A release's `latest.json`: Tauri's updater format, plus the CLI
+/// archives (`<os>-<arch>-cli`) and `min_server`. It only grows (every
 /// installed client reads the newest): fields unknown here are ignored.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Manifest {
@@ -194,7 +194,7 @@ impl Manifest {
         }
     }
 
-    /// The package for `target` (`darwin-aarch64`, `linux-x86_64-headless`...).
+    /// The package for `target` (`darwin-aarch64`, `linux-x86_64-cli`...).
     pub fn package(&self, target: &str) -> Result<&Package, UpdateError> {
         self.platforms
             .get(target)
@@ -250,7 +250,7 @@ fn public_key(key: &str) -> Option<minisign_verify::PublicKey> {
 
 /// `bytes` are what `signature` signed with `key` (the base64 of a minisign
 /// `.pub` file, as `PUBLIC_KEY`), and the signature's trusted comment
-/// (signed with the rest) names a file of `version` (`file:theca-headless-1.3.0-…`,
+/// (signed with the rest) names a file of `version` (`file:theca-cli-1.3.0-…`,
 /// `file:Theca_1.3.0_amd64.AppImage`, as Tauri's signer writes it): the
 /// manifest isn't signed, so an older signed package announced as newer
 /// would otherwise be taken (a rollback).
@@ -267,17 +267,17 @@ pub fn verify_release(
         .find_map(|field| field.strip_prefix("file:"))
         .unwrap_or("");
     // The name as the release writes it, the version followed by what can
-    // only come after a whole one: a headless archive's OS
-    // (`theca-headless-2.0.0-rc.1-…` isn't 2.0.0's), an `.AppImage`'s `_`
+    // only come after a whole one: a CLI archive's OS
+    // (`theca-cli-2.0.0-rc.1-…` isn't 2.0.0's), an `.AppImage`'s `_`
     // (Tauri writes a prerelease's version whole: `Theca_2.0.0-rc.1_…`).
-    let headless = file
-        .strip_prefix(&format!("theca-headless-{version}-"))
+    let cli = file
+        .strip_prefix(&format!("theca-cli-{version}-"))
         .is_some_and(|rest| {
-            // No headless macOS archive since 1.2.0 (a Mac's CLI is the app's).
+            // No CLI macOS archive since 1.2.0 (a Mac's CLI is the app's).
             ["linux-", "windows-"].iter().any(|os| rest.starts_with(os))
         });
     let appimage = file.starts_with(&format!("Theca_{version}_"));
-    if headless || appimage {
+    if cli || appimage {
         Ok(())
     } else {
         Err(UpdateError::NotThisVersion {
@@ -311,8 +311,8 @@ pub const MANIFEST: &str =
 /// What a self-update replaces.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Installed {
-    /// The headless binary (where a link to it leads).
-    Headless(std::path::PathBuf),
+    /// The CLI binary (where a link to it leads).
+    Cli(std::path::PathBuf),
     /// The `.AppImage` the app runs from (`$APPIMAGE`: the running binary
     /// is inside its mount), updated by this code, not Tauri's: Tauri's needs
     /// a display.
@@ -320,11 +320,11 @@ pub enum Installed {
 }
 
 impl Installed {
-    /// This process's, if this code updates it: headless, or the app from an
+    /// This process's, if this code updates it: the CLI, or the app from an
     /// `.AppImage` (Tauri's updater updates the app on macOS and Windows).
     pub fn this() -> Option<Installed> {
         if !cfg!(feature = "gui") {
-            std::env::current_exe().ok().map(Installed::Headless)
+            std::env::current_exe().ok().map(Installed::Cli)
         } else if cfg!(target_os = "linux") {
             std::env::var_os("APPIMAGE").map(|p| Installed::AppImage(p.into()))
         } else {
@@ -334,22 +334,22 @@ impl Installed {
 
     pub fn path(&self) -> &std::path::Path {
         match self {
-            Installed::Headless(path) | Installed::AppImage(path) => path,
+            Installed::Cli(path) | Installed::AppImage(path) => path,
         }
     }
 
     /// Its entry in a manifest's `platforms`: `<os>-<arch>` as Tauri names
-    /// them (the `.AppImage` is `linux-<arch>`), `-headless` for headless.
+    /// them (the `.AppImage` is `linux-<arch>`), `-cli` for the CLI.
     pub fn target(&self) -> String {
         let os = match std::env::consts::OS {
             "macos" => "darwin",
             os => os,
         };
-        let headless = match self {
-            Installed::Headless(_) => "-headless",
+        let cli = match self {
+            Installed::Cli(_) => "-cli",
             Installed::AppImage(_) => "",
         };
-        format!("{os}-{}{headless}", std::env::consts::ARCH)
+        format!("{os}-{}{cli}", std::env::consts::ARCH)
     }
 
     /// The new release started with `args`: from the installed file (never
@@ -428,7 +428,7 @@ pub async fn install(
     let download = fetch(&package.url).await?;
     verify_release(key, &package.signature, &download, &manifest.version)?;
     let binary = match installed {
-        Installed::Headless(_) => unpack(&download)?,
+        Installed::Cli(_) => unpack(&download)?,
         // Tauri's `.AppImage` package is the file itself.
         Installed::AppImage(_) => download,
     };
@@ -542,7 +542,7 @@ where
     }
 }
 
-/// The binary in a headless archive: `<folder>/theca` in a `.tar.gz`.
+/// The binary in a CLI archive: `<folder>/theca` in a `.tar.gz`.
 #[cfg(not(windows))]
 fn unpack(archive: &[u8]) -> Result<Vec<u8>, UpdateError> {
     use std::io::Read;
@@ -560,7 +560,7 @@ fn unpack(archive: &[u8]) -> Result<Vec<u8>, UpdateError> {
     Err(UpdateError::Archive("theca".into()))
 }
 
-/// The binary in a headless archive: `<folder>/theca.exe` in a `.zip`.
+/// The binary in a CLI archive: `<folder>/theca.exe` in a `.zip`.
 #[cfg(windows)]
 fn unpack(archive: &[u8]) -> Result<Vec<u8>, UpdateError> {
     use std::io::Read;
@@ -704,7 +704,7 @@ mod tests {
               "pub_date": "2026-11-20T10:00:00Z",
               "min_server": "1.6.0",
               "platforms": {{
-                "linux-x86_64-headless": {{
+                "linux-x86_64-cli": {{
                   "url": "https://example.invalid/theca.tar.gz",
                   "signature": "{signature}"{extra}
                 }}
@@ -722,12 +722,12 @@ mod tests {
         let m = Manifest::parse(&manifest(&key.sign(PACKAGE), "")).unwrap();
         assert!(m.is_newer_than("1.2.0"));
         assert!(!m.is_newer_than("1.3.0") && !m.is_newer_than("1.4.0"));
-        let package = m.package("linux-x86_64-headless").unwrap();
+        let package = m.package("linux-x86_64-cli").unwrap();
         assert_eq!(package.url, "https://example.invalid/theca.tar.gz");
         assert_eq!(verify(&key.public(), &package.signature, PACKAGE), Ok(()));
         assert_eq!(
-            m.package("windows-x86_64-headless").unwrap_err(),
-            UpdateError::NoPackage("windows-x86_64-headless".into())
+            m.package("windows-x86_64-cli").unwrap_err(),
+            UpdateError::NoPackage("windows-x86_64-cli".into())
         );
     }
 
@@ -758,27 +758,24 @@ mod tests {
         let ok = |file: &str, version: &str| {
             verify_release(&key.public(), &key.sign_as(PACKAGE, file), PACKAGE, version)
         };
-        assert_eq!(
-            ok("theca-headless-1.2.1-linux-x86_64.tar.gz", "1.2.1"),
-            Ok(())
-        );
+        assert_eq!(ok("theca-cli-1.2.1-linux-x86_64.tar.gz", "1.2.1"), Ok(()));
         assert_eq!(ok("Theca_1.2.1_amd64.AppImage", "1.2.1"), Ok(()));
-        assert_eq!(
-            ok("theca-headless-1.2.1-windows-x86_64.zip", "1.2.1"),
-            Ok(())
-        );
+        assert_eq!(ok("theca-cli-1.2.1-windows-x86_64.zip", "1.2.1"), Ok(()));
         for (file, version) in [
-            ("theca-headless-1.2.10-linux-x86_64.tar.gz", "1.2.1"),
-            ("theca-headless-1.2.1-linux-x86_64.tar.gz", "1.2.10"),
+            ("theca-cli-1.2.10-linux-x86_64.tar.gz", "1.2.1"),
+            ("theca-cli-1.2.1-linux-x86_64.tar.gz", "1.2.10"),
             ("Theca_11.2.1_amd64.AppImage", "1.2.1"),
             ("theca.tar.gz", "1.2.1"),
             // A prerelease's package, for its final version.
-            ("theca-headless-2.0.0-rc.1-linux-x86_64.tar.gz", "2.0.0"),
+            ("theca-cli-2.0.0-rc.1-linux-x86_64.tar.gz", "2.0.0"),
             ("Theca_2.0.0-rc.1_amd64.AppImage", "2.0.0"),
-            // A headless macOS archive, which no release has.
-            ("theca-headless-1.2.1-macos-arm64.tar.gz", "1.2.1"),
+            // A CLI macOS archive, which no release has.
+            ("theca-cli-1.2.1-macos-arm64.tar.gz", "1.2.1"),
+            // The name before 1.3.0 (CLI was "headless", theca/computer#61):
+            // no release signs a package under it, no update installs one.
+            ("theca-headless-1.2.1-linux-x86_64.tar.gz", "1.2.1"),
             // The version elsewhere in the name.
-            ("old-theca-headless-1.2.1-linux-x86_64.tar.gz", "1.2.1"),
+            ("old-theca-cli-1.2.1-linux-x86_64.tar.gz", "1.2.1"),
         ] {
             assert!(
                 matches!(ok(file, version), Err(UpdateError::NotThisVersion { .. })),
@@ -853,7 +850,7 @@ mod tests {
             r#", "delta": {"from": "1.2.0"}"#,
         ))
         .unwrap();
-        let package = m.package("linux-x86_64-headless").unwrap();
+        let package = m.package("linux-x86_64-cli").unwrap();
         assert_eq!(verify(&key.public(), &package.signature, PACKAGE), Ok(()));
     }
 
@@ -919,7 +916,7 @@ mod tests {
         assert!(!earlier.exists(), "the one left from before removed");
     }
 
-    /// The app installs by itself; headless asks.
+    /// The app installs by itself; the CLI asks.
     #[test]
     fn the_default_depends_on_the_build() {
         let expected = if cfg!(feature = "gui") {

@@ -32,7 +32,7 @@ if [ "${GITHUB_REF_TYPE:-}" = tag ] && [ -n "${THECA_TEST_UPDATER_PUBKEY:-}" ]; 
     exit 1
 fi
 name=theca-$version-$os-$arch
-headless=theca-headless-$version-$os-$arch
+cli=theca-cli-$version-$os-$arch
 bundle=target/release/bundle
 dist=$PWD/dist
 # A runner's temp folder, or one of our own when run by hand.
@@ -248,12 +248,12 @@ if [ "$os" = linux ]; then
     tauri_build '{"build":{"beforeBuildCommand":""}}' --bundles deb
 fi
 
-# Headless: no GUI library linked (ADR 0004). Not on macOS since 1.2.0: a
+# The CLI: no GUI library linked (ADR 0004). Not on macOS since 1.2.0: a
 # Mac's CLI is the app's own `theca` (its drive needs the app's extension).
 if [ "$os" != macos ]; then
-    cargo build --release --features self-update --target-dir target/headless
-    mkdir "$tmp/$headless"
-    cp LICENSE README.md USING.md "$tmp/$headless/"
+    cargo build --release --features self-update --target-dir target/cli
+    mkdir "$tmp/$cli"
+    cp LICENSE README.md USING.md "$tmp/$cli/"
 fi
 
 # The uninstaller removes every drive first (ci/installer.nsh), but for an
@@ -364,26 +364,26 @@ linux)
     ;;
 esac
 
-# The headless archive: a folder of its name, unpacked again to be checked.
+# The CLI archive: a folder of its name, unpacked again to be checked.
 check_dir=$tmp/unpacked
 mkdir "$check_dir"
 if [ "$os" = macos ]; then
     :
 elif [ "$os" = windows ]; then
     # Built outside Tauri: signed here, before the zip and its .sig.
-    if $signed; then ssign target/headless/release/theca.exe; fi
-    cp target/headless/release/theca.exe "$tmp/$headless/"
-    (cd "$tmp" && 7z a -tzip -bso0 "$dist/$headless.zip" "$headless")
-    sign "dist/$headless.zip"
-    7z x -bso0 -o"$check_dir" "dist/$headless.zip"
-    check "$check_dir/$headless/theca.exe"
-    if $signed; then authenticode "$check_dir/$headless/theca.exe"; fi
+    if $signed; then ssign target/cli/release/theca.exe; fi
+    cp target/cli/release/theca.exe "$tmp/$cli/"
+    (cd "$tmp" && 7z a -tzip -bso0 "$dist/$cli.zip" "$cli")
+    sign "dist/$cli.zip"
+    7z x -bso0 -o"$check_dir" "dist/$cli.zip"
+    check "$check_dir/$cli/theca.exe"
+    if $signed; then authenticode "$check_dir/$cli/theca.exe"; fi
 else
-    cp target/headless/release/theca "$tmp/$headless/"
-    tar -czf "dist/$headless.tar.gz" -C "$tmp" "$headless"
-    sign "dist/$headless.tar.gz"
-    tar -xzf "dist/$headless.tar.gz" -C "$check_dir"
-    check "$check_dir/$headless/theca"
+    cp target/cli/release/theca "$tmp/$cli/"
+    tar -czf "dist/$cli.tar.gz" -C "$tmp" "$cli"
+    sign "dist/$cli.tar.gz"
+    tar -xzf "dist/$cli.tar.gz" -C "$check_dir"
+    check "$check_dir/$cli/theca"
 fi
 ls -l dist
 # The update itself, A to B, with a test key (no release needed).

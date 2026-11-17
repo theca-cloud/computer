@@ -105,7 +105,7 @@ enum Command {
         /// What libraries new to the account do: sync (up to the size
         /// limit), drive, or silent (listed only: `theca libraries`).
         /// Default: silent. Its libraries now are added with `theca add`.
-        #[arg(long, value_parser = headless_new_libraries)]
+        #[arg(long, value_parser = cli_new_libraries)]
         new_libraries: Option<state::NewLibraries>,
     },
     /// The accounts on this device.
@@ -732,7 +732,7 @@ async fn update_now(path: &std::path::Path, state: &State, manifest_url: &str) -
         release.version,
         release.notes_url()
     );
-    if matches!(installed, update::Installed::Headless(_)) {
+    if matches!(installed, update::Installed::Cli(_)) {
         println!("A running `theca run` goes on with {current} until it starts again.");
     }
     Ok(())
@@ -963,7 +963,7 @@ fn new_libraries_said(new: state::NewLibraries, limit: i64) -> String {
 }
 
 /// `login --new-libraries`: what a computer without the app's window can do.
-fn headless_new_libraries(value: &str) -> std::result::Result<state::NewLibraries, String> {
+fn cli_new_libraries(value: &str) -> std::result::Result<state::NewLibraries, String> {
     match value.parse()? {
         state::NewLibraries::Notify => {
             Err("notify needs the app's window: sync, drive or silent".into())

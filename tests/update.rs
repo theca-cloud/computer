@@ -1,4 +1,4 @@
-//! Headless updates for real: a manifest and an archive served over HTTP,
+//! CLI updates for real: a manifest and an archive served over HTTP,
 //! signed with a key of the test's own, installed over a copy of this build's
 //! `theca`, which must still run.
 
@@ -31,7 +31,7 @@ impl Key {
     /// As `tauri signer sign` signs a package of the release announced
     /// (9.0.0): its trusted comment names the file.
     fn sign(&self, bytes: &[u8]) -> String {
-        self.sign_as(bytes, "theca-headless-9.0.0-linux-x86_64.tar.gz")
+        self.sign_as(bytes, "theca-cli-9.0.0-linux-x86_64.tar.gz")
     }
     /// Signed as the package `file`.
     fn sign_as(&self, bytes: &[u8], file: &str) -> String {
@@ -46,13 +46,10 @@ fn b64(text: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(text)
 }
 
-/// The headless archive `release.yml` publishes for `target`, holding
+/// The CLI archive `release.yml` publishes for `target`, holding
 /// `binary`.
 fn archive(target: &str, binary: &[u8]) -> Vec<u8> {
-    let folder = format!(
-        "theca-headless-9.0.0-{}",
-        target.trim_end_matches("-headless")
-    );
+    let folder = format!("theca-cli-9.0.0-{}", target.trim_end_matches("-cli"));
     #[cfg(not(windows))]
     {
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
@@ -96,21 +93,21 @@ struct Release {
 }
 
 impl Release {
-    /// Headless: the binary, released in its archive.
+    /// The CLI: the binary, released in its archive.
     fn new(sign: impl FnOnce(&[u8]) -> String) -> Release {
         let binary = std::fs::read(env!("CARGO_BIN_EXE_theca")).unwrap();
-        Release::of(Installed::Headless, &binary, sign)
+        Release::of(Installed::Cli, &binary, sign)
     }
 
-    /// Headless, a small file standing in for the binary (the debug build
+    /// The CLI, a small file standing in for the binary (the debug build
     /// is hundreds of MB): for the tests that don't run it.
     fn small(sign: impl FnOnce(&[u8]) -> String) -> Release {
-        Release::of(Installed::Headless, b"a binary", sign)
+        Release::of(Installed::Cli, b"a binary", sign)
     }
 
     /// `small`, needing a server on `min_server` or later.
     fn needing(min_server: &str, sign: impl FnOnce(&[u8]) -> String) -> Release {
-        Release::with(Installed::Headless, b"a binary", min_server, sign)
+        Release::with(Installed::Cli, b"a binary", min_server, sign)
     }
 
     /// `kind` of install of `binary` (the `.AppImage`'s package is the file
@@ -144,7 +141,7 @@ impl Release {
         let original = std::fs::read(&exe).unwrap();
         let new = [&original[..], MARKER].concat();
         let archive = match installed {
-            Installed::Headless(_) => archive(&target, &new),
+            Installed::Cli(_) => archive(&target, &new),
             Installed::AppImage(_) => new,
         };
         let signature = sign(&archive);
@@ -206,7 +203,7 @@ fn server(version: &str) -> Vec<(String, Option<String>)> {
 /// The release found, its archive verified, the binary replaced, and the new
 /// one runs.
 #[tokio::test]
-async fn headless_updates_itself() {
+async fn cli_updates_itself() {
     let key = Key::new();
     let release = Release::new(|a| key.sign(a));
     let manifest = update::check(&release.manifest).await.unwrap().unwrap();
@@ -322,7 +319,7 @@ async fn a_link_to_the_binary_stays_a_link() {
         &manifest,
         &key.public(),
         &server("1.6.0"),
-        &Installed::Headless(link.clone()),
+        &Installed::Cli(link.clone()),
     )
     .await
     .unwrap();
@@ -381,13 +378,13 @@ fn state_in(mode: Mode) -> (tempfile::TempDir, State) {
     (dir, state)
 }
 
-/// One scheduled check in `mode`, installing headless as `theca run` does.
+/// One scheduled check in `mode`, installing the CLI as `theca run` does.
 async fn tick(release: &Release, key: &Key, mode: Mode) -> Checked {
     let (_dir, state) = state_in(mode);
     tick_on(&state, release, key).await
 }
 
-/// One scheduled check on `state`, installing headless as `theca run` does.
+/// One scheduled check on `state`, installing the CLI as `theca run` does.
 async fn tick_on(state: &State, release: &Release, key: &Key) -> Checked {
     let public = key.public();
     update::tick(state, &release.manifest, |manifest, servers| async move {
@@ -534,18 +531,9 @@ fn the_release_manifest_is_what_the_client_reads() {
         ("theca-9.0.0-windows-x86_64.exe", "windows-x86_64"),
         ("theca-9.0.0-linux-x86_64.AppImage", "linux-x86_64"),
         ("theca-9.0.0-linux-arm64.AppImage", "linux-aarch64"),
-        (
-            "theca-headless-9.0.0-windows-x86_64.zip",
-            "windows-x86_64-headless",
-        ),
-        (
-            "theca-headless-9.0.0-linux-x86_64.tar.gz",
-            "linux-x86_64-headless",
-        ),
-        (
-            "theca-headless-9.0.0-linux-arm64.tar.gz",
-            "linux-aarch64-headless",
-        ),
+        ("theca-cli-9.0.0-windows-x86_64.zip", "windows-x86_64-cli"),
+        ("theca-cli-9.0.0-linux-x86_64.tar.gz", "linux-x86_64-cli"),
+        ("theca-cli-9.0.0-linux-arm64.tar.gz", "linux-aarch64-cli"),
     ];
     for (file, _) in packages {
         std::fs::write(dist.path().join(file), file).unwrap();
@@ -591,7 +579,7 @@ fn the_release_manifest_is_what_the_client_reads() {
         assert_eq!(signed, Ok(()), "{target}");
     }
     // The names `Installed` asks for are among them.
-    let here = Installed::Headless(PathBuf::new()).target();
+    let here = Installed::Cli(PathBuf::new()).target();
     if matches!(std::env::consts::ARCH, "x86_64" | "aarch64") && !cfg!(target_os = "macos") {
         assert!(manifest.package(&here).is_ok(), "{here}");
     }
@@ -679,13 +667,13 @@ async fn min_server_is_checked_against_each_accounts_server() {
 #[tokio::test]
 async fn an_older_release_announced_as_newer_is_refused() {
     let key = Key::new();
-    let release = Release::small(|a| key.sign_as(a, "theca-headless-1.2.0-linux-x86_64.tar.gz"));
+    let release = Release::small(|a| key.sign_as(a, "theca-cli-1.2.0-linux-x86_64.tar.gz"));
     let error = refused(&release, &key, &server("1.6.0")).await;
     assert_eq!(
         error,
         UpdateError::NotThisVersion {
             version: "9.0.0".into(),
-            signed: "theca-headless-1.2.0-linux-x86_64.tar.gz".into(),
+            signed: "theca-cli-1.2.0-linux-x86_64.tar.gz".into(),
         }
     );
 }
