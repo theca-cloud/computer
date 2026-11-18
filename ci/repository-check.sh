@@ -20,7 +20,8 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # Which releases a repository keeps: the newest that fit, and no more.
 kept=$(printf '1.4.0 100\n1.3.1 100\n1.3.0 100\n' | ci/repository.sh --select 250 | tr '\n' ' ')
 [ "$kept" = "1.4.0 1.3.1 " ] || fail "250 bytes keep '$kept', not the two newest"
-[ -z "$(printf '1.3.0 100\n' | ci/repository.sh --select 50)" ] || fail "a release over the budget was kept"
+over=$(printf '1.3.0 100\n' | ci/repository.sh --select 50) || fail "--select 50 failed" # empty on a crash too
+[ -z "$over" ] || fail "a release over the budget was kept"
 [ "$(printf '1.4.0 100\n1.3.0 100\n' | ci/repository.sh --select 200 | wc -l)" = 2 ] || fail "releases that fit exactly weren't all kept"
 echo "ok: the releases kept are the newest that fit"
 
@@ -110,6 +111,7 @@ has_files || no "theca-cli brought no repository files"
 apt-get install -y theca >/dev/null
 installed theca-cli && no "theca didn't replace theca-cli"
 [ "$(theca --version)" = "theca $VERSION" ] || no "theca --version: $(theca --version)"
+has_files || no "theca, back, brought no repository files" # there, before purging asserts they're gone
 say "theca-cli replaces theca, and theca replaces theca-cli"
 apt-get purge -y theca >/dev/null
 [ ! -e /etc/apt/sources.list.d/theca.sources ] && [ ! -e /usr/share/keyrings/theca.gpg ] || no "purging theca left the repository files"
@@ -165,6 +167,7 @@ has_files || no "theca-cli brought no repository files"
 dnf_test install --allowerasing theca >/dev/null
 rpm -q theca-cli >/dev/null 2>&1 && no "theca didn't replace theca-cli"
 [ "$(theca --version)" = "theca $VERSION" ] || no "theca --version: $(theca --version)"
+has_files || no "theca, back, brought no repository files" # there, before removing asserts they're gone
 say "theca-cli replaces theca, and theca replaces theca-cli"
 dnf -q -y remove theca >/dev/null
 [ ! -e /etc/yum.repos.d/theca.repo ] && [ ! -e /etc/pki/rpm-gpg/RPM-GPG-KEY-theca ] || no "removing theca left the repository files"
