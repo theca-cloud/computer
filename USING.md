@@ -4,29 +4,59 @@ The Theca app for macOS, Windows and Linux keeps local folders identical to Thec
 
 ## Install
 
-Download it from the [releases](https://github.com/theca-cloud/computer/releases), for your system and processor (`arm64`: Apple Silicon, ARM servers and Raspberry Pis; `x86_64`: Intel and AMD):
+From the channel your system already uses, which keeps Theca up to date too ([Updating](#updating)):
 
-| | The app | Headless (servers) |
+| | The app | CLI (servers) |
+|---|---|---|
+| macOS | [Homebrew](https://brew.sh): `brew install theca-cloud/tap/theca` | the app's own `theca`, which Homebrew puts on your `PATH` |
+| Windows | the Microsoft Store (search for Theca), or `winget install Theca.Theca` | `theca-cli-<version>-windows-x86_64.zip` ([direct downloads](#direct-downloads)) |
+| Debian, Ubuntu | our apt repository: `theca` | our apt repository: `theca-cli` |
+| Fedora | our dnf repository: `theca` | our dnf repository: `theca-cli` |
+| Other Linux (Arch too) | the `.AppImage` ([direct downloads](#direct-downloads)) | `theca-cli-<version>-linux-<arch>.tar.gz` |
+
+### Debian, Ubuntu: apt
+
+```sh
+sudo curl -fsSL https://packages.theca.rs/theca.gpg -o /usr/share/keyrings/theca.gpg
+sudo curl -fsSL https://packages.theca.rs/theca.sources -o /etc/apt/sources.list.d/theca.sources
+sudo apt update && sudo apt install theca      # or theca-cli, without the window
+```
+
+### Fedora: dnf
+
+```sh
+sudo curl -fsSL https://packages.theca.rs/RPM-GPG-KEY-theca -o /etc/pki/rpm-gpg/RPM-GPG-KEY-theca
+sudo curl -fsSL https://packages.theca.rs/theca.repo -o /etc/yum.repos.d/theca.repo
+sudo dnf install theca                         # or theca-cli, without the window
+```
+
+The repositories and the `.rpm` files are signed with one key, fingerprint `B7AE 400C DAA6 5388 CEC6 316D 43CE 4F13 6D66 5585`: `apt` and `dnf` check it, as the files above say. `theca` and `theca-cli` both own the `theca` command, so only one is installed at a time: `apt` replaces one with the other, `dnf` is asked to (`sudo dnf install --allowerasing theca-cli`). Installing a `.deb` or an `.rpm` downloaded from the releases adds the same repository, so `apt` and `dnf` update it from then on. The `.rpm` is built for Fedora: Red Hat Enterprise Linux 9 and its clones (Rocky, Alma) are too old for it (glibc 2.34, no WebKitGTK 4.1): use the `.AppImage`, or on a server the CLI archive.
+
+### Direct downloads
+
+From the [releases](https://github.com/theca-cloud/computer/releases), for your system and processor (`arm64`: Apple Silicon, ARM servers and Raspberry Pis; `x86_64`: Intel and AMD):
+
+| | The app | CLI (servers) |
 |---|---|---|
 | macOS | `theca-<version>-macos-<arch>.dmg`: open it, drag Theca to Applications | the app's own `theca` (below) |
-| Windows | `theca-<version>-windows-x86_64.exe`: installs for you alone, no admin | `theca-headless-<version>-windows-x86_64.zip` |
-| Linux | `theca-<version>-linux-<arch>.deb` (Debian, Ubuntu: `sudo apt install ./theca-….deb`), or the `.AppImage` anywhere else (`chmod +x`, then run it) | `theca-headless-<version>-linux-<arch>.tar.gz` |
+| Windows | `theca-<version>-windows-x86_64.exe`: installs for you alone, no admin | `theca-cli-<version>-windows-x86_64.zip` |
+| Linux | `theca-<version>-linux-<arch>.AppImage` (`chmod +x`, then run it), or the `.deb` / `.rpm` | `theca-cli-<version>-linux-<arch>.tar.gz`, or the `theca-cli` `.deb` / `.rpm` |
 
-The app also answers the CLI (`theca --help`). Headless, unpack the archive and put `theca` on your `PATH` (`sudo install theca-headless-*/theca /usr/local/bin/`), then `theca login`. On a Mac used from the command line, install the app and use its `theca`: `/Applications/Theca.app/Contents/MacOS/theca` (a Mac's drives need the app's extension; there is no headless Mac archive from 1.2.0). Linux builds run on Ubuntu 22.04 and Debian 12 or newer; drives on Linux need `fuse3` (the `.deb` installs it; elsewhere, install it).
+The app also answers the CLI (`theca --help`). For the CLI archive, unpack it and put `theca` on your `PATH` (`sudo install theca-cli-*/theca /usr/local/bin/`), then `theca login`. On a Mac there is no CLI archive (since 1.2.0, a Mac's drives need the app's extension): use the app's own `theca`, which Homebrew puts on your `PATH`; installed from a `.dmg`, link it once with `sudo ln -sf /Applications/Theca.app/Contents/MacOS/theca /usr/local/bin/theca`. Linux builds run on Ubuntu 22.04 and Debian 12 or newer; drives on Linux need `fuse3` (the packages install it; elsewhere, install it).
 
 ### Updating
 
-The app and headless update themselves from Theca's releases, except the `.deb`, which `apt` updates with the rest of the system (`theca update` says so there). An update is checked against Theca's release key before anything is replaced, and none is installed while one of your accounts is on a server older than it needs, or one that can't be reached (tried again at the next check). What the app keeps is upgraded the first time the new version starts; installing the new version over the old one by hand still works.
+The app and the CLI update themselves from Theca's releases, except what a package manager installed (`theca` and `theca-cli` from our apt and dnf repositories or a `.deb` / `.rpm`): `apt` and `dnf` update those with the rest of the system (`theca update` says so there). An update is checked against Theca's release key before anything is replaced, and none is installed while one of your accounts is on a server older than it needs, or one that can't be reached (tried again at the next check). What the app keeps is upgraded the first time the new version starts; installing the new version over the old one by hand still works.
 
-- **When**: at start, then every 6 hours, in the app and in `theca run`, as its setting says: `auto` installs and restarts (the app's default), `ask` says a new version is out (a notification, the window and the tray; headless, the log and `theca status`; headless' default), `off` never checks by itself.
+- **When**: at start, then every 6 hours, in the app and in `theca run`, as its setting says: `auto` installs and restarts (the app's default), `ask` says a new version is out (a notification, the window and the tray; the CLI, the log and `theca status`; the CLI's default), `off` never checks by itself.
 - **In the app**: Settings, Updates: the setting, **Check for updates**, and a new version with its release notes and **Install and restart**. The tray has **Check for updates…**, and says **Update to X.Y.Z** while one waits: click it to install.
-- **Headless**: `theca updates auto`, `ask` or `off` sets it (`theca updates` shows it). `theca update` checks and installs now, whatever the setting: the binary is replaced where it is, by a user who can write it (`sudo theca update` for `/usr/local/bin/theca`); a running `theca run` goes on with the old version until it starts again. In `auto`, `theca run` installs the new version and starts it in its place, when it can write its binary.
+- **CLI**: `theca updates auto`, `ask` or `off` sets it (`theca updates` shows it). `theca update` checks and installs now, whatever the setting: the binary is replaced where it is, by a user who can write it (`sudo theca update` for `/usr/local/bin/theca`); a running `theca run` goes on with the old version until it starts again. In `auto`, `theca run` installs the new version and starts it in its place, when it can write its binary.
 - **`theca update` with the app open** hands over: the app installs and restarts. Without a display (a server over ssh), there is no app to hand over to: it installs itself, and says so.
 - **What it leaves**: on Windows, the binary it replaced, set aside as `theca.exe.old` beside it (it may still be running), removed at the next update. `theca status` waits 3 seconds at most to say a new version is out: offline, it says nothing of it.
 
 ### Windows' SmartScreen
 
-The apps are signed by their developer: macOS opens them without a warning, Apple having checked them. On Windows, the installer and the app name their publisher, "Open Source Developer Pascal Perrenoud"; until that certificate has earned a reputation with Microsoft, SmartScreen may still say "Windows protected your PC": click **More info**, check the publisher, then **Run anyway**.
+The apps are signed by their developer: macOS opens them without a warning, Apple having checked them. On Windows, the installer and the app name their publisher, "Open Source Developer Pascal Perrenoud"; until that certificate has earned a reputation with Microsoft, SmartScreen may still say "Windows protected your PC": click **More info**, check the publisher, then **Run anyway**. An install from the Microsoft Store never shows it.
 
 ### Checking a download
 
@@ -85,7 +115,7 @@ A library can be a **drive** instead of a synced folder: your file manager shows
 - **Removing a drive** moves the edits not uploaded yet to `<default folder>/<library> (not uploaded)`, never deleted; everything else goes (it is on the server). Uninstalling Theca on Windows removes its drives first, the same way.
 - **On Linux, a file saved into the drive's folder while Theca wasn't running** (so not into the drive) stops the drive until you move it out; the drive then comes back by itself.
 
-## Headless use
+## CLI use
 
 ```sh
 theca login https://cloud.example.com   # prints a page to open and a code to check, then the libraries

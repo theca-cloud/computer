@@ -176,7 +176,36 @@ if [ "$step" = all ] || [ "$step" = deny ]; then
     cargo deny --all-features check
     # Every dependency: the page bundles its devDependencies (--omit=dev would
     # audit nothing). Lows let through: deepmerge's, in vite-plugin-svelte at
-    # build time, has no fixed release.
-    npm --prefix ui audit --audit-level=moderate
+    # build time, has no fixed release. And, by id, the ALLOWED advisories: a
+    # moderate or worse with no fixed release, in build tooling that only ever
+    # handles this repository's own files, so nobody supplies the input it
+    # fails on; each goes once the audit passes without it (theca/computer#68).
+    #   GHSA-fc5q-39xc-vjpf: picomatch <= 4.0.7, a ReDoS through repeated
+    #   extglobs (vite, svelte-check, paraglide glob our own paths); no patched
+    #   version listed on 2026-11-18.
+    ALLOWED="GHSA-fc5q-39xc-vjpf"
+    export ALLOWED
+    audit=$(npm --prefix ui audit --audit-level=moderate --json || true)
+    # Fails closed: an audit that gave no JSON (no network) fails the parse.
+    printf '%s' "$audit" | node -e '
+        let json = "";
+        process.stdin.on("data", (chunk) => (json += chunk)).on("end", () => {
+            const allowed = process.env.ALLOWED.split(" ");
+            const found = new Set();
+            for (const v of Object.values(JSON.parse(json).vulnerabilities)) {
+                for (const via of v.via) {
+                    if (typeof via !== "object") continue;
+                    if (!["moderate", "high", "critical"].includes(via.severity)) continue;
+                    if (allowed.some((id) => via.url.endsWith(id))) continue;
+                    found.add(`${via.url} (${via.name}, ${via.severity})`);
+                }
+            }
+            if (found.size) {
+                console.error("npm audit: " + [...found].join(", "));
+                process.exit(1);
+            }
+        });
+    '
+    unset ALLOWED
 fi
 echo "CI checks passed ($step)"

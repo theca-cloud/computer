@@ -127,3 +127,12 @@ if [ "$branch" = dev ]; then
 else
     echo "Released $next on prod. Bring it into dev: git merge prod, then push prod, dev and $next"
 fi
+# What the tag's run doesn't do (ci/README.md, The repositories and the channels).
+cat <<AFTER
+
+Once GitHub's release run has published $next:
+  1. packages.theca.rs: on chapter.li, \`theca-packages/pull.sh $next\` (then \`docker compose\` needs nothing).
+  2. A channel job that failed is re-run alone (\`gh run rerun <run> --job <id>\`); the release stays.
+  3. theca.rs/computer: bump COMPUTER_VERSION in saas to $next, then deploy.
+  4. winget, a package's first version: submit the winget-manifests artifact of the run by hand; the Store's too (Partner Center), then set the repository variable STORE_LISTED to true.
+AFTER

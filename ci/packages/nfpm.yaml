@@ -1,0 +1,43 @@
+# theca-cli: the command line without the app's window (no GUI library, no
+# self-update: apt and dnf update it), as .deb and .rpm, by nfpm (ci/package.sh).
+# ci/package.sh sets the version and the architecture, and puts the binary and
+# the keyring where the paths below are: nfpm expands variables in a few fields
+# only, not in `contents` (tried). Both packages own the repository's files:
+# our apt source and key, or our rpm repository and key, removed with them.
+name: theca-cli
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${NFPM_VERSION}
+section: net
+priority: optional
+maintainer: Pascal Perrenoud <packages@theca.rs>
+description: Theca's command line and daemon (no window), keeping folders identical to Theca libraries.
+homepage: https://theca.rs/computer
+license: AGPL-3.0-only
+depends:
+  - fuse3
+# One command, /usr/bin/theca, from either package: a conflict, both ways. apt
+# removes the other by itself, with the .deb's Replaces; dnf is asked to
+# (`--allowerasing`): an rpm Obsoletes in each package would hide the other
+# one from dnf once installed ("Nothing to do").
+conflicts:
+  - theca
+overrides:
+  deb:
+    replaces:
+      - theca
+contents:
+  - src: target/cli-pkg/release/theca
+    dst: /usr/bin/theca
+  - src: ci/packages/theca.sources
+    dst: /etc/apt/sources.list.d/theca.sources
+    packager: deb
+  - src: target/cli-pkg/theca.gpg
+    dst: /usr/share/keyrings/theca.gpg
+    packager: deb
+  - src: ci/packages/theca.repo
+    dst: /etc/yum.repos.d/theca.repo
+    packager: rpm
+  - src: ci/packages.asc
+    dst: /etc/pki/rpm-gpg/RPM-GPG-KEY-theca
+    packager: rpm

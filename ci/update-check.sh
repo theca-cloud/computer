@@ -3,7 +3,7 @@
 # built with a test key, updated to B, the same commit with its version
 # bumped, built and signed with that key, through a manifest served here
 # (`theca update --manifest`): the app as installed (the .app, the NSIS
-# install, the .AppImage) and headless. First B signed by another key is
+# install, the .AppImage) and the CLI. First B signed by another key is
 # served, and A must refuse it and still be A; then B, which A installs.
 # Each version read from the installed files, never by starting the app
 # while it installs. Run by ci/package.sh after the packages, on every run:
@@ -74,7 +74,7 @@ linux) bundles=appimage ;;
 esac
 bundle=target/release/bundle
 
-# The app and headless at Cargo.toml's version, with the test key, into $1
+# The app and the CLI at Cargo.toml's version, with the test key, into $1
 # (B's updater packages signed).
 build() {
     out=$1
@@ -101,8 +101,8 @@ build() {
         ;;
     esac
     if [ "$os" != macos ]; then
-        cargo build --release --features self-update --target-dir target/headless
-        cp "target/headless/release/theca$exe" "$out/"
+        cargo build --release --features self-update --target-dir target/cli
+        cp "target/cli/release/theca$exe" "$out/"
     fi
 }
 
@@ -122,15 +122,15 @@ esac
 cp "$tmp/b/$app" "$dist/$name.$ext"
 cp "$tmp/b/$app.sig" "$dist/$name.$ext.sig"
 if [ "$os" != macos ]; then
-    headless=theca-headless-$next-$os-$arch
-    mkdir "$tmp/$headless"
-    cp "$tmp/b/theca$exe" "$tmp/$headless/"
+    cli=theca-cli-$next-$os-$arch
+    mkdir "$tmp/$cli"
+    cp "$tmp/b/theca$exe" "$tmp/$cli/"
     if [ "$os" = windows ]; then
-        (cd "$tmp" && 7z a -tzip -bso0 "$dist/$headless.zip" "$headless")
-        archive=$dist/$headless.zip
+        (cd "$tmp" && 7z a -tzip -bso0 "$dist/$cli.zip" "$cli")
+        archive=$dist/$cli.zip
     else
-        tar -czf "$dist/$headless.tar.gz" -C "$tmp" "$headless"
-        archive=$dist/$headless.tar.gz
+        tar -czf "$dist/$cli.tar.gz" -C "$tmp" "$cli"
+        archive=$dist/$cli.tar.gz
     fi
     "$tauri" signer sign "$archive" >/dev/null
 fi

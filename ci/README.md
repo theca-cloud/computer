@@ -111,13 +111,28 @@ On the developer's Mac, `ci/mac/ci.sh dmg` signs with the identity in their keyc
 **Windows: Certum's Open Source Code Signing in the cloud** (a year, at most 459 days; its
 RSA 4096 key generated in SimplySign, where it stays). `ssign` (installed by `release.yml`,
 pinned) signs against it over HTTPS: Tauri calls it on `theca.exe`, NSIS's plugins, the
-uninstaller and the installer (`bundle.windows.signCommand`), `ci/package.sh` on the headless
+uninstaller and the installer (`bundle.windows.signCommand`), `ci/package.sh` on the CLI
 `theca.exe`; `signtool verify /pa` checks each, by "Open Source Developer", timestamped.
 `CERTUM_EMAIL` (the SimplySign login) and `CERTUM_OTP` (the `otpauth://` URI of SimplySign's
 QR code, read from a screenshot with `zbarimg -q --raw` before the phone scans it): with the
 email, the seed signs anything as the developer; leaked, a new QR (Certum's "regain access")
 makes it useless. A login code works once: `ssign` keeps its session 20 minutes, for every
 file of a build.
+
+**Linux: the repositories' key** (`LINUX_SIGNING_KEY`): one GPG key, RSA 4096, no expiry (an
+expired key would stop every machine that missed the update shipping a new one), signs the
+`.rpm` files (`rpmsign`, in `ci/package.sh`) and the repositories' indexes
+(`ci/repository.sh`). Its public half is `ci/packages.asc` (fingerprint
+`B7AE400CDAA65388CEC6316D43CE4F136D665585`), which every package ships: apt's keyring is made
+from it at build time, and `packages.theca.rs` serves it. Both scripts refuse, on a tag, a
+`LINUX_SIGNING_KEY` that isn't that key. Made on the developer's Mac (the private key never
+touches a workspace): `gpg --batch --passphrase '' --quick-generate-key "Theca packages
+<packages@theca.rs>" rsa4096 sign never`, then `gpg --export-secret-keys --armor <fingerprint> |
+gh secret set LINUX_SIGNING_KEY --env signing -R theca-cloud/computer` and
+`gpg --export --armor <fingerprint> > packages.asc` (committed). The revocation certificate
+(`gpg --gen-revoke`) and an offline copy of the private key stay in the password manager;
+leaked, the revocation and a new key go out in a package update. A run by hand signs with a
+throwaway key (the real one signs releases only).
 
 **The updater's key** (ADR 0006): the packages that update themselves (all but the `.deb`)
 are signed with one minisign key, its public half `ci/updater.pub`, built into every one;
@@ -134,7 +149,50 @@ checks the update itself, without a release: `ci/update-check.sh` builds A and B
 version bumped) with a key made for the run, installs A and updates it to B through a
 manifest it serves, after seeing A refuse B signed by another key and stay A.
 
-## 4. Keeping it up
+## 4. The repositories and the channels
+
+**`packages.theca.rs`** (apt at `/deb`, rpm at `/rpm`, on `chapter.li`): `release.yml`'s
+`repository` job runs `ci/repository.sh`, then `ci/repository-check.sh`, on every run. The
+index lists the `.deb` and `.rpm` files of the release and, on a tag, of the earlier releases
+that carry a `repository.tar.gz`, newest first while they fit in 5 GiB; nothing is rebuilt (the
+packages are the releases' own). A run by hand signs with a throwaway key and lists its own
+packages only. `repository.tar.gz` (attached to the release, so in its `SHA256SUMS`) holds
+`deb/dists/stable/…`, `rpm/<x86_64|aarch64>/repodata/…`, the four files a user fetches to add
+the repository (`theca.sources`, `theca.gpg`, `theca.repo`, `RPM-GPG-KEY-theca`) and
+`files.txt`: one line a package, `<release> <asset name> <path in the tree>` (`deb/pool/<release>/…`,
+`rpm/<arch>/<release>/…`); no package. After a release, **by hand on `chapter.li`**:
+`theca-packages/pull.sh <version>` (its repository's README): it downloads the packages from
+GitHub, checks each against its release's `SHA256SUMS`, and swaps the served tree in one
+rename. The check installs from the repositories in Debian 12, Ubuntu 24.04 and Fedora (apt;
+dnf, where the two packages are told to replace each other with `--allowerasing`), refuses a
+repository signed by another key and a package that isn't the one the index lists.
+
+**The channels** `release.yml` doesn't host: on every run `cask-check`, `aur-check` and
+`winget-check` build the file and check it (`ci/cask.sh`, `ci/aur.sh`, `ci/winget.sh`: a cask
+installed by `brew` on a Mac runner, `theca-bin` by `makepkg` in Arch's container, winget's
+manifests against Microsoft's schemas), and on a tag, once the release exists, `tap`, `winget`
+and `store` publish, each its own job, run again alone when it fails. `theca-bin` isn't
+published: the AUR paused new registrations (theca/computer#69), its check keeps the PKGBUILD
+working meanwhile. Their secrets
+are in the **`channels`** environment (version tags only, like `signing`), never the signing
+key: these jobs run other people's code, which sees their environment's secrets. Set from the
+developer's machine, `gh secret set <NAME> --env channels -R theca-cloud/computer`:
+
+- `TAP_TOKEN`: a fine-grained token, `contents: write` on `theca-cloud/homebrew-tap` only. It
+  expires (made 2026-11-18, valid until **2027-11-19**): replaced before, or the tap job fails.
+- `WINGET_TOKEN`: a classic token (`public_repo`, and `workflow` to sync the fork) of a GitHub
+  machine account (`theca-winget`) that owns a fork of `microsoft/winget-pkgs` and nothing
+  else, no right on `theca-cloud`: the developer's own token would reach every repository they
+  can write to. It expires (made 2026-11-18, valid until **2027-11-18**): replaced before.
+  komac (pinned) opens the pull request; it needs a version already in winget-pkgs, so a
+  package's first one is submitted by hand with the run's `winget-manifests` artifact.
+- `STORE_TENANT_ID`, `STORE_CLIENT_ID`, `STORE_CLIENT_SECRET`, `STORE_SELLER_ID`,
+  `STORE_PRODUCT_ID`: the Azure AD application of the developer's Partner Center account
+  (Account settings, Manage users, Azure AD applications, role Manager) and the product's ID.
+  The `store` job (`msstore`, Microsoft's CLI) runs once a first submission exists, made by hand in
+  Partner Center: the repository variable `STORE_LISTED` is then set to `true`.
+
+## 5. Keeping it up
 
 - **Rust bumped**: the CI image (step 1), then its tag in `.woodpecker/linux.yaml`.
 - **The actions** are pinned to exact versions (`actions/*`, `Swatinem/rust-cache`): bumped

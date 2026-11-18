@@ -10,6 +10,9 @@
 # and its _PASSWORD (release.yml's secrets; a run without them, by hand,
 # signs with a throwaway key; a tag never). THECA_TEST_UPDATER_PUBKEY, a test
 # key's public half, replaces ci/updater.pub in the builds: refused on a tag.
+# Linux's .rpm files are signed (rpmsign) with LINUX_SIGNING_KEY, the key of
+# ci/packages.asc that every package ships; a run by hand signs them with a
+# throwaway key, a tag never.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -32,7 +35,7 @@ if [ "${GITHUB_REF_TYPE:-}" = tag ] && [ -n "${THECA_TEST_UPDATER_PUBKEY:-}" ]; 
     exit 1
 fi
 name=theca-$version-$os-$arch
-headless=theca-headless-$version-$os-$arch
+cli=theca-cli-$version-$os-$arch
 bundle=target/release/bundle
 dist=$PWD/dist
 # A runner's temp folder, or one of our own when run by hand.
@@ -54,9 +57,12 @@ rm -rf "$dist" && mkdir "$dist"
 # signed with by ssign (release.yml installs it):
 #   CERTUM_EMAIL, the SimplySign login; CERTUM_OTP, its TOTP seed (the
 #   otpauth:// URI of SimplySign's QR code).
+# Linux's: LINUX_SIGNING_KEY, the private key of ci/packages.asc (armored),
+# which signs the .rpm files and the repositories' indexes.
 case $os in
 macos) credentials="APPLE_SIGNING_IDENTITY APPLE_API_KEY APPLE_API_ISSUER APPLE_API_PRIVATE_KEY" ;;
 windows) credentials="CERTUM_EMAIL CERTUM_OTP" ;;
+linux) credentials="LINUX_SIGNING_KEY" ;;
 *) credentials= ;;
 esac
 given=
@@ -75,16 +81,24 @@ elif [ -n "$credentials" ]; then
         echo "no signing credentials ($credentials): a release is signed by the developer" >&2
         exit 1
     fi
-    echo "no signing credentials: the $os packages are ad hoc and unsigned (a run by hand)" >&2
+    if [ "$os" = linux ]; then
+        echo "no LINUX_SIGNING_KEY: the .rpm files are signed with a throwaway key (a run by hand)" >&2
+    else
+        echo "no signing credentials: the $os packages are ad hoc and unsigned (a run by hand)" >&2
+    fi
 fi
 if ! $signed; then
     # release.yml passes them empty: Tauri takes a variable that is set, even
     # empty, as an identity (APPLE_SIGNING_IDENTITY="" overrides "-").
     unset APPLE_SIGNING_IDENTITY APPLE_API_KEY APPLE_API_ISSUER APPLE_API_PRIVATE_KEY \
-        APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD CERTUM_EMAIL CERTUM_OTP
+        APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD CERTUM_EMAIL CERTUM_OTP LINUX_SIGNING_KEY
 fi
 cleanup() {
     rm -f "$tmp"/AuthKey_*.p8 "$tmp/certificate.p12"
+    if [ -d "$tmp/gnupg" ]; then
+        GNUPGHOME=$tmp/gnupg gpgconf --kill gpg-agent 2>/dev/null || true
+        rm -rf "$tmp/gnupg"
+    fi
     if [ -n "${keychain:-}" ]; then security delete-keychain "$keychain" 2>/dev/null || true; fi
 }
 trap cleanup EXIT
@@ -123,10 +137,88 @@ if [ "$os" = windows ] && $signed; then
     [ -n "$signtool" ] || { echo "no signtool.exe in the Windows SDK" >&2; exit 1; }
 fi
 
+# Linux: the key that signs the .rpm files. A tag's is the one in
+# LINUX_SIGNING_KEY, which must be the key every package ships (ci/packages.asc:
+# apt's keyring and rpm's key, public); a run by hand signs with a throwaway
+# key made for it (the real one signs releases only), imported by the checks.
+if [ "$os" = linux ]; then
+    export GNUPGHOME=$tmp/gnupg
+    (umask 077 && mkdir "$GNUPGHOME")
+    secret_key() { gpg --batch --with-colons --list-secret-keys | awk -F: '/^fpr/ { print $10; exit }'; }
+    shipped=$(gpg --batch --with-colons --show-keys ci/packages.asc | awk -F: '/^fpr/ { print $10; exit }')
+    if $signed; then
+        printf '%s\n' "$LINUX_SIGNING_KEY" | gpg --batch --quiet --import
+        unset LINUX_SIGNING_KEY
+        rpm_key=$(secret_key)
+        [ "$rpm_key" = "$shipped" ] ||
+            { echo "LINUX_SIGNING_KEY ($rpm_key) isn't the key the packages ship, ci/packages.asc ($shipped)" >&2; exit 1; }
+    else
+        gpg --batch --quiet --pinentry-mode loopback --passphrase '' \
+            --quick-generate-key "Theca packages, a run's throwaway key <throwaway@invalid>" rsa4096 sign 1d
+        rpm_key=$(secret_key)
+    fi
+    gpg --batch --export --armor "$rpm_key" >"$tmp/rpm-signer.asc"
+    # apt's Signed-By wants the binary keyring.
+    gpg --batch --dearmor <ci/packages.asc >"$tmp/theca.gpg"
+fi
+# Signs rpm files with the key above.
+rpm_sign() {
+    rpmsign --addsign --define "__gpg $(command -v gpg)" --define "_gpg_name $rpm_key" --define "_gpg_path $GNUPGHOME" "$@" >/dev/null
+}
+
 check() {
     out=$("$@" --version | tr -d '\r')
     [ "$out" = "theca $version" ] || { echo "$1 --version: '$out', not 'theca $version'" >&2; exit 1; }
     echo "checked: $1 prints $out"
+}
+
+# A .deb's, then an .rpm's checks (Linux): the repository's files, fuse3, the
+# conflict with $2 (theca and theca-cli own the same /usr/bin/theca), the
+# files not conffiles (removed with the package, overwritten by an upgrade),
+# and the command, unpacked, printing this version.
+deb_check() {
+    local file=$1 other=$2 f listing
+    # The listing in a variable: `grep -q` closing a pipe early fails the
+    # command writing to it, under pipefail.
+    listing=$(dpkg-deb -c "$file")
+    for f in etc/apt/sources.list.d/theca.sources usr/share/keyrings/theca.gpg usr/bin/theca; do
+        grep -Eq " (\./)?$f\$" <<<"$listing" || { echo "$file doesn't hold /$f" >&2; exit 1; }
+    done
+    # fuse3 itself: not libfuse3-3, which another dependency could pull in.
+    grep -Eq '(^|[ ,|])fuse3([ ,|(]|$)' <<<"$(dpkg-deb -f "$file" Depends)" || { echo "$file doesn't depend on fuse3" >&2; exit 1; }
+    for f in Conflicts Replaces; do
+        [ "$(dpkg-deb -f "$file" "$f")" = "$other" ] || { echo "$file: $f isn't $other" >&2; exit 1; }
+    done
+    rm -rf "$tmp/control" "$tmp/unpacked-deb"
+    dpkg-deb -e "$file" "$tmp/control"
+    if [ -f "$tmp/control/conffiles" ]; then
+        echo "$file has conffiles: $(cat "$tmp/control/conffiles")" >&2
+        exit 1
+    fi
+    dpkg-deb -x "$file" "$tmp/unpacked-deb"
+    check "$tmp/unpacked-deb/usr/bin/theca"
+}
+rpm_check() {
+    local file=$1 other=$2 f listing
+    grep -q 'digests signatures OK' <<<"$(rpm --dbpath "$tmp/rpmdb" -K "$file")" ||
+        { echo "$file isn't signed by this run's key" >&2; exit 1; }
+    listing=$(rpm --dbpath "$tmp/rpmdb" -qpl "$file")
+    for f in /etc/yum.repos.d/theca.repo /etc/pki/rpm-gpg/RPM-GPG-KEY-theca /usr/bin/theca; do
+        grep -qx "$f" <<<"$listing" || { echo "$file doesn't hold $f" >&2; exit 1; }
+    done
+    grep -Eq '^fuse3( |$)' <<<"$(rpm --dbpath "$tmp/rpmdb" -qp --requires "$file")" || { echo "$file doesn't require fuse3" >&2; exit 1; }
+    # A conflict only: an Obsoletes in each package would hide the other from
+    # dnf once one is installed.
+    [ "$(rpm --dbpath "$tmp/rpmdb" -qp --conflicts "$file")" = "$other" ] || { echo "$file: conflicts isn't $other" >&2; exit 1; }
+    obsoletes=$(rpm --dbpath "$tmp/rpmdb" -qp --obsoletes "$file")
+    [ -z "$obsoletes" ] || { echo "$file obsoletes $obsoletes" >&2; exit 1; }
+    # rpm2cpio exits 1 on Tauri's .rpm, whose payload it writes whole and which
+    # Fedora installs and runs (tried, Fedora 43): what is checked is the
+    # command it unpacks.
+    rm -rf "$tmp/unpacked-rpm" && mkdir "$tmp/unpacked-rpm"
+    rpm2cpio "$file" >"$tmp/payload.cpio" || true
+    (cd "$tmp/unpacked-rpm" && cpio -idm --quiet <"$tmp/payload.cpio")
+    check "$tmp/unpacked-rpm/usr/bin/theca"
 }
 
 # The developer's signatures (signed runs only), each failing the run with
@@ -243,17 +335,40 @@ if [ "$os" = windows ] && $signed; then
 fi
 tauri_build "{\"build\":{\"beforeBuildCommand\":\"\"},\"bundle\":{$bundle_config},\"plugins\":{\"updater\":{\"pubkey\":\"$signing_pub\"}}}" \
     --bundles "$bundles" --features self-update
-# Linux's app a second time, without self-update: the .deb.
+# Linux's app a second time, without self-update: the .deb and the .rpm, which
+# add our repository (ci/packages/) to what apt and dnf read.
 if [ "$os" = linux ]; then
-    tauri_build '{"build":{"beforeBuildCommand":""}}' --bundles deb
+    deb_files="\"/etc/apt/sources.list.d/theca.sources\":\"ci/packages/theca.sources\",\"/usr/share/keyrings/theca.gpg\":\"$tmp/theca.gpg\""
+    rpm_files="\"/etc/yum.repos.d/theca.repo\":\"ci/packages/theca.repo\",\"/etc/pki/rpm-gpg/RPM-GPG-KEY-theca\":\"ci/packages.asc\""
+    tauri_build "{\"build\":{\"beforeBuildCommand\":\"\"},\"bundle\":{\"linux\":{\"deb\":{\"files\":{$deb_files}},\"rpm\":{\"files\":{$rpm_files}}}}}" \
+        --bundles deb,rpm
+fi
+# theca-cli, the command line for apt and dnf: the CLI a third time, without
+# self-update, packaged by nfpm (pinned, its checksum checked), with the same
+# repository files as the app's.
+if [ "$os" = linux ]; then
+    cargo build --release --target-dir target/cli-pkg
+    case $arch in
+    x86_64) nfpm_arch=amd64 nfpm_sha=6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750 ;;
+    arm64) nfpm_arch=arm64 nfpm_sha=a9a75213763783b7669719e505474c748c5ad7dc66591a195619deb50f85c2f4 ;;
+    esac
+    curl -fsSL --retry 3 -o "$tmp/nfpm.tar.gz" \
+        "https://github.com/goreleaser/nfpm/releases/download/v2.48.0/nfpm_2.48.0_Linux_$arch.tar.gz"
+    echo "$nfpm_sha  $tmp/nfpm.tar.gz" | sha256sum -c --quiet -
+    mkdir "$tmp/nfpm" && tar -xzf "$tmp/nfpm.tar.gz" -C "$tmp/nfpm" nfpm
+    cp "$tmp/theca.gpg" target/cli-pkg/theca.gpg
+    for format in deb rpm; do
+        NFPM_VERSION=$version NFPM_ARCH=$nfpm_arch "$tmp/nfpm/nfpm" package -f ci/packages/nfpm.yaml \
+            -p "$format" -t "dist/$cli.$format" >/dev/null
+    done
 fi
 
-# Headless: no GUI library linked (ADR 0004). Not on macOS since 1.2.0: a
+# The CLI: no GUI library linked (ADR 0004). Not on macOS since 1.2.0: a
 # Mac's CLI is the app's own `theca` (its drive needs the app's extension).
 if [ "$os" != macos ]; then
-    cargo build --release --features self-update --target-dir target/headless
-    mkdir "$tmp/$headless"
-    cp LICENSE README.md USING.md "$tmp/$headless/"
+    cargo build --release --features self-update --target-dir target/cli
+    mkdir "$tmp/$cli"
+    cp LICENSE README.md USING.md "$tmp/$cli/"
 fi
 
 # The uninstaller removes every drive first (ci/installer.nsh), but for an
@@ -354,36 +469,44 @@ linux)
     cp "$bundle"/appimage/Theca_"$version"_*.AppImage "dist/$name.AppImage"
     cp "$bundle"/appimage/Theca_"$version"_*.AppImage.sig "dist/$name.AppImage.sig"
     cp "$bundle"/deb/Theca_"$version"_*.deb "dist/$name.deb"
+    cp "$bundle"/rpm/*.rpm "dist/$name.rpm"
+    rpm_sign "dist/$name.rpm" "dist/$cli.rpm"
     # No FUSE on the runner: the AppImage unpacks itself instead.
     APPIMAGE_EXTRACT_AND_RUN=1 check "dist/$name.AppImage"
-    # Drives need fuse3: declared, and installed with it (apt, as users do).
-    dpkg-deb -f "dist/$name.deb" Depends | grep -q fuse3 ||
-        { echo "the .deb doesn't depend on fuse3" >&2; exit 1; }
+    # The four packages for apt and dnf: our repository's files, fuse3 (drives
+    # need it), the other one as a conflict, the command in each, and each
+    # .rpm signed by this run's key (rpm_key).
+    rpm --dbpath "$tmp/rpmdb" --import "$tmp/rpm-signer.asc"
+    deb_check "dist/$name.deb" theca-cli
+    deb_check "dist/$cli.deb" theca
+    rpm_check "dist/$name.rpm" theca-cli
+    rpm_check "dist/$cli.rpm" theca
+    # Installed with apt, as users do.
     sudo apt-get install -yq "./dist/$name.deb" >/dev/null
     check /usr/bin/theca
     ;;
 esac
 
-# The headless archive: a folder of its name, unpacked again to be checked.
+# The CLI archive: a folder of its name, unpacked again to be checked.
 check_dir=$tmp/unpacked
 mkdir "$check_dir"
 if [ "$os" = macos ]; then
     :
 elif [ "$os" = windows ]; then
     # Built outside Tauri: signed here, before the zip and its .sig.
-    if $signed; then ssign target/headless/release/theca.exe; fi
-    cp target/headless/release/theca.exe "$tmp/$headless/"
-    (cd "$tmp" && 7z a -tzip -bso0 "$dist/$headless.zip" "$headless")
-    sign "dist/$headless.zip"
-    7z x -bso0 -o"$check_dir" "dist/$headless.zip"
-    check "$check_dir/$headless/theca.exe"
-    if $signed; then authenticode "$check_dir/$headless/theca.exe"; fi
+    if $signed; then ssign target/cli/release/theca.exe; fi
+    cp target/cli/release/theca.exe "$tmp/$cli/"
+    (cd "$tmp" && 7z a -tzip -bso0 "$dist/$cli.zip" "$cli")
+    sign "dist/$cli.zip"
+    7z x -bso0 -o"$check_dir" "dist/$cli.zip"
+    check "$check_dir/$cli/theca.exe"
+    if $signed; then authenticode "$check_dir/$cli/theca.exe"; fi
 else
-    cp target/headless/release/theca "$tmp/$headless/"
-    tar -czf "dist/$headless.tar.gz" -C "$tmp" "$headless"
-    sign "dist/$headless.tar.gz"
-    tar -xzf "dist/$headless.tar.gz" -C "$check_dir"
-    check "$check_dir/$headless/theca"
+    cp target/cli/release/theca "$tmp/$cli/"
+    tar -czf "dist/$cli.tar.gz" -C "$tmp" "$cli"
+    sign "dist/$cli.tar.gz"
+    tar -xzf "dist/$cli.tar.gz" -C "$check_dir"
+    check "$check_dir/$cli/theca"
 fi
 ls -l dist
 # The update itself, A to B, with a test key (no release needed).

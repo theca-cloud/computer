@@ -512,14 +512,10 @@ async fn a_stopped_folder_located() {
         common::local(&other) == w.remote(&w.library).await
     })
     .await;
-    assert!(
-        w.admin
-            .library_trash(w.library.id)
-            .await
-            .unwrap()
-            .is_empty(),
-        "nothing trashed"
-    );
+    // What was trashed, in the message: a failure on Windows (theca/computer#76)
+    // said only "nothing trashed".
+    let trashed = w.admin.library_trash(w.library.id).await.unwrap();
+    assert!(trashed.is_empty(), "nothing trashed, but: {trashed:?}");
 }
 
 /// A member (not the organization's owner, who sees every library) taken
