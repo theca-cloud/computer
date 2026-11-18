@@ -52,14 +52,16 @@ jobs:
       - uses: actions/setup-node@v7.1.0
         with:
           node-version-file: ui/.nvmrc
-      # Tauri's Linux prerequisites (as in test.yml and ci/Dockerfile), and
-      # what its AppImage bundler runs.
+      # Tauri's Linux prerequisites (as in test.yml and ci/Dockerfile), what
+      # its AppImage bundler runs, and what signs and checks the .rpm files
+      # (rpmsign, rpm2cpio) without a Fedora.
       - name: Linux packages
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
           sudo apt-get install -yq --no-install-recommends \
-            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf file
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf file \
+            rpm cpio gnupg
       # What signs Windows' files against Certum's cloud (ci/package.sh, and
       # Tauri's signCommand), on the runs that sign only.
       - name: ssign
