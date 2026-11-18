@@ -32,6 +32,7 @@ got=$("$link" --version)
 [ "$got" = "theca $version" ] || { echo "theca --version: '$got', not 'theca $version'" >&2; exit 1; }
 echo "checked: brew installed the cask, $link prints $got"
 brew uninstall --cask theca-test/tap/theca
-[ ! -e "$link" ] && [ ! -e "$out/Applications/Theca.app" ] || { echo "uninstalling left the link or the app" >&2; exit 1; }
+# -L, not -e: a link left behind dangles once the app is gone, and -e follows it.
+[ ! -L "$link" ] && [ ! -e "$out/Applications/Theca.app" ] || { echo "uninstalling left the link or the app" >&2; exit 1; }
 brew untap theca-test/tap >/dev/null
 echo "checked: uninstalling removes the link and the app"

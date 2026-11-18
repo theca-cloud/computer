@@ -17,7 +17,8 @@ version=$1 dist=$2 base=${3%/} out=$4
 sum() {
     local file=$dist/theca-$version-macos-$1.dmg
     [ -f "$file" ] || { echo "$file: missing" >&2; exit 1; }
-    sha256sum "$file" 2>/dev/null | cut -d' ' -f1 || shasum -a 256 "$file" | cut -d' ' -f1
+    # shasum: on every Mac, where this runs (sha256sum isn't).
+    shasum -a 256 "$file" | cut -d' ' -f1
 }
 arm=$(sum arm64)
 intel=$(sum x86_64)

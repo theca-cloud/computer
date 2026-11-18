@@ -13,6 +13,12 @@ on:
     tags: ["[0-9]+.[0-9]+.[0-9]+"]
   workflow_dispatch:
 
+# The token every job gets reads the repository and nothing more: the one that
+# creates the release asks for more itself, and the channels' jobs push with
+# tokens of their own.
+permissions:
+  contents: read
+
 jobs:
   test:
     uses: ./.github/workflows/test.yml
@@ -90,6 +96,8 @@ jobs:
           APPLE_API_PRIVATE_KEY: ${{ matrix.os == 'macos' && env.THECA_SIGNING_RUN == 'true' && secrets.APPLE_API_PRIVATE_KEY || '' }}
           CERTUM_EMAIL: ${{ matrix.os == 'windows' && env.THECA_SIGNING_RUN == 'true' && secrets.CERTUM_EMAIL || '' }}
           CERTUM_OTP: ${{ matrix.os == 'windows' && env.THECA_SIGNING_RUN == 'true' && secrets.CERTUM_OTP || '' }}
+          # Signs the .rpm files, on a tag (ci/package.sh refuses a tag without it).
+          LINUX_SIGNING_KEY: ${{ matrix.os == 'linux' && env.THECA_SIGNING_RUN == 'true' && secrets.LINUX_SIGNING_KEY || '' }}
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ matrix.os }}-${{ matrix.arch }}
@@ -329,9 +337,17 @@ jobs:
     environment: channels
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: microsoft/microsoft-store-apppublisher@cc9910a8d59f2eb55cbb83df0a3800cf3b5300e0 # v1.4
-        with:
-          version: v0.4.4
+      # msstore v0.4.4 by its checksum, as komac: the action that installs it
+      # (microsoft-store-apppublisher) downloads it and checks nothing, in the
+      # job that holds the Store's secrets. The archive holds the binary and
+      # its libraries: all of it goes on the PATH.
+      - name: msstore
+        run: |
+          curl -fsSL --retry 3 -o msstore.tar.gz https://github.com/microsoft/msstore-cli/releases/download/v0.4.4/MSStoreCLI-linux-x64.tar.gz
+          echo "8c1283643530afede36d935c532e252dd69240d30432775794ad1598bce3c162  msstore.tar.gz" | sha256sum -c --quiet -
+          mkdir "$RUNNER_TEMP/msstore"
+          tar -xzf msstore.tar.gz -C "$RUNNER_TEMP/msstore"
+          echo "$RUNNER_TEMP/msstore" >>"$GITHUB_PATH"
       - name: Submission
         env:
           STORE_TENANT_ID: ${{ secrets.STORE_TENANT_ID }}
