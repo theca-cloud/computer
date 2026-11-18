@@ -184,7 +184,8 @@ deb_check() {
     for f in etc/apt/sources.list.d/theca.sources usr/share/keyrings/theca.gpg usr/bin/theca; do
         grep -Eq " (\./)?$f\$" <<<"$listing" || { echo "$file doesn't hold /$f" >&2; exit 1; }
     done
-    grep -q fuse3 <<<"$(dpkg-deb -f "$file" Depends)" || { echo "$file doesn't depend on fuse3" >&2; exit 1; }
+    # fuse3 itself: not libfuse3-3, which another dependency could pull in.
+    grep -Eq '(^|[ ,|])fuse3([ ,|(]|$)' <<<"$(dpkg-deb -f "$file" Depends)" || { echo "$file doesn't depend on fuse3" >&2; exit 1; }
     for f in Conflicts Replaces; do
         [ "$(dpkg-deb -f "$file" "$f")" = "$other" ] || { echo "$file: $f isn't $other" >&2; exit 1; }
     done
@@ -205,7 +206,7 @@ rpm_check() {
     for f in /etc/yum.repos.d/theca.repo /etc/pki/rpm-gpg/RPM-GPG-KEY-theca /usr/bin/theca; do
         grep -qx "$f" <<<"$listing" || { echo "$file doesn't hold $f" >&2; exit 1; }
     done
-    grep -q fuse3 <<<"$(rpm --dbpath "$tmp/rpmdb" -qp --requires "$file")" || { echo "$file doesn't require fuse3" >&2; exit 1; }
+    grep -Eq '^fuse3( |$)' <<<"$(rpm --dbpath "$tmp/rpmdb" -qp --requires "$file")" || { echo "$file doesn't require fuse3" >&2; exit 1; }
     # A conflict only: an Obsoletes in each package would hide the other from
     # dnf once one is installed.
     [ "$(rpm --dbpath "$tmp/rpmdb" -qp --conflicts "$file")" = "$other" ] || { echo "$file: conflicts isn't $other" >&2; exit 1; }
