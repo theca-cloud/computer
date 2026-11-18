@@ -170,16 +170,20 @@ repository signed by another key and a package that isn't the one the index list
 **The channels** `release.yml` doesn't host: on every run `cask-check`, `aur-check` and
 `winget-check` build the file and check it (`ci/cask.sh`, `ci/aur.sh`, `ci/winget.sh`: a cask
 installed by `brew` on a Mac runner, `theca-bin` by `makepkg` in Arch's container, winget's
-manifests against Microsoft's schemas), and on a tag, once the release exists, `tap`, `aur`,
-`winget` and `store` publish, each its own job, run again alone when it fails. Their secrets
+manifests against Microsoft's schemas), and on a tag, once the release exists, `tap`, `winget`
+and `store` publish, each its own job, run again alone when it fails. `theca-bin` isn't
+published: the AUR paused new registrations (theca/computer#69), its check keeps the PKGBUILD
+working meanwhile. Their secrets
 are in the **`channels`** environment (version tags only, like `signing`), never the signing
 key: these jobs run other people's code, which sees their environment's secrets. Set from the
 developer's machine, `gh secret set <NAME> --env channels -R theca-cloud/computer`:
 
-- `TAP_TOKEN`: a fine-grained token, `contents: write` on `theca-cloud/homebrew-tap` only.
+- `TAP_TOKEN`: a fine-grained token, `contents: write` on `theca-cloud/homebrew-tap` only. It
+  expires (made 2026-11-18, valid until **2027-11-19**): replaced before, or the tap job fails.
 - `WINGET_TOKEN`: a classic token (`public_repo`, and `workflow` to sync the fork) of a GitHub
-  machine account that owns a fork of `microsoft/winget-pkgs` and nothing else, no right on
-  `theca-cloud`: the developer's own token would reach every repository they can write to.
+  machine account (`theca-winget`) that owns a fork of `microsoft/winget-pkgs` and nothing
+  else, no right on `theca-cloud`: the developer's own token would reach every repository they
+  can write to. It expires (made 2026-11-18, valid until **2027-11-18**): replaced before.
   komac (pinned) opens the pull request; it needs a version already in winget-pkgs, so a
   package's first one is submitted by hand with the run's `winget-manifests` artifact.
 - `STORE_TENANT_ID`, `STORE_CLIENT_ID`, `STORE_CLIENT_SECRET`, `STORE_SELLER_ID`,
@@ -187,8 +191,6 @@ developer's machine, `gh secret set <NAME> --env channels -R theca-cloud/compute
   (Account settings, Manage users, Azure AD applications, role Manager) and the product's ID.
   The `store` job (`msstore`, Microsoft's CLI) runs once a first submission exists, made by hand in
   Partner Center: the repository variable `STORE_LISTED` is then set to `true`.
-- `AUR_SSH_KEY`: the private key of an SSH key made for the AUR account (the public half in its
-  profile); `theca-bin` is created by the first push.
 
 ## 5. Keeping it up
 

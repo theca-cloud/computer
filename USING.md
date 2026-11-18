@@ -12,8 +12,7 @@ From the channel your system already uses, which keeps Theca up to date too ([Up
 | Windows | the Microsoft Store (search for Theca), or `winget install Theca.Theca` | `theca-cli-<version>-windows-x86_64.zip` ([direct downloads](#direct-downloads)) |
 | Debian, Ubuntu | our apt repository: `theca` | our apt repository: `theca-cli` |
 | Fedora | our dnf repository: `theca` | our dnf repository: `theca-cli` |
-| Arch | `theca-bin` on the [AUR](https://aur.archlinux.org/packages/theca-bin) | `theca-cli-<version>-linux-<arch>.tar.gz` ([direct downloads](#direct-downloads)) |
-| Other Linux | the `.AppImage` ([direct downloads](#direct-downloads)) | `theca-cli-<version>-linux-<arch>.tar.gz` |
+| Other Linux (Arch too) | the `.AppImage` ([direct downloads](#direct-downloads)) | `theca-cli-<version>-linux-<arch>.tar.gz` |
 
 ### Debian, Ubuntu: apt
 
@@ -47,7 +46,7 @@ The app also answers the CLI (`theca --help`). For the CLI archive, unpack it an
 
 ### Updating
 
-The app and the CLI update themselves from Theca's releases, except what a package manager installed (`theca` and `theca-cli` from our apt and dnf repositories or a `.deb` / `.rpm`, `theca-bin` on the AUR): `apt`, `dnf` and `pacman` update those with the rest of the system (`theca update` says so there). An update is checked against Theca's release key before anything is replaced, and none is installed while one of your accounts is on a server older than it needs, or one that can't be reached (tried again at the next check). What the app keeps is upgraded the first time the new version starts; installing the new version over the old one by hand still works.
+The app and the CLI update themselves from Theca's releases, except what a package manager installed (`theca` and `theca-cli` from our apt and dnf repositories or a `.deb` / `.rpm`): `apt` and `dnf` update those with the rest of the system (`theca update` says so there). An update is checked against Theca's release key before anything is replaced, and none is installed while one of your accounts is on a server older than it needs, or one that can't be reached (tried again at the next check). What the app keeps is upgraded the first time the new version starts; installing the new version over the old one by hand still works.
 
 - **When**: at start, then every 6 hours, in the app and in `theca run`, as its setting says: `auto` installs and restarts (the app's default), `ask` says a new version is out (a notification, the window and the tray; the CLI, the log and `theca status`; the CLI's default), `off` never checks by itself.
 - **In the app**: Settings, Updates: the setting, **Check for updates**, and a new version with its release notes and **Install and restart**. The tray has **Check for updates…**, and says **Update to X.Y.Z** while one waits: click it to install.
