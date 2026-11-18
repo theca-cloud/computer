@@ -34,8 +34,7 @@
       },
       "rpm": {
         "depends": ["fuse3"],
-        "conflicts": ["theca-cli"],
-        "obsoletes": ["theca-cli"]
+        "conflicts": ["theca-cli"]
       }
     },
     "windows": {

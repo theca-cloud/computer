@@ -206,9 +206,11 @@ rpm_check() {
         grep -qx "$f" <<<"$listing" || { echo "$file doesn't hold $f" >&2; exit 1; }
     done
     grep -q fuse3 <<<"$(rpm --dbpath "$tmp/rpmdb" -qp --requires "$file")" || { echo "$file doesn't require fuse3" >&2; exit 1; }
-    for f in conflicts obsoletes; do
-        [ "$(rpm --dbpath "$tmp/rpmdb" -qp "--$f" "$file")" = "$other" ] || { echo "$file: $f isn't $other" >&2; exit 1; }
-    done
+    # A conflict only: an Obsoletes in each package would hide the other from
+    # dnf once one is installed.
+    [ "$(rpm --dbpath "$tmp/rpmdb" -qp --conflicts "$file")" = "$other" ] || { echo "$file: conflicts isn't $other" >&2; exit 1; }
+    obsoletes=$(rpm --dbpath "$tmp/rpmdb" -qp --obsoletes "$file")
+    [ -z "$obsoletes" ] || { echo "$file obsoletes $obsoletes" >&2; exit 1; }
     # rpm2cpio exits 1 on Tauri's .rpm, whose payload it writes whole and which
     # Fedora installs and runs (tried, Fedora 43): what is checked is the
     # command it unpacks.

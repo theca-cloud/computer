@@ -16,11 +16,16 @@ homepage: https://theca.rs/computer
 license: AGPL-3.0-only
 depends:
   - fuse3
-# One command, /usr/bin/theca, from either package.
+# One command, /usr/bin/theca, from either package: a conflict, both ways. apt
+# removes the other by itself, with the .deb's Replaces; dnf is asked to
+# (`--allowerasing`): an rpm Obsoletes in each package would hide the other
+# one from dnf once installed ("Nothing to do").
 conflicts:
   - theca
-replaces:
-  - theca
+overrides:
+  deb:
+    replaces:
+      - theca
 contents:
   - src: target/cli-pkg/release/theca
     dst: /usr/bin/theca
