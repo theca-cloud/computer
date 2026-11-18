@@ -60,6 +60,15 @@ good=$(serve "$out/tree")
 other=$(serve "$work/other")
 tampered=$(serve "$work/tampered")
 
+# At the root, for a user adding the repository by hand: what the packages
+# install (the apt source and keyring, the rpm repository and key), served.
+for pair in theca.sources:ci/packages/theca.sources theca.repo:ci/packages/theca.repo RPM-GPG-KEY-theca:ci/packages.asc; do
+    curl -fsS "http://127.0.0.1:$good/${pair%%:*}" | cmp -s - "${pair#*:}" || fail "/${pair%%:*} isn't ${pair#*:}"
+done
+curl -fsS "http://127.0.0.1:$good/theca.gpg" | cmp -s - <(gpg --batch --dearmor <ci/packages.asc) ||
+    fail "/theca.gpg isn't the keyring the packages ship"
+echo "ok: the source, the repository and the key are served at the root"
+
 # What each container runs, with the three repositories' URLs and the version.
 cat >"$work/apt.sh" <<'APT'
 set -eu

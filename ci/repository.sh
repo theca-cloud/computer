@@ -24,7 +24,9 @@
 # and only this run's packages are indexed: the real key signs releases only.
 #
 # repository.tar.gz: the folders `deb/` (dists/stable/..., InRelease) and
-# `rpm/<arch>/repodata/`, and files.txt: "<release> <asset name> <path of the
+# `rpm/<arch>/repodata/`, theca.sources, theca.gpg, theca.repo and
+# RPM-GPG-KEY-theca at its root (what the packages install, for a user to
+# fetch first), and files.txt: "<release> <asset name> <path of the
 # package in the tree>", one a line, where pull.sh puts each package.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -189,6 +191,12 @@ for dir in "$tree"/rpm/*/; do
     createrepo_c --quiet "$dir"
     sign_rpm "${dir}repodata"
 done
+
+# What a user adds the repository with (USING.md), at the tree's root: our apt
+# source and key (apt's binary keyring), our rpm repository and key.
+cp ci/packages/theca.sources ci/packages/theca.repo "$tree/"
+cp ci/packages.asc "$tree/RPM-GPG-KEY-theca"
+gpg --batch --dearmor <ci/packages.asc >"$tree/theca.gpg"
 
 # What a release attaches: the index and files.txt, no package.
 tar -czf "$out/repository.tar.gz" -C "$tree" --exclude='*.deb' --exclude='*.rpm' .
