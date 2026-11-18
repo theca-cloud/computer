@@ -122,9 +122,45 @@ jobs:
           path: latest.json
           if-no-files-found: error
 
+  # The apt and rpm repositories' index (ci/repository.sh), signed, from the
+  # Linux packages of every architecture, then used as a user would
+  # (ci/repository-check.sh: Debian 12, Ubuntu 24.04, Fedora): on every run, a
+  # manual one included, with a throwaway key; a tag signs with the release
+  # key, of the `signing` environment, and keeps the earlier releases' packages
+  # too. No package is rebuilt: repository.tar.gz holds the index only, and
+  # `chapter.li`'s pull.sh serves it with the packages of the releases.
+  repository:
+    needs: package
+    runs-on: ubuntu-24.04
+    environment: ${{ github.event_name == 'push' && github.ref_type == 'tag' && 'signing' || '' }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends apt-utils createrepo-c rpm gnupg
+      - name: Repositories
+        env:
+          LINUX_SIGNING_KEY: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.LINUX_SIGNING_KEY || '' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          ci/repository.sh "$version" dist repository
+      - name: Check
+        run: ci/repository-check.sh repository
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: repository
+          path: repository/repository.tar.gz
+          if-no-files-found: error
+
   release:
     if: github.ref_type == 'tag'
-    needs: manifest
+    needs: [manifest, repository]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
