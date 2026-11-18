@@ -158,9 +158,69 @@ jobs:
           path: repository/repository.tar.gz
           if-no-files-found: error
 
+  # The channels we don't host (wiki: Releases). On every run, a manual one
+  # included, each builds its file from this run's packages and checks it,
+  # publishing nothing: the cask installed by Homebrew, `theca-bin` by makepkg
+  # in Arch's container, winget's manifests against Microsoft's schemas (the
+  # Windows image has no winget). Their publishing jobs follow `release`.
+  cask-check:
+    needs: package
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          pattern: macos-*
+          merge-multiple: true
+      - run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          ci/cask-check.sh "$version" dist cask
+
+  aur-check:
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          pattern: linux-*
+          merge-multiple: true
+      - run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          ci/aur-check.sh "$version" dist "$GITHUB_REPOSITORY" aur
+      # PKGBUILD and .SRCINFO with the release's URLs: what the AUR job pushes.
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: aur-files
+          path: aur/publish
+          if-no-files-found: error
+
+  winget-check:
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          pattern: windows-*
+          merge-multiple: true
+      - run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          ci/winget-check.sh "$version" dist winget
+      # The manifests of this version: a package's first one is submitted by
+      # hand with them (komac makes the next ones, from the previous).
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: winget-manifests
+          path: winget/files
+          if-no-files-found: error
+
   release:
     if: github.ref_type == 'tag'
-    needs: [manifest, repository]
+    needs: [manifest, repository, cask-check, aur-check, winget-check]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -169,6 +229,7 @@ jobs:
       - uses: actions/download-artifact@v8.0.2
         with:
           path: dist
+          pattern: "{macos-*,windows-*,linux-*,manifest,repository}"
           merge-multiple: true
       - name: Release
         env:
@@ -179,3 +240,110 @@ jobs:
           # This version's section of the changelog.
           awk -v h="## [$TAG]" 'index($0, h) == 1 {on = 1; next} /^## \[/ {on = 0} on' CHANGELOG.md > notes.md
           gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md --verify-tag
+
+  # The channels' publishing, on a tag only, once the release exists (their
+  # files point at it), from the `channels` environment: only version tags may
+  # use it, and it holds no signing key (these jobs run other people's code).
+  # Each is its own job, run again alone when it fails; the release stays.
+  # Homebrew: the cask, pushed to our tap.
+  tap:
+    if: github.ref_type == 'tag'
+    needs: release
+    runs-on: ubuntu-24.04
+    environment: channels
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          pattern: macos-*
+          merge-multiple: true
+      - name: Cask
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          ci/cask.sh "$version" dist "https://github.com/$GITHUB_REPOSITORY/releases/download/$version" cask
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: theca-cloud/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+      - name: Publish
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          mkdir -p tap/Casks
+          cp cask/Casks/theca.rb tap/Casks/
+          cd tap
+          git add Casks/theca.rb
+          if git diff --cached --quiet; then echo "the cask is already $version"; exit 0; fi
+          git -c user.name="Pascal Perrenoud" -c user.email="packages@theca.rs" commit -q -m "theca $version"
+          git push
+
+  # winget: komac (pinned, its checksum checked) makes the new version's
+  # manifests from the previous one's and opens the pull request on
+  # microsoft/winget-pkgs from the machine account's fork. The first version of
+  # a package has none to start from: it is submitted by hand with the
+  # `winget-manifests` artifact, and this job says so.
+  winget:
+    if: github.ref_type == 'tag'
+    needs: release
+    runs-on: ubuntu-24.04
+    environment: channels
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Is Theca.Theca in winget-pkgs?
+        id: listed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api repos/microsoft/winget-pkgs/contents/manifests/t/Theca/Theca >/dev/null 2>&1; then
+            echo "listed=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "listed=false" >>"$GITHUB_OUTPUT"
+            echo "::notice::Theca.Theca isn't in winget-pkgs yet: its first version is submitted by hand, with the winget-manifests artifact of this run"
+          fi
+      - name: Komac
+        if: steps.listed.outputs.listed == 'true'
+        run: |
+          curl -fsSL --retry 3 -o komac.tar.gz https://github.com/russellbanks/Komac/releases/download/v2.17.2/komac-2.17.2-x86_64-unknown-linux-gnu.tar.gz
+          echo "b03b020eec98acfb0b53e284a6e21815b884be33de6785b97e7a120f0e748966  komac.tar.gz" | sha256sum -c --quiet -
+          tar -xzf komac.tar.gz komac
+      - name: Pull request
+        if: steps.listed.outputs.listed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          ./komac update Theca.Theca --version "$version" \
+            --urls "https://github.com/$GITHUB_REPOSITORY/releases/download/$version/theca-$version-windows-x86_64.exe" \
+            --submit
+
+  # The Microsoft Store: msstore (Microsoft's CLI, pinned; store-submission,
+  # the action first agreed on, is archived) updates the product's installer
+  # URL and submits it. A product's first submission is made by hand in
+  # Partner Center (its listing); this job runs once the repository variable
+  # STORE_LISTED is "true". Unproven until a release has gone through it.
+  store:
+    if: github.ref_type == 'tag' && vars.STORE_LISTED == 'true'
+    needs: release
+    runs-on: ubuntu-24.04
+    environment: channels
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: microsoft/microsoft-store-apppublisher@cc9910a8d59f2eb55cbb83df0a3800cf3b5300e0 # v1.4
+        with:
+          version: v0.4.4
+      - name: Submission
+        env:
+          STORE_TENANT_ID: ${{ secrets.STORE_TENANT_ID }}
+          STORE_SELLER_ID: ${{ secrets.STORE_SELLER_ID }}
+          STORE_CLIENT_ID: ${{ secrets.STORE_CLIENT_ID }}
+          STORE_CLIENT_SECRET: ${{ secrets.STORE_CLIENT_SECRET }}
+          STORE_PRODUCT_ID: ${{ secrets.STORE_PRODUCT_ID }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$version/theca-$version-windows-x86_64.exe"
+          msstore reconfigure --tenantId "$STORE_TENANT_ID" --sellerId "$STORE_SELLER_ID" \
+            --clientId "$STORE_CLIENT_ID" --clientSecret "$STORE_CLIENT_SECRET"
+          msstore submission update "$STORE_PRODUCT_ID" \
+            "{\"packages\":[{\"packageUrl\":\"$url\",\"languages\":[\"en\"],\"architectures\":[\"X64\"],\"isSilentInstall\":true,\"installerParameters\":\"/S\"}]}"
+          msstore submission publish "$STORE_PRODUCT_ID"
