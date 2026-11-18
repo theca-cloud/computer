@@ -22,7 +22,7 @@ CI runs on Linux on our Woodpecker, and on macOS, Windows and Linux arm64 on Git
 
 ## Releasing
 
-`scripts/release.sh` from `dev` (it refuses while GitHub's latest test run on `dev` is red), then `git push origin prod dev <version>`. Woodpecker mirrors the tag to GitHub, which builds every package, checks each one (`ci/package.sh`: installed or unpacked, `theca --version`), and publishes the release once they all passed. A run that fails: re-run its failed jobs if it was flaky; if it was a real bug, fix it on `dev`, and the next patch release ships it. A tag is never moved: that version stays a tag without a release.
+`scripts/release.sh` from `dev` (it refuses while GitHub's latest test run on `dev` is red), then `git push origin prod dev <version>`. Woodpecker mirrors the tag to GitHub, which builds every package, checks each one (`ci/package.sh`: installed or unpacked, `theca --version`), and publishes the release once they all passed. A run that fails: re-run its failed jobs if it was flaky; if it was a real bug, fix it on `dev`, and the next patch release ships it. A tag is never moved: that version stays a tag without a release. Once it is published, by hand: `theca-packages/pull.sh <version>` on `chapter.li` (the apt and rpm repositories), and `COMPUTER_VERSION` bumped in `saas`; `scripts/release.sh` prints what stays by hand, and `ci/README.md` ([The repositories and the channels](ci/README.md)) says how the channels are published.
 
 Questions, need help, or running Theca and want to say so? Come to [Discord](https://discord.gg/JBTfacSm4G).
 
