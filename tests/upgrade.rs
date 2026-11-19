@@ -1,4 +1,5 @@
-//! The client state only moves forward (docs/decisions.md, Sync): every
+//! The client state only moves forward (wiki: Sync client, The client
+//! state): every
 //! release's state, kept in `tests/upgrade/<version>/` with a manifest of what
 //! it holds, is opened by this build, migrated, and read back; a fresh state's
 //! schema is what the migrations build; a newer state is refused, untouched.

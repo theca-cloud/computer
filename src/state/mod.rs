@@ -1,6 +1,7 @@
 //! The client state: one SQLite file holding everything it keeps (accounts,
 //! sync pairs, what was last in sync, notices). No config file: settings
-//! change through the CLI or the GUI (docs/decisions.md, Sync). Forward-only:
+//! change through the CLI or the GUI (wiki: Sync client, The client
+//! state). Forward-only:
 //! a state an older version wrote is migrated, one step per version
 //! (`migrations/`), a copy kept first.
 

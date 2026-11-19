@@ -7,6 +7,8 @@ use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use theca::engine::{self, Handle, plural};
 use theca::keychain::KeychainError;
 use theca::state::{self, State};
+#[cfg(feature = "self-update")]
+use theca::update;
 use theca::{exit, ops};
 
 /// Where a Mac's drive is switched on: macOS adds it switched off.
@@ -32,6 +34,8 @@ enum CliError {
     Engine(#[from] engine::EngineError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Update(#[from] theca::update::UpdateError),
     #[cfg(feature = "gui")]
     #[error(transparent)]
     App(#[from] tauri::Error),
@@ -69,9 +73,33 @@ struct Cli {
     /// Started at login: the app's window stays closed (its tray only).
     #[arg(long, hide = true)]
     background: bool,
+    /// The update manifest read instead of the latest release's, still
+    /// verified with the release key (the release checks, ci/package.sh).
+    #[arg(long, env = "THECA_UPDATE_MANIFEST", global = true, hide = true)]
+    manifest: Option<String>,
     /// None: the app (a build with the `gui` feature).
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// `theca service`'s two commands (Windows).
+#[cfg(windows)]
+#[derive(Subcommand)]
+enum ServiceAction {
+    /// Register the service and start it: asks for the user's Windows
+    /// password (once, not kept by Theca), or reads a line of standard input
+    /// when there is no terminal.
+    On {
+        /// The account it runs as, `user` or `DOMAIN\user` (default: you).
+        #[arg(long)]
+        account: Option<String>,
+    },
+    /// Stop the service and remove it.
+    Off {
+        /// The account it runs as (default: you).
+        #[arg(long)]
+        account: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -97,7 +125,7 @@ enum Command {
         /// What libraries new to the account do: sync (up to the size
         /// limit), drive, or silent (listed only: `theca libraries`).
         /// Default: silent. Its libraries now are added with `theca add`.
-        #[arg(long, value_parser = headless_new_libraries)]
+        #[arg(long, value_parser = cli_new_libraries)]
         new_libraries: Option<state::NewLibraries>,
     },
     /// The accounts on this device.
@@ -210,7 +238,29 @@ enum Command {
     /// Restore what the last deletion moved to the trash.
     Undo,
     /// Run the sync engine in the foreground (what a service runs).
-    Run,
+    Run {
+        /// As the Windows service `theca service on` registers: started by the
+        /// service manager, which it answers.
+        #[cfg(windows)]
+        #[arg(long, hide = true)]
+        service: bool,
+    },
+    /// Run `theca run` as a Windows service, starting with Windows (run as
+    /// an administrator).
+    #[cfg(windows)]
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+    /// Check for a newer release, and install it (in the packages that
+    /// update themselves; the others are updated by their package manager).
+    Update,
+    /// How this computer updates: auto (installs and restarts), ask (says
+    /// so), off (never checks by itself); shown, or set.
+    Updates {
+        #[arg(value_parser = theca::update::Mode::parse)]
+        mode: Option<theca::update::Mode>,
+    },
     /// Every drive removed, as `remove` does (the Windows uninstaller runs
     /// it: no sync root stays registered).
     #[command(hide = true)]
@@ -237,7 +287,7 @@ fn main() -> ExitCode {
         .ok()
         .map(|path| theca::logs::settings_at(&path));
     let _logging = theca::logs::init(settings.as_ref());
-    let long_running = matches!(cli.command, None | Some(Command::Run));
+    let long_running = matches!(cli.command, None | Some(Command::Run { .. }));
     if long_running && let Some(settings) = &settings {
         theca::logs::keep(settings);
     }
@@ -249,7 +299,7 @@ fn main() -> ExitCode {
     if cli.command.is_none() {
         // The app runs its own runtime, on the main thread (the OS's windows
         // want it).
-        return exit(app(cli.state, cli.background));
+        return exit(app(cli.state, cli.background, cli.manifest));
     }
     let runtime = tokio::runtime::Runtime::new().expect("a runtime");
     exit(runtime.block_on(command(cli)))
@@ -279,8 +329,17 @@ fn state_path(given: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 async fn command(cli: Cli) -> Result<()> {
+    // What the user gave, for the service to run on too (none: its user's own).
+    #[cfg(windows)]
+    let explicit_state = cli.state.clone();
     let path = state_path(cli.state)?;
     let state = State::open(&path)?;
+    #[cfg(feature = "self-update")]
+    let manifest_url = cli
+        .manifest
+        .as_deref()
+        .unwrap_or(update::MANIFEST)
+        .to_owned();
     match cli.command.expect("the app is started by main") {
         Command::Login {
             instance,
@@ -306,7 +365,8 @@ async fn command(cli: Cli) -> Result<()> {
                 },
             )
             .await?;
-            if !no_keyring && matches!(account.password, state::Password::InState(_)) {
+            let in_state = matches!(account.password, state::Password::InState(_));
+            if !no_keyring && in_state {
                 println!(
                     "No keychain could be reached: the app password is kept in {}.",
                     path.display()
@@ -350,6 +410,15 @@ async fn command(cli: Cli) -> Result<()> {
                     }
                 }
                 Err(e) => println!("Its libraries: theca libraries ({e})."),
+            }
+            // Whoever ran it: `sudo`'s caller, not root (the service runs as
+            // the user whose state this is).
+            let user = std::env::var("SUDO_USER")
+                .or_else(|_| std::env::var("USER"))
+                .ok()
+                .filter(|user| !user.is_empty());
+            if let Some(hint) = ops::service_hint(std::env::consts::OS, in_state, user.as_deref()) {
+                println!("{hint}");
             }
         }
         Command::Accounts => {
@@ -483,7 +552,25 @@ async fn command(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Status => status(&state)?,
+        Command::Status => {
+            #[cfg(feature = "self-update")]
+            print_newer_release(&state, &manifest_url).await;
+            status(&state)?
+        }
+        #[cfg(feature = "self-update")]
+        Command::Update => update_now(&path, &state, &manifest_url).await?,
+        #[cfg(feature = "self-update")]
+        Command::Updates { mode } => match mode {
+            Some(mode) => {
+                update::set_mode(&state, mode)?;
+                println!("Updates: {}", mode.as_str());
+            }
+            None => println!("Updates: {}", update::mode(&state)?.as_str()),
+        },
+        #[cfg(not(feature = "self-update"))]
+        Command::Update | Command::Updates { .. } => {
+            return refused(theca::update::NOT_SELF_UPDATING);
+        }
         Command::RemoveDrives { all } => {
             for pair in state.pairs()? {
                 if pair.mode == state::Mode::Drive {
@@ -614,9 +701,35 @@ async fn command(cli: Cli) -> Result<()> {
             let restored = ops::undo(&state, notice.id).await?;
             println!("Restored {}.", plural(restored, "item"));
         }
-        Command::Run => {
-            let _lock = theca::lock(&path)?;
+        #[cfg(windows)]
+        Command::Service { action } => {
+            let done = match action {
+                // The service runs on the state this command was given.
+                ServiceAction::On { account } => {
+                    theca::service::on(account.as_deref(), explicit_state)
+                }
+                ServiceAction::Off { account } => theca::service::off(account.as_deref()),
+            };
+            println!("{}", done.or_else(refused)?);
+        }
+        Command::Run {
+            #[cfg(windows)]
+            service,
+        } => {
+            #[cfg(windows)]
+            if service {
+                // The update checks need a manifest: a build without
+                // self-update has none (and no checks).
+                #[cfg(feature = "self-update")]
+                let manifest = manifest_url.clone();
+                #[cfg(not(feature = "self-update"))]
+                let manifest = String::new();
+                return run_as_service(path, manifest).await;
+            }
+            let lock = theca::lock(&path)?;
             let (stop, stopped) = tokio::sync::watch::channel(false);
+            #[cfg(feature = "self-update")]
+            let restart = keep_updated(&path, &manifest_url, stop.clone(), stopped.clone());
             tokio::spawn(async move {
                 stop_signal().await;
                 let _ = stop.send(true);
@@ -625,21 +738,247 @@ async fn command(cli: Cli) -> Result<()> {
                 std::process::exit(130);
             });
             engine::run(path, Handle::default(), stopped).await?;
+            // Updated: the new release in this process's place, the engine
+            // stopped.
+            #[cfg(feature = "self-update")]
+            if let Some(installed) = restart.lock().expect("restart").take() {
+                // The new one takes the state's lock: released first (on
+                // Windows the new process could start before this one ends).
+                drop(lock);
+                return Err(installed.restart().into());
+            }
+            drop(lock);
         }
     }
     Ok(())
 }
 
+/// What the service ends with after a self-update: a failure, so the service's
+/// recovery action (`theca service on` sets it, also for an exit that isn't a
+/// crash) starts the release installed in its place.
+#[cfg(all(windows, feature = "self-update"))]
+const SERVICE_UPDATED: u32 = 3;
+
+/// The process wasn't started by the service manager (`theca run --service`
+/// by hand).
+#[cfg(windows)]
+const ERROR_FAILED_SERVICE_CONTROLLER_CONNECT: i32 = 1063;
+
+/// `theca run --service`: the engine as the Windows service the service
+/// manager started. The manager's thread runs `service_body`; this returns
+/// once the service has stopped.
+#[cfg(windows)]
+async fn run_as_service(path: PathBuf, manifest_url: String) -> Result<()> {
+    let runtime = tokio::runtime::Handle::current();
+    let connected = tokio::task::spawn_blocking(move || {
+        theca_winservice::run("theca", move |stop| {
+            service_body(&runtime, path, &manifest_url, stop)
+        })
+    })
+    .await
+    .expect("the service's thread");
+    match connected {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) => refused(
+            "`theca run --service` is for Windows' service manager: `theca run` runs it in a terminal, `theca service on` registers the service",
+        ),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The service's work, on the thread the service manager gave it: `theca run`
+/// until the manager asks it to stop, or until an update was installed. Its
+/// result is the exit code the service ends with (0: stopped as asked).
+#[cfg(windows)]
+fn service_body(
+    runtime: &tokio::runtime::Handle,
+    path: PathBuf,
+    manifest_url: &str,
+    stop: theca_winservice::Stop,
+) -> u32 {
+    // The lock is taken here, not before the manager is answered: a state
+    // another process holds ends the service, still starting, with a failure,
+    // which `theca service on` and the manager show, where an exit before
+    // answering shows only "did not respond in a timely fashion".
+    let lock = match theca::lock(&path) {
+        Ok(lock) => lock,
+        Err(e) => {
+            tracing::error!("the service can't start: {e}");
+            return 1;
+        }
+    };
+    let (stopper, stopped) = tokio::sync::watch::channel(false);
+    let on_stop = stopper.clone();
+    stop.on_stop(move || {
+        let _ = on_stop.send(true);
+    });
+    // The state is ours: the service runs.
+    stop.ready();
+    #[cfg(feature = "self-update")]
+    let restart = keep_updated(&path, manifest_url, stopper, stopped.clone());
+    #[cfg(not(feature = "self-update"))]
+    let _ = (manifest_url, stopper);
+    let ran = runtime.block_on(engine::run(path, Handle::default(), stopped));
+    drop(lock);
+    if let Err(e) = ran {
+        tracing::error!("the engine stopped: {e}");
+        return 1;
+    }
+    // Updated: the new release isn't started from here (a service's process
+    // is the manager's): ending with a failure has the recovery action do it.
+    #[cfg(feature = "self-update")]
+    if restart.lock().expect("restart").take().is_some() {
+        return SERVICE_UPDATED;
+    }
+    0
+}
+
+/// `theca update`: the release at `manifest_url`, if newer, installed in any
+/// mode (asked for). The app open on this state installs it itself (handed
+/// over); a running `theca run` goes on with the old one until it starts
+/// again.
+#[cfg(feature = "self-update")]
+async fn update_now(path: &std::path::Path, state: &State, manifest_url: &str) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let Some(release) = update::check(manifest_url).await? else {
+        println!("Theca {current} is the latest.");
+        return Ok(());
+    };
+    // Held while installing: the app doesn't start meanwhile.
+    let lock = theca::lock(path);
+    #[cfg(feature = "gui")]
+    if lock.is_err() {
+        if theca::gui::has_display() {
+            println!("The app is installing Theca {}.", release.version);
+            match theca::gui::hand_over() {
+                Ok(()) => {
+                    println!("No app answered (`theca run` holds this state): installing here.")
+                }
+                Err(e) => println!("The app can't be reached ({e}): installing here."),
+            }
+        } else {
+            // No display, no app on it (starting one to ask would panic).
+            println!("No display, so no app to hand this to: installing here.");
+        }
+    }
+    let _lock = lock;
+    let servers = update::servers(state).await;
+    let Some(installed) = update::Installed::this() else {
+        #[cfg(feature = "gui")]
+        if cfg!(any(target_os = "macos", windows)) {
+            theca::gui::install_now(manifest_url, &release, &servers).await?;
+            println!(
+                "Theca {} installed (was {current}): {}",
+                release.version,
+                release.notes_url()
+            );
+            return Ok(());
+        }
+        return Err(update::UpdateError::NotInstalled.into());
+    };
+    update::install(&release, update::PUBLIC_KEY, &servers, &installed).await?;
+    println!(
+        "Theca {} installed (was {current}): {}",
+        release.version,
+        release.notes_url()
+    );
+    if matches!(installed, update::Installed::Cli(_)) {
+        println!("A running `theca run` goes on with {current} until it starts again.");
+    }
+    Ok(())
+}
+
+/// `theca status`'s first line, a newer release (not stored: asked now,
+/// unless updates are `off`).
+#[cfg(feature = "self-update")]
+async fn print_newer_release(state: &State, manifest_url: &str) {
+    if update::mode(state).is_ok_and(|m| m == update::Mode::Off) {
+        return;
+    }
+    // A status answers at once: a manifest slow to come is no news.
+    let check = update::check(manifest_url);
+    let Ok(checked) = tokio::time::timeout(std::time::Duration::from_secs(3), check).await else {
+        return tracing::info!("no update check: the manifest took more than 3 s");
+    };
+    match checked {
+        Ok(Some(release)) => println!(
+            "Theca {} is available: theca update ({})\n",
+            release.version,
+            release.notes_url()
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::info!("no update check: {e}"),
+    }
+}
+
+/// `theca run`'s checks (`update::schedule`) as the state's mode says: a
+/// release found is said in the log; installed (`auto`), the engine stops,
+/// and the release to start in this process's place is given back.
+#[cfg(feature = "self-update")]
+fn keep_updated(
+    path: &std::path::Path,
+    manifest_url: &str,
+    stop: tokio::sync::watch::Sender<bool>,
+    stopped: tokio::sync::watch::Receiver<bool>,
+) -> std::sync::Arc<std::sync::Mutex<Option<update::Installed>>> {
+    use std::ops::ControlFlow;
+    let restart = std::sync::Arc::<std::sync::Mutex<_>>::default();
+    let Some(installed) = update::Installed::this() else {
+        return restart;
+    };
+    let (path, manifest_url) = (path.to_owned(), manifest_url.to_owned());
+    let given = restart.clone();
+    let tick = move || {
+        let (path, manifest_url, installed, given, stop) = (
+            path.clone(),
+            manifest_url.clone(),
+            installed.clone(),
+            given.clone(),
+            stop.clone(),
+        );
+        async move {
+            let Ok(state) = State::open(&path) else {
+                return ControlFlow::Continue(());
+            };
+            let to = installed.clone();
+            let checked = update::tick(&state, &manifest_url, |manifest, servers| async move {
+                update::install(&manifest, update::PUBLIC_KEY, &servers, &to).await
+            })
+            .await;
+            match checked {
+                update::Checked::Installed(manifest) => {
+                    tracing::info!(version = manifest.version, "installed: starting it");
+                    *given.lock().expect("restart") = Some(installed);
+                    let _ = stop.send(true);
+                    ControlFlow::Break(())
+                }
+                update::Checked::Offered { manifest, why } => {
+                    let why = why.map(|e| format!(" ({e})")).unwrap_or_default();
+                    tracing::info!(
+                        "Theca {} is available{why}: theca update; {}",
+                        manifest.version,
+                        manifest.notes_url()
+                    );
+                    ControlFlow::Continue(())
+                }
+                _ => ControlFlow::Continue(()),
+            }
+        }
+    };
+    tokio::spawn(update::schedule(tick, stopped));
+    restart
+}
+
 #[cfg(feature = "gui")]
-fn app(state: Option<PathBuf>, background: bool) -> Result<()> {
+fn app(state: Option<PathBuf>, background: bool, manifest_url: Option<String>) -> Result<()> {
     let path = state_path(state)?;
     State::open(&path)?;
-    theca::gui::run(path, background)?;
+    theca::gui::run(path, background, manifest_url)?;
     Ok(())
 }
 
 #[cfg(not(feature = "gui"))]
-fn app(_: Option<PathBuf>, _: bool) -> Result<()> {
+fn app(_: Option<PathBuf>, _: bool, _: Option<String>) -> Result<()> {
     refused("this build has no app (the `gui` feature): give a command, see --help")
 }
 
@@ -774,7 +1113,7 @@ fn new_libraries_said(new: state::NewLibraries, limit: i64) -> String {
 }
 
 /// `login --new-libraries`: what a computer without the app's window can do.
-fn headless_new_libraries(value: &str) -> std::result::Result<state::NewLibraries, String> {
+fn cli_new_libraries(value: &str) -> std::result::Result<state::NewLibraries, String> {
     match value.parse()? {
         state::NewLibraries::Notify => {
             Err("notify needs the app's window: sync, drive or silent".into())

@@ -1,4 +1,4 @@
-//! App passwords in the OS keychain (docs/decisions.md, Sync): the real one on
+//! App passwords in the OS keychain (wiki: Sync client, The app password): the real one on
 //! GitHub's macOS and Windows runners, the in-memory one elsewhere
 //! (`common::keychain`).
 

@@ -1,0 +1,5 @@
+Types: deb
+URIs: https://packages.theca.rs/deb
+Suites: stable
+Components: main
+Signed-By: /usr/share/keyrings/theca.gpg

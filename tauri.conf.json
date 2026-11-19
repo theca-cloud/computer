@@ -15,11 +15,26 @@
       "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "windows": {
+        "installMode": "quiet"
+      }
+    }
+  },
   "bundle": {
     "active": true,
+    "publisher": "Pascal Perrenoud",
     "linux": {
       "deb": {
-        "depends": ["fuse3"]
+        "depends": ["fuse3"],
+        "conflicts": ["theca-cli"],
+        "replaces": ["theca-cli"]
+      },
+      "rpm": {
+        "depends": ["fuse3"],
+        "conflicts": ["theca-cli"]
       }
     },
     "windows": {

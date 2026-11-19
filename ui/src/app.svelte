@@ -11,6 +11,7 @@
 	import DriveSettings from '#lib/components/drive-settings.svelte';
 	import FirstStep from '#lib/components/first-step.svelte';
 	import LogsSettings from '#lib/components/logs-settings.svelte';
+	import UpdatesSettings from '#lib/components/updates-settings.svelte';
 	import Login from '#lib/components/login.svelte';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import * as Card from '#lib/components/ui/card/index.js';
@@ -174,6 +175,8 @@
 			<DriveSettings />
 			<Separator />
 			<LogsSettings />
+			<Separator />
+			<UpdatesSettings />
 			<Separator />
 			<div class="flex items-center gap-2">
 				<Switch id="autostart" checked={autostart} onCheckedChange={setAutostart} />

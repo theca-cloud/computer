@@ -38,12 +38,189 @@ pub fn keychain() {
     }
 }
 
+/// The script every child of the tests runs under on Unix: it ends the child
+/// when the test process is gone or silent (its header says how).
+#[cfg(unix)]
+pub fn child_script() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/common/child.sh")
+}
+
+/// Detaches every mount at or below `folder`, as `child.sh` does once its
+/// command ended (a daemon killed leaves its mounts dead).
+#[cfg(unix)]
+fn detach_below(folder: &Path) {
+    Tended::start(Path::new("true"), 0, Some(folder), |_| {}).stop();
+}
+
+/// The file a child engine's output goes to, in its device's folder.
+const OUTPUT: &str = "theca.out";
+
+/// A process is there and not a zombie nobody reaped yet.
+#[cfg(unix)]
+pub fn running(pid: u32) -> bool {
+    let state = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let state = String::from_utf8_lossy(&state.stdout);
+    !state.trim().is_empty() && !state.trim().starts_with('Z')
+}
+
+/// How a tended command ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// By itself, or on SIGTERM: its exit code (143: the signal's default).
+    Exited(i32),
+    /// It had to be killed: after its grace, or at once without one.
+    Killed,
+}
+
+/// The silence `child.sh` takes for a test process gone, in seconds.
+#[cfg(unix)]
+const SILENCE: u32 = 10;
+
+/// A child's end of the heartbeat: closed (emptied) to stop it.
+#[cfg(unix)]
+type Pipe = Arc<Mutex<Option<std::process::ChildStdin>>>;
+
+/// `pipe` among those this process writes a line a second on, from one
+/// thread: a line missing for `SILENCE` seconds is how `child.sh` learns of a
+/// test process killed with one of its threads stuck (its files stay open).
+#[cfg(unix)]
+fn beat(pipe: std::process::ChildStdin) -> Pipe {
+    static PIPES: Mutex<Vec<Pipe>> = Mutex::new(Vec::new());
+    static BEATING: std::sync::Once = std::sync::Once::new();
+    let pipe = Arc::new(Mutex::new(Some(pipe)));
+    PIPES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(pipe.clone());
+    BEATING.call_once(|| {
+        let beating = std::thread::Builder::new().name("heartbeat".into());
+        let _ = beating.spawn(|| {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                // A pipe closed here or by its script's end is forgotten.
+                PIPES
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|pipe| {
+                        let mut pipe = pipe.lock().unwrap_or_else(|e| e.into_inner());
+                        if pipe.as_mut().is_some_and(|p| p.write_all(b"\n").is_err()) {
+                            *pipe = None;
+                        }
+                        pipe.is_some()
+                    });
+            }
+        });
+    });
+    pipe
+}
+
+/// A process the tests start, ended with them however they end: on Unix it
+/// runs under `child.sh`, fed this process's heartbeat. On Windows it is the
+/// process itself, killed when stopped, and left behind by a killed test.
+pub struct Tended {
+    child: Child,
+    grace: u32,
+    #[cfg(unix)]
+    pipe: Pipe,
+}
+
+impl Tended {
+    /// `program`, as `set` completes it (arguments, environment, folder,
+    /// output; never its input). Stopped by SIGTERM and, `grace` seconds
+    /// later, SIGKILL (0: SIGKILL at once); every mount at or below `drives`
+    /// (a device's own folder) is detached once it ended.
+    pub fn start(
+        program: &Path,
+        grace: u32,
+        drives: Option<&Path>,
+        set: impl FnOnce(&mut Command),
+    ) -> Tended {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let mut command = Command::new("bash");
+            command
+                .arg(child_script())
+                .args([SILENCE.to_string(), grace.to_string()])
+                .arg(drives.map_or(std::ffi::OsStr::new("-"), Path::as_os_str))
+                .arg(program);
+            set(&mut command);
+            // A group of its own: no signal sent to the tests' group (Ctrl-C,
+            // `timeout`) reaches the script, which then sees the tests end.
+            command.stdin(Stdio::piped()).process_group(0);
+            let mut child = command.spawn().expect("bash, for child.sh");
+            let pipe = beat(child.stdin.take().expect("piped"));
+            Tended { child, grace, pipe }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = drives;
+            let mut command = Command::new(program);
+            set(&mut command);
+            let child = command.spawn().expect("the program");
+            Tended { child, grace }
+        }
+    }
+
+    /// The script's process on Unix (its command is its child), the
+    /// program's own on Windows.
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// How it ended, once it has.
+    pub fn ended(&mut self) -> Option<Ended> {
+        let status = self.child.try_wait().ok()??;
+        // The script exits as its command did: 137 is SIGKILL's.
+        #[cfg(unix)]
+        let ended = match status.code() {
+            Some(137) | None => Ended::Killed,
+            Some(code) => Ended::Exited(code),
+        };
+        #[cfg(not(unix))]
+        let ended = Ended::Exited(status.code().unwrap_or(1));
+        Some(ended)
+    }
+
+    /// Stops it, and says how it ended. The script is never killed itself
+    /// (its command would be left running): it is waited for.
+    pub fn stop(&mut self) -> Ended {
+        if let Some(ended) = self.ended() {
+            return ended;
+        }
+        #[cfg(unix)]
+        self.pipe.lock().unwrap_or_else(|e| e.into_inner()).take();
+        #[cfg(not(unix))]
+        let _ = self.child.kill();
+        let deadline = Instant::now() + Duration::from_secs(u64::from(self.grace) + 10);
+        loop {
+            if let Some(ended) = self.ended() {
+                return if cfg!(unix) { ended } else { Ended::Killed };
+            }
+            if Instant::now() > deadline {
+                assert!(std::thread::panicking(), "child.sh never ended");
+                return Ended::Killed;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Tended {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 pub const ADMIN: &str = "admin@test.theca";
 pub const PASSWORD: &str = "a long password";
 
 /// The server: a process of the test's own, killed when dropped.
 pub struct Server {
-    child: Child,
+    child: Tended,
     pub url: String,
     /// Its own database's URL (a test reads it, as the app's tests do).
     pub database: String,
@@ -53,32 +230,40 @@ pub struct Server {
 impl Server {
     /// Gone, as a server down or unreachable.
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.stop();
+    }
+
+    /// The process tending it: on Unix `child.sh`, whose child the server is.
+    pub fn script_pid(&self) -> u32 {
+        self.child.id()
     }
 }
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.child.stop();
         // Its database too: a few dozen MB each, they filled the dev Postgres.
-        // On a thread of its own: this runs inside the test's runtime.
-        if let Ok(admin) = std::env::var("DATABASE_URL") {
-            let name = self.database.rsplit_once('/').unwrap().1.to_owned();
-            let _ = std::thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                runtime.block_on(async {
-                    let mut admin = sqlx::PgConnection::connect(&admin).await?;
-                    let drop = format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)");
-                    admin.execute(sqlx::AssertSqlSafe(drop)).await.map(|_| ())
-                })
+        drop_database(&self.database);
+    }
+}
+
+/// Drops a test server's database (by its URL), on a thread of its own: this
+/// runs inside a test's runtime too.
+pub fn drop_database(database: &str) {
+    if let Ok(admin) = std::env::var("DATABASE_URL") {
+        let name = database.rsplit_once('/').unwrap().1.to_owned();
+        let _ = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut admin = sqlx::PgConnection::connect(&admin).await?;
+                let drop = format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)");
+                admin.execute(sqlx::AssertSqlSafe(drop)).await.map(|_| ())
             })
-            .join();
-        }
+        })
+        .join();
     }
 }
 
@@ -212,18 +397,19 @@ pub async fn server_with(wire: Option<Arc<Wire>>) -> Server {
         "{}: scripts/ci.sh test builds it (from the pinned core), or set THECA_SERVER",
         binary.display()
     );
-    let child = Command::new(binary)
-        .current_dir(dir.path())
-        .env("DATABASE_URL__FILE", file("database_url", &database))
-        .env("SERVER_KEY__FILE", file("server_key", &"1".repeat(64)))
-        .env("DATA_KEY__FILE", file("data_key", &"2".repeat(64)))
-        .env("PUBLIC_URL", &url)
-        .env("LISTEN_ADDR", format!("127.0.0.1:{port}"))
-        .env("SETUP_OPEN", "true")
-        .env("RUST_LOG", "warn")
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("the server binary");
+    // No grace: a server gone is a server killed (`Server::kill`).
+    let child = Tended::start(&binary, 0, None, |server| {
+        server
+            .current_dir(dir.path())
+            .env("DATABASE_URL__FILE", file("database_url", &database))
+            .env("SERVER_KEY__FILE", file("server_key", &"1".repeat(64)))
+            .env("DATA_KEY__FILE", file("data_key", &"2".repeat(64)))
+            .env("PUBLIC_URL", &url)
+            .env("LISTEN_ADDR", format!("127.0.0.1:{port}"))
+            .env("SETUP_OPEN", "true")
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null());
+    });
     let mut server = Server {
         child,
         url,
@@ -240,8 +426,8 @@ pub async fn server_with(wire: Option<Arc<Wire>>) -> Server {
         {
             return server;
         }
-        if let Ok(Some(status)) = server.child.try_wait() {
-            panic!("the server exited: {status}");
+        if let Some(ended) = server.child.ended() {
+            panic!("the server exited: {ended:?}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -303,14 +489,72 @@ pub struct Device {
     pub handle: Handle,
     /// Its name, on its engine's log lines (every device's pair is 1).
     name: String,
+    runs: Runs,
     stop: watch::Sender<bool>,
     engine: Option<JoinHandle<()>>,
+    /// Its engine when a child's (`Runs::Child`).
+    daemon: Option<Tended>,
+    /// A test made its engine call into its own drive (`expect_own_calls`).
+    own_calls_expected: bool,
     _dir: tempfile::TempDir,
+}
+
+/// Where a device's engine runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Runs {
+    /// In this process, as a task.
+    Here,
+    /// In a child `theca run`: on Linux, every engine that may mount a drive.
+    /// A process that serves a FUSE mount and calls into it can't be killed
+    /// while it waits on itself (theca/computer#1): this one is only ever a
+    /// drive's client, as a user's programs are. `handle` reaches no child.
+    Child,
+}
+
+/// Where a drive's engine runs.
+const DRIVE_RUNS: Runs = if cfg!(target_os = "linux") {
+    Runs::Child
+} else {
+    Runs::Here
+};
+
+/// The drive's scenarios run where its backend is (Linux: `/dev/fuse` and
+/// `fusermount3`; Windows: always), and skip without it, unless
+/// `THECA_TEST_DRIVE` says it must be there (GitHub's runners). Safe to run
+/// anywhere: a drive's engine is never this process (`Runs::Child`).
+#[cfg(any(target_os = "linux", windows))]
+pub fn fuse() -> bool {
+    #[cfg(target_os = "linux")]
+    let here = Path::new("/dev/fuse").exists() && theca::drive::fuse::available();
+    #[cfg(windows)]
+    let here = true;
+    let required = std::env::var("THECA_TEST_DRIVE").is_ok_and(|v| !v.is_empty() && v != "0");
+    assert!(here || !required, "THECA_TEST_DRIVE: no FUSE here");
+    if !here {
+        eprintln!("skipped: no FUSE here");
+    }
+    here
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
+        if self.runs == Runs::Here {
+            return;
+        }
+        // Stopped, and nothing left mounted, before its folder goes with
+        // `_dir`: a daemon's own drives, and one a `theca` a test ran and
+        // killed left dead (the script detaches what is below the folder).
+        self.daemon.take();
+        #[cfg(unix)]
+        if let Ok(own) = self.dir().canonicalize() {
+            detach_below(&own);
+        }
+        if std::thread::panicking() {
+            self.print_said();
+        } else {
+            self.never_called_its_own_drive();
+        }
     }
 }
 
@@ -427,12 +671,21 @@ impl World {
     /// `theca` runs on it, and can't read this process's keychain (the mock),
     /// nor, on macOS, an entry another binary wrote without a prompt.
     pub async fn device_without_keychain(&self, name: &str) -> Device {
-        self.device_made(name, &self.library, true, false, Mode::Sync)
+        self.device_made(name, &self.library, true, false, Mode::Sync, Runs::Here)
             .await
     }
 
     pub async fn device_for(&self, name: &str, library: &api::Library, start: bool) -> Device {
-        self.device_made(name, library, start, true, Mode::Sync)
+        self.device_made(name, library, start, true, Mode::Sync, Runs::Here)
+            .await
+    }
+
+    /// A syncing device whose engine is a child `theca run` (`Runs::Child`):
+    /// one that may come to mount a drive. Without `start`, `restart` starts
+    /// it.
+    #[cfg(unix)]
+    pub async fn device_in_a_child(&self, name: &str, start: bool) -> Device {
+        self.device_made(name, &self.library, start, false, Mode::Sync, Runs::Child)
             .await
     }
 
@@ -469,16 +722,18 @@ impl World {
         (dir, state_path, account)
     }
 
-    /// A device whose pair is a drive.
+    /// A device whose pair is a drive. On Linux its engine is a child
+    /// (`Runs::Child`), which reads its app password in the state.
     pub async fn drive(&self, name: &str) -> Device {
-        self.device_made(name, &self.library, true, true, Mode::Drive)
+        let keyring = !cfg!(target_os = "linux");
+        self.device_made(name, &self.library, true, keyring, Mode::Drive, DRIVE_RUNS)
             .await
     }
 
     /// A drive whose app password is in its state: a child `theca` runs on
     /// it (`device_without_keychain`).
     pub async fn drive_without_keychain(&self, name: &str) -> Device {
-        self.device_made(name, &self.library, true, false, Mode::Drive)
+        self.device_made(name, &self.library, true, false, Mode::Drive, DRIVE_RUNS)
             .await
     }
 
@@ -489,6 +744,7 @@ impl World {
         start: bool,
         keyring: bool,
         mode: Mode,
+        runs: Runs,
     ) -> Device {
         let created = self
             .admin
@@ -501,7 +757,7 @@ impl World {
             .await
             .unwrap();
         let mut device = self
-            .device_in(name, library, &created.password, start, keyring, mode)
+            .device_in(name, library, &created.password, start, keyring, mode, runs)
             .await;
         device.app_password = Some(created.app_password.id);
         device
@@ -515,10 +771,12 @@ impl World {
         start: bool,
         keyring: bool,
     ) -> Device {
-        self.device_in(name, library, password, start, keyring, Mode::Sync)
+        let here = Runs::Here;
+        self.device_in(name, library, password, start, keyring, Mode::Sync, here)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)] // a device's every choice, made by the few above
     async fn device_in(
         &self,
         name: &str,
@@ -527,6 +785,7 @@ impl World {
         start: bool,
         keyring: bool,
         mode: Mode,
+        runs: Runs,
     ) -> Device {
         keychain();
         // Windows takes no sync root in the temp folder (`UNABLE_TO_MASK_PATH`):
@@ -577,8 +836,11 @@ impl World {
             account,
             handle: Handle::default(),
             name: name.into(),
+            runs,
             stop,
             engine: None,
+            daemon: None,
+            own_calls_expected: false,
             _dir: dir,
         };
         if start {
@@ -679,10 +941,67 @@ where
     }
 }
 
+/// What a task that panicked said.
+pub fn panic_message(panicked: tokio::task::JoinError) -> String {
+    let panic = panicked.into_panic();
+    panic
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default()
+}
+
+/// How long a call into a drive may take: a drive that answers nothing fails
+/// its test, never hangs it.
+pub const DRIVE_ANSWERS: Duration = Duration::from_secs(30);
+
+/// `call`, which reaches into a drive's folder, on a thread of its own, and
+/// what it returned: or the test fails once `DRIVE_ANSWERS` has passed. The
+/// thread then waits on, until the test's cleanup stops the drive's engine
+/// (the call fails at once when its daemon is gone); nothing waits for it.
+pub async fn in_drive<T: Send + 'static>(
+    what: &str,
+    call: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    in_drive_within(DRIVE_ANSWERS, what, call).await
+}
+
+/// `in_drive`, given `limit`.
+pub async fn in_drive_within<T: Send + 'static>(
+    limit: Duration,
+    what: &str,
+    call: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (done, ended) = tokio::sync::oneshot::channel();
+    let calling = std::thread::spawn(move || {
+        let _ = done.send(call());
+    });
+    match tokio::time::timeout(limit, ended).await {
+        Ok(Ok(returned)) => returned,
+        // The call panicked: its own panic, here.
+        Ok(Err(_)) => match calling.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => unreachable!("it returned without its value"),
+        },
+        Err(_) => panic!("the drive didn't answer in {limit:?}: {what}"),
+    }
+}
+
 impl Device {
     /// Stops its engine (offline, or the app quit).
     pub async fn stop(&mut self) {
         let _ = self.stop.send(true);
+        // A child's: told to stop, it ends by itself, or the test fails here.
+        if let Some(mut daemon) = self.daemon.take() {
+            let ended = tokio::task::spawn_blocking(move || daemon.stop())
+                .await
+                .unwrap();
+            if ended != Ended::Exited(0) {
+                self.print_said();
+            }
+            assert_eq!(ended, Ended::Exited(0), "the engine stops");
+            self.never_called_its_own_drive();
+        }
         // Gone once it returns: what the test changes next, it changes offline.
         if let Some(engine) = self.engine.take() {
             tokio::time::timeout(Duration::from_secs(10), engine)
@@ -708,7 +1027,82 @@ impl Device {
             .collect()
     }
 
+    /// Its own folder, which holds all it has: its state, its pairs' folders.
+    fn dir(&self) -> &Path {
+        self.state_path.parent().expect("in its folder")
+    }
+
+    /// Prints what its child engine wrote, for a failing test.
+    fn print_said(&self) {
+        eprintln!("--- {}'s `theca run` said:\n{}", self.name, self.said());
+    }
+
+    /// What its child engine wrote (its log's lines, at `debug`): nothing
+    /// captures a child's output.
+    fn said(&self) -> String {
+        std::fs::read_to_string(self.dir().join(OUTPUT)).unwrap_or_default()
+    }
+
+    /// Its child engine never called into a drive it served: the thread
+    /// making such a call waits on its own process, which then can't be
+    /// killed (the drive's warning, `fuse::OWN_CALL`).
+    fn never_called_its_own_drive(&self) {
+        #[cfg(target_os = "linux")]
+        if !self.own_calls_expected && self.called_its_own_drive() {
+            self.print_said();
+            panic!("{}'s engine {}", self.name, theca::drive::fuse::OWN_CALL);
+        }
+        // Only a FUSE drive says it.
+        #[cfg(not(target_os = "linux"))]
+        let _ = self.own_calls_expected;
+    }
+
+    /// Its child engine said it called into a drive it served.
+    #[cfg(target_os = "linux")]
+    pub fn called_its_own_drive(&self) -> bool {
+        self.said().contains(theca::drive::fuse::OWN_CALL)
+    }
+
+    /// The test makes its engine call into its own drive, on purpose: its
+    /// stop won't fail for it.
+    pub fn expect_own_calls(&mut self) {
+        self.own_calls_expected = true;
+    }
+
+    /// The process tending its child engine: on Unix `child.sh`, whose child
+    /// `theca` is.
+    pub fn script_pid(&self) -> Option<u32> {
+        self.daemon.as_ref().map(Tended::id)
+    }
+
+    /// `theca run` on its state, a child under `child.sh`: given 10 s to stop
+    /// once told (what an in-process engine gets), its drives detached after.
+    fn daemon(&self) -> Tended {
+        let out = std::fs::File::options()
+            .create(true)
+            .append(true)
+            .open(self.dir().join(OUTPUT))
+            .unwrap();
+        let err = out.try_clone().unwrap();
+        // As the mount table spells it: the script matches mounts by path.
+        let own = self.dir().canonicalize().unwrap();
+        let theca = Path::new(env!("CARGO_BIN_EXE_theca"));
+        Tended::start(theca, 10, Some(&own), |theca| {
+            theca
+                .arg("--state")
+                .arg(&self.state_path)
+                .arg("run")
+                .env("RUST_LOG", "theca=debug")
+                .stdout(out)
+                .stderr(err);
+        })
+    }
+
     fn start(&mut self, stopped: watch::Receiver<bool>) {
+        if self.runs == Runs::Child {
+            self.daemon = Some(self.daemon());
+            return;
+        }
         let path = self.state_path.clone();
         let handle = self.handle.clone();
         // The engine's target: `RUST_LOG=theca=debug` shows it.
@@ -802,4 +1196,46 @@ fn names(tree: &BTreeMap<String, Option<Vec<u8>>>) -> Vec<String> {
 
 fn pair_id(state: &State) -> i64 {
     state.pairs().unwrap()[0].id
+}
+
+/// The files `files` makes for the base URL they're served on, served on
+/// 127.0.0.1 until the process ends; that URL, and the requests counted.
+pub fn serve(
+    files: impl FnOnce(&str) -> std::collections::HashMap<&'static str, Vec<u8>>,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let files = files(&base);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counted = requests.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            counted.fetch_add(1, Ordering::SeqCst);
+            let mut request = String::new();
+            let mut reader = std::io::BufReader::new(&stream);
+            if std::io::BufRead::read_line(&mut reader, &mut request).is_err() {
+                continue;
+            }
+            // The headers, up to the empty line.
+            let mut line = String::new();
+            while std::io::BufRead::read_line(&mut reader, &mut line).is_ok_and(|n| n > 2) {
+                line.clear();
+            }
+            let path = request.split(' ').nth(1).unwrap_or("");
+            let response = match files.get(path) {
+                Some(body) => {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    [head.as_bytes(), body].concat()
+                }
+                None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec(),
+            };
+            let _ = stream.write_all(&response);
+        }
+    });
+    (base, requests)
 }

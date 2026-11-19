@@ -1,4 +1,5 @@
-//! What the CLI promises (docs/decisions.md, Sync): its commands and flags,
+//! What the CLI promises (wiki: Sync client, What the CLI
+//! promises from 1.0): its commands and flags,
 //! its exit codes (only 0 or not is promised, `USING.md` lists them), and
 //! `USING.md` in step with both.
 
@@ -191,6 +192,65 @@ async fn a_script_logs_in_without_the_keychain() {
     );
 }
 
+/// A server's login (the app password in the state file) ends by saying what
+/// to run for the daemon to start at boot: the user's own `systemctl` line,
+/// `sudo`'s caller named rather than root. Linux's unit (a system service).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_login_says_how_to_start_the_daemon_at_boot() {
+    let w = world().await;
+    let password = || async {
+        w.admin
+            .create_app_password(&theca_common::api::CreateAppPassword {
+                name: "server".into(),
+                organization: None,
+                library: None,
+                read_only: false,
+            })
+            .await
+            .unwrap()
+            .password
+    };
+    let login = |password: String, env: &[(&str, &str)], remove: &[&str]| {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.sqlite");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_theca"));
+        command
+            .arg("--state")
+            .arg(&state)
+            .args(["login", &w.server.url, "--no-keyring"])
+            .env("THECA_TOKEN", password);
+        for name in remove {
+            command.env_remove(name);
+        }
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let out = command.output().unwrap();
+        assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let said = login(password().await, &[("USER", "bob")], &["SUDO_USER"]);
+    assert!(
+        said.contains("sudo systemctl enable --now theca@bob"),
+        "{said}"
+    );
+    // Under `sudo`: the caller, whose state this is, not root.
+    let said = login(
+        password().await,
+        &[("USER", "root"), ("SUDO_USER", "alice")],
+        &[],
+    );
+    assert!(
+        said.contains("sudo systemctl enable --now theca@alice"),
+        "{said}"
+    );
+    assert!(!said.contains("theca@root"), "{said}");
+    // Nobody to name: no line, and the login still works.
+    let said = login(password().await, &[], &["USER", "SUDO_USER"]);
+    assert!(!said.contains("systemctl"), "{said}");
+}
+
 /// `login` adds nothing: it lists the libraries with the `theca add` lines;
 /// libraries new later are `silent`, or `--new-libraries`; `notify` (no
 /// window to notify in) is refused. Every library there at login is seen.
@@ -370,6 +430,27 @@ fn using_lists_the_environment_variables() {
     // The log's filter: tracing's, not clap's.
     variables.insert("RUST_LOG".into());
     assert_eq!(using("Environment variables"), variables);
+}
+
+/// The unit `USING.md` gives the archive's users is the one the package
+/// ships, but for its comments: the two can't drift apart.
+#[test]
+fn using_gives_the_unit_the_package_ships() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let page = std::fs::read_to_string(root.join("USING.md")).unwrap();
+    let shown = page
+        .split("```ini\n")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .expect("USING.md shows the unit in an ini block");
+    let shipped: String = std::fs::read_to_string(root.join("ci/packages/theca@.service"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    // The comment block ends with a blank line: not part of the unit.
+    assert_eq!(shown.trim(), shipped.trim());
 }
 
 /// Every flag `USING.md` shows (on a `theca` command, or alone) is one a

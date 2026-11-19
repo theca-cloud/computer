@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.3.0] - 2026-11-19
+
+### Features
+
+- **update**: The app and headless update themselves (theca/computer#3)
+- The macOS and Windows packages are signed by the developer
+- The computer app's channels: our apt and dnf repositories, a Homebrew tap, winget and the Store
+- **computer**: The app starts at login and the daemon runs as a service
+
+### Fixes
+
+- **ci**: The app's tests run after the others, never beside them
+- **drive**: A failed or killed drive test can no longer hang its machine
+
+### Documentation
+
+- Cite the wiki instead of the docs repo's files
+
 ## [1.2.0] - 2026-11-11
 
 ### Features

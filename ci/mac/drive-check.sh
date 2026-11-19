@@ -10,7 +10,8 @@
 #   - you: the drive's switch in System Settings (if macOS doesn't remember
 #     it), Finder's Always Keep on This Mac and Free Up Space, and whether
 #     its menu offers them; with --as-downloaded also the drag into
-#     Applications and Gatekeeper's Open Anyway;
+#     Applications and macOS's question before opening a download (a
+#     signed app needs no Open Anyway: Gatekeeper's verdict is checked);
 #   - checked: not translocated, the extension registered, logged in (no
 #     browser: the app password), the drive added, its folder listed, a
 #     file fetched when read, a folder kept then not, the drive removed.
@@ -21,8 +22,8 @@
 # into summary.txt too.
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
-# --as-downloaded: as a user gets it (quarantined, dragged in, Gatekeeper's
-# Open Anyway), once before a release; else the app copied in, its
+# --as-downloaded: as a user gets it (quarantined, dragged in, accepted by
+# Gatekeeper as notarized), once before a release; else the app copied in, its
 # quarantine removed: no clicks for those (a quicker turn).
 downloaded=false
 [ "${1:-}" = --as-downloaded ] && { downloaded=true; shift; }
@@ -172,8 +173,18 @@ if $downloaded; then
     else
         result FAIL "installed, quarantine kept" "no com.apple.quarantine on the app"
     fi
+    # Signed and notarized: Gatekeeper accepts it as downloaded, and macOS
+    # only asks whether to open an app from the Internet (no Open Anyway).
+    gatekeeper=$(spctl -a -vvv -t execute "$app" 2>&1)
+    grep -q 'source=Notarized Developer ID' <<<"$gatekeeper" ||
+        stop "Gatekeeper accepts it" "$(tr '\n' ' ' <<<"$gatekeeper")"
+    result PASS "Gatekeeper accepts it" "$(tr '\n' ' ' <<<"$gatekeeper")"
     open "$app" 2>/dev/null
-    ask "macOS refuses an unsigned app: System Settings → Privacy & Security → Open Anyway, then open Theca again if it closed"
+    ask "If macOS asks whether to open an app downloaded from the Internet, click Open"
+    if confirm "Did macOS refuse it instead (could not verify, damaged, or sent you to Privacy & Security)?"; then
+        stop "opened without Open Anyway" "macOS refused the downloaded app"
+    fi
+    result PASS "opened without Open Anyway" "the downloaded app, quarantined"
 else
     mnt=$work/mnt
     hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" >/dev/null || stop "installed" "the .dmg didn't mount"

@@ -1038,9 +1038,10 @@ impl Drop for Mounted {
 
 /// The same with real disks (macOS: disk images, no root needed). Image A,
 /// the pair's folder, detached while the client is stopped; image B attached
-/// meanwhile takes its device number; A attached again comes back on another
-/// one: followed. B mounted in A's place instead (its root is the same inode
-/// too): stopped.
+/// meanwhile is meant to take its device number. A attached again, on another
+/// device (macOS may hand it the old number back: it is attached again until it
+/// lands on another one): followed. B mounted in A's place instead (its root is
+/// the same inode too): stopped.
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_disk_image_remounted() {
@@ -1075,8 +1076,22 @@ async fn a_disk_image_remounted() {
     let before = device(&a.folder);
     drop(mounted);
     let b = Mounted::attach(&b_image, &b_mount);
-    let mounted = Mounted::attach(&a_image, &a.folder);
-    assert_ne!(device(&a.folder), before, "A came back on another device");
+    // macOS can give A its old device back even with B attached
+    // (theca/computer#31): attached again until it lands on another, three
+    // tries at most.
+    let mut same = 0;
+    let mounted = loop {
+        let mounted = Mounted::attach(&a_image, &a.folder);
+        if device(&a.folder) != before {
+            break mounted;
+        }
+        same += 1;
+        assert!(
+            same < 3,
+            "A came back on device {before} each time ({same} tries)"
+        );
+        drop(mounted);
+    };
     a.restart();
     a.write("y.txt", "y");
     w.converge(&[&a]).await;

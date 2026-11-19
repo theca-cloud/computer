@@ -65,10 +65,13 @@ steps:
     commands:
       - scripts/ci.sh test
 
-  # The app driven through its window (tauri-driver; Linux only).
+  # The app driven through its window (tauri-driver; Linux only). After
+  # test, never beside it: both build target/debug/theca, with different
+  # features, in the one workspace, and the app's tests once ran test's
+  # build without the app (pipeline 40).
   - name: app
     <<: *image
-    depends_on: [lint]
+    depends_on: [lint, test]
     commands:
       - scripts/ci.sh app
 

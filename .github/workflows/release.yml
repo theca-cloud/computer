@@ -2,14 +2,22 @@
 # pushes here with prod once its checks passed: the tests on the other
 # platforms (test.yml), on this very commit, then every package built natively
 # on its runner and checked (ci/package.sh), then one GitHub release with them
-# all, created only once every package passed. By hand (workflow_dispatch), it
-# tests, builds and checks the packages without releasing: they stay on the run.
+# all, created only once every package passed. By hand (workflow_dispatch) on a
+# branch, it tests, builds and checks the packages without releasing, signed
+# with a throwaway key: they stay on the run. By hand on a tag, the packaging
+# refuses: without the release key it signs nothing (ci/package.sh).
 name: release
 
 on:
   push:
     tags: ["[0-9]+.[0-9]+.[0-9]+"]
   workflow_dispatch:
+
+# The token every job gets reads the repository and nothing more: the one that
+# creates the release asks for more itself, and the channels' jobs push with
+# tokens of their own.
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -29,6 +37,18 @@ jobs:
           - { runner: ubuntu-22.04, os: linux, arch: x86_64 }
           - { runner: ubuntu-22.04-arm, os: linux, arch: arm64 }
     runs-on: ${{ matrix.runner }}
+    # Every signing secret lives in the `signing` environment, which GitHub
+    # lets only version tags use: a branch can't reach them by editing this
+    # file. The job names it on a pushed version tag only (the same condition
+    # as THECA_SIGNING_RUN, which can't be read here); '' runs it without an
+    # environment, its packages unsigned (tried: theca/computer#36).
+    environment: ${{ github.event_name == 'push' && github.ref_type == 'tag' && 'signing' || '' }}
+    # Which runs get the developer's signing credentials (the packaging
+    # step's env). Our prefix: the job's env reaches every tool, and
+    # linuxdeploy's AppImage plugin GPG-signs whenever SIGN is set, even to
+    # "false" (its src/main.cpp), and failed without a key.
+    env:
+      THECA_SIGNING_RUN: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     defaults:
       run:
         shell: bash
@@ -38,24 +58,202 @@ jobs:
       - uses: actions/setup-node@v7.1.0
         with:
           node-version-file: ui/.nvmrc
-      # Tauri's Linux prerequisites (as in test.yml and ci/Dockerfile), and
-      # what its AppImage bundler runs.
+      # Tauri's Linux prerequisites (as in test.yml and ci/Dockerfile), what
+      # its AppImage bundler runs, and what signs and checks the .rpm files
+      # (rpmsign, rpm2cpio) without a Fedora.
       - name: Linux packages
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
           sudo apt-get install -yq --no-install-recommends \
-            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf file
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf file \
+            rpm cpio gnupg
+      # What signs Windows' files against Certum's cloud (ci/package.sh, and
+      # Tauri's signCommand), on the runs that sign only.
+      - name: ssign
+        if: runner.os == 'Windows' && env.THECA_SIGNING_RUN == 'true'
+        run: cargo install --locked ssign@0.1.11
       - run: ci/package.sh ${{ matrix.os }} ${{ matrix.arch }}
+        # The updater's signatures (ADR 0006): the release key, here only, and
+        # on a pushed version tag only. A run by hand gets none: from a branch
+        # it signs with a throwaway key (ci/package.sh), its artifacts,
+        # downloadable from a public repository, no install's update; on a tag,
+        # ci/package.sh refuses to package without the release key.
+        #
+        # The developer's signatures (Apple's Developer ID and notarization;
+        # Certum's certificate, through SimplySign's TOTP seed, for Windows),
+        # on the runners that sign with them only: on a pushed version tag,
+        # as the updater key. Anywhere else (a manual run, from a branch)
+        # ci/package.sh builds the packages unsigned, and refuses to on a tag.
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.TAURI_SIGNING_PRIVATE_KEY || '' }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ matrix.os == 'macos' && env.THECA_SIGNING_RUN == 'true' && vars.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_CERTIFICATE: ${{ matrix.os == 'macos' && env.THECA_SIGNING_RUN == 'true' && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ matrix.os == 'macos' && env.THECA_SIGNING_RUN == 'true' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_API_KEY: ${{ matrix.os == 'macos' && env.THECA_SIGNING_RUN == 'true' && secrets.APPLE_API_KEY || '' }}
+          APPLE_API_ISSUER: ${{ matrix.os == 'macos' && env.THECA_SIGNING_RUN == 'true' && secrets.APPLE_API_ISSUER || '' }}
+          APPLE_API_PRIVATE_KEY: ${{ matrix.os == 'macos' && env.THECA_SIGNING_RUN == 'true' && secrets.APPLE_API_PRIVATE_KEY || '' }}
+          CERTUM_EMAIL: ${{ matrix.os == 'windows' && env.THECA_SIGNING_RUN == 'true' && secrets.CERTUM_EMAIL || '' }}
+          CERTUM_OTP: ${{ matrix.os == 'windows' && env.THECA_SIGNING_RUN == 'true' && secrets.CERTUM_OTP || '' }}
+          # Signs the .rpm files, on a tag (ci/package.sh refuses a tag without it).
+          LINUX_SIGNING_KEY: ${{ matrix.os == 'linux' && env.THECA_SIGNING_RUN == 'true' && secrets.LINUX_SIGNING_KEY || '' }}
       - uses: actions/upload-artifact@v7.0.2
         with:
           name: ${{ matrix.os }}-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 
+  # latest.json, the updater's manifest (ci/manifest.py), from every
+  # package's .sig: on every run, a manual one included (kept with the run),
+  # so a release's is known good before one is made.
+  manifest:
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: latest.json
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          # This version's section of the changelog (none on a manual run).
+          awk -v h="## [$version]" 'index($0, h) == 1 {on = 1; next} /^## \[/ {on = 0} on' CHANGELOG.md > notes.md
+          ci/manifest.py "$version" \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/$version" dist notes.md > latest.json
+          cat latest.json
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: manifest
+          path: latest.json
+          if-no-files-found: error
+
+  # The apt and rpm repositories' index (ci/repository.sh), signed, from the
+  # Linux packages of every architecture, then used as a user would
+  # (ci/repository-check.sh: Debian 12, Ubuntu 24.04, Fedora): on every run, a
+  # manual one included, with a throwaway key; a tag signs with the release
+  # key, of the `signing` environment, and keeps the earlier releases' packages
+  # too. No package is rebuilt: repository.tar.gz holds the index only, and
+  # `chapter.li`'s pull.sh serves it with the packages of the releases.
+  repository:
+    needs: package
+    runs-on: ubuntu-24.04
+    environment: ${{ github.event_name == 'push' && github.ref_type == 'tag' && 'signing' || '' }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq --no-install-recommends apt-utils createrepo-c rpm gnupg
+      - name: Repositories
+        env:
+          LINUX_SIGNING_KEY: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.LINUX_SIGNING_KEY || '' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          ci/repository.sh "$version" dist repository
+      - name: Check
+        run: ci/repository-check.sh repository
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: repository
+          path: repository/repository.tar.gz
+          if-no-files-found: error
+
+  # The daemon as a Linux service (tests/service.rs): this run's theca-cli
+  # .deb installed on a Debian 12 booted with systemd, enabled as
+  # `theca@<user>`, syncing against the test server, upgraded, refused beside
+  # a second `theca run`, removed. On every run, a manual one included. Its
+  # container is privileged (systemd as PID 1): the runner's Docker allows it
+  # (tried on a developer's Docker; assumed here until a run shows it).
+  service-check:
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: Swatinem/rust-cache@v2.9.3
+      # The test server's Postgres, as test.yml's Linux runs it.
+      - name: Postgres
+        run: scripts/dev.sh
+      - name: The service
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          THECA_TEST_DEB="$PWD/dist/theca-cli-$version-linux-x86_64.deb" scripts/ci.sh service
+
+  # The channels we don't host (wiki: Releases). On every run, a manual one
+  # included, each builds its file from this run's packages and checks it,
+  # publishing nothing: the cask installed by Homebrew, `theca-bin` by makepkg
+  # in Arch's container, winget's manifests against Microsoft's schemas (the
+  # Windows image has no winget). Their publishing jobs follow `release`.
+  cask-check:
+    needs: package
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          pattern: macos-*
+          merge-multiple: true
+      - run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          ci/cask-check.sh "$version" dist cask
+
+  aur-check:
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          pattern: linux-*
+          merge-multiple: true
+      - run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          ci/aur-check.sh "$version" dist "$GITHUB_REPOSITORY" aur
+      # PKGBUILD and .SRCINFO with the release's URLs: what the AUR job pushes.
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: aur-files
+          path: aur/publish
+          if-no-files-found: error
+
+  winget-check:
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          pattern: windows-*
+          merge-multiple: true
+      - run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          ci/winget-check.sh "$version" dist winget
+      # The manifests of this version: a package's first one is submitted by
+      # hand with them (komac makes the next ones, from the previous).
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: winget-manifests
+          path: winget/files
+          if-no-files-found: error
+
   release:
     if: github.ref_type == 'tag'
-    needs: package
+    needs: [manifest, repository, service-check, cask-check, aur-check, winget-check]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -64,6 +262,7 @@ jobs:
       - uses: actions/download-artifact@v8.0.2
         with:
           path: dist
+          pattern: "{macos-*,windows-*,linux-*,manifest,repository}"
           merge-multiple: true
       - name: Release
         env:
@@ -71,9 +270,121 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
-          # This version's section of the changelog, and how to open an
-          # unsigned app (signing comes with Distribution).
+          # This version's section of the changelog.
           awk -v h="## [$TAG]" 'index($0, h) == 1 {on = 1; next} /^## \[/ {on = 0} on' CHANGELOG.md > notes.md
-          printf '\nThe apps are not signed yet: [how to open them](https://github.com/%s/blob/%s/USING.md#opening-an-unsigned-app).\n' \
-            "$GITHUB_REPOSITORY" "$TAG" >> notes.md
           gh release create "$TAG" dist/* --title "$TAG" --notes-file notes.md --verify-tag
+
+  # The channels' publishing, on a tag only, once the release exists (their
+  # files point at it), from the `channels` environment: only version tags may
+  # use it, and it holds no signing key (these jobs run other people's code).
+  # Each is its own job, run again alone when it fails; the release stays.
+  # Homebrew: the cask, pushed to our tap.
+  tap:
+    if: github.ref_type == 'tag'
+    needs: release
+    runs-on: ubuntu-24.04
+    environment: channels
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          pattern: macos-*
+          merge-multiple: true
+      - name: Cask
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          ci/cask.sh "$version" dist "https://github.com/$GITHUB_REPOSITORY/releases/download/$version" cask
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: theca-cloud/homebrew-tap
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+      - name: Publish
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          mkdir -p tap/Casks
+          cp cask/Casks/theca.rb tap/Casks/
+          cd tap
+          git add Casks/theca.rb
+          if git diff --cached --quiet; then echo "the cask is already $version"; exit 0; fi
+          git -c user.name="Pascal Perrenoud" -c user.email="packages@theca.rs" commit -q -m "theca $version"
+          git push
+
+  # winget: komac (pinned, its checksum checked) makes the new version's
+  # manifests from the previous one's and opens the pull request on
+  # microsoft/winget-pkgs from the machine account's fork. The first version of
+  # a package has none to start from: it is submitted by hand with the
+  # `winget-manifests` artifact, and this job says so.
+  winget:
+    if: github.ref_type == 'tag'
+    needs: release
+    runs-on: ubuntu-24.04
+    environment: channels
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Is Theca.Theca in winget-pkgs?
+        id: listed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api repos/microsoft/winget-pkgs/contents/manifests/t/Theca/Theca >/dev/null 2>&1; then
+            echo "listed=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "listed=false" >>"$GITHUB_OUTPUT"
+            echo "::notice::Theca.Theca isn't in winget-pkgs yet: its first version is submitted by hand, with the winget-manifests artifact of this run"
+          fi
+      - name: Komac
+        if: steps.listed.outputs.listed == 'true'
+        run: |
+          curl -fsSL --retry 3 -o komac.tar.gz https://github.com/russellbanks/Komac/releases/download/v2.17.2/komac-2.17.2-x86_64-unknown-linux-gnu.tar.gz
+          echo "b03b020eec98acfb0b53e284a6e21815b884be33de6785b97e7a120f0e748966  komac.tar.gz" | sha256sum -c --quiet -
+          tar -xzf komac.tar.gz komac
+      - name: Pull request
+        if: steps.listed.outputs.listed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          ./komac update Theca.Theca --version "$version" \
+            --urls "https://github.com/$GITHUB_REPOSITORY/releases/download/$version/theca-$version-windows-x86_64.exe" \
+            --submit
+
+  # The Microsoft Store: msstore (Microsoft's CLI, pinned; store-submission,
+  # the action first agreed on, is archived) updates the product's installer
+  # URL and submits it. A product's first submission is made by hand in
+  # Partner Center (its listing); this job runs once the repository variable
+  # STORE_LISTED is "true". Unproven until a release has gone through it.
+  store:
+    if: github.ref_type == 'tag' && vars.STORE_LISTED == 'true'
+    needs: release
+    runs-on: ubuntu-24.04
+    environment: channels
+    steps:
+      - uses: actions/checkout@v7.0.1
+      # msstore v0.4.4 by its checksum, as komac: the action that installs it
+      # (microsoft-store-apppublisher) downloads it and checks nothing, in the
+      # job that holds the Store's secrets. The archive holds the binary and
+      # its libraries: all of it goes on the PATH.
+      - name: msstore
+        run: |
+          curl -fsSL --retry 3 -o msstore.tar.gz https://github.com/microsoft/msstore-cli/releases/download/v0.4.4/MSStoreCLI-linux-x64.tar.gz
+          echo "8c1283643530afede36d935c532e252dd69240d30432775794ad1598bce3c162  msstore.tar.gz" | sha256sum -c --quiet -
+          mkdir "$RUNNER_TEMP/msstore"
+          tar -xzf msstore.tar.gz -C "$RUNNER_TEMP/msstore"
+          echo "$RUNNER_TEMP/msstore" >>"$GITHUB_PATH"
+      - name: Submission
+        env:
+          STORE_TENANT_ID: ${{ secrets.STORE_TENANT_ID }}
+          STORE_SELLER_ID: ${{ secrets.STORE_SELLER_ID }}
+          STORE_CLIENT_ID: ${{ secrets.STORE_CLIENT_ID }}
+          STORE_CLIENT_SECRET: ${{ secrets.STORE_CLIENT_SECRET }}
+          STORE_PRODUCT_ID: ${{ secrets.STORE_PRODUCT_ID }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$version/theca-$version-windows-x86_64.exe"
+          msstore reconfigure --tenantId "$STORE_TENANT_ID" --sellerId "$STORE_SELLER_ID" \
+            --clientId "$STORE_CLIENT_ID" --clientSecret "$STORE_CLIENT_SECRET"
+          msstore submission update "$STORE_PRODUCT_ID" \
+            "{\"packages\":[{\"packageUrl\":\"$url\",\"languages\":[\"en\"],\"architectures\":[\"X64\"],\"isSilentInstall\":true,\"installerParameters\":\"/S\"}]}"
+          msstore submission publish "$STORE_PRODUCT_ID"

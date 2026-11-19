@@ -10,19 +10,33 @@ use std::time::Duration;
 
 use common::*;
 
-/// `theca <args>` on a device's state, killed at `point`.
+/// `theca <args>` on a device's state, killed at `point`: a tended child
+/// (`theca run` on a drive mounts it), given a minute to get there. Once it
+/// died, every mount below the device's folder is detached: the device's own
+/// engine must be stopped first, as every caller does.
 async fn crash(state: &Path, point: &str, args: &[&str]) {
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_theca"));
-    command
-        .arg("--state")
-        .arg(state)
-        .args(args)
-        .env("THECA_CRASH_AT", point);
-    let status = tokio::task::spawn_blocking(move || command.status())
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(!status.success(), "never reached {point}");
+    let theca = Path::new(env!("CARGO_BIN_EXE_theca"));
+    let dir = state.parent().unwrap().canonicalize().unwrap();
+    let mut crashed = Tended::start(theca, 0, Some(&dir), |theca| {
+        theca
+            .arg("--state")
+            .arg(state)
+            .args(args)
+            .env("THECA_CRASH_AT", point);
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let ended = loop {
+        if let Some(ended) = crashed.ended() {
+            break ended;
+        }
+        // Stopped (killed) by its drop.
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never reached {point}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_ne!(ended, Ended::Exited(0), "never reached {point}");
 }
 
 /// B5: removing a pair with its files, killed once they're deleted: the
@@ -258,18 +272,6 @@ async fn a_local_delete_killed_before_its_record_converges() {
     assert_eq!(w.admin.library_trash(w.library.id).await.unwrap().len(), 1);
 }
 
-/// The drive's backend here: its crash tests need it (as `tests/drive.rs`).
-#[cfg(any(target_os = "linux", windows))]
-fn fuse() -> bool {
-    #[cfg(target_os = "linux")]
-    let here = Path::new("/dev/fuse").exists() && theca::drive::fuse::available();
-    #[cfg(windows)]
-    let here = true;
-    let required = std::env::var("THECA_TEST_DRIVE").is_ok_and(|v| !v.is_empty() && v != "0");
-    assert!(here || !required, "THECA_TEST_DRIVE: no FUSE here");
-    here
-}
-
 /// A drive's file downloaded (kept, then no longer), its engine stopped.
 #[cfg(any(target_os = "linux", windows))]
 async fn downloaded_in_a_stopped_drive(w: &World) -> Device {
@@ -322,8 +324,8 @@ async fn an_eviction_killed_after_its_mark_loses_nothing() {
     );
     d.restart();
     let mounted = d.folder.join("a.txt");
-    let opened = tokio::task::spawn_blocking(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let opened = in_drive("a.txt opened, once mounted", move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             if let Ok(c) = std::fs::read_to_string(&mounted)
                 && !c.is_empty()
@@ -334,7 +336,7 @@ async fn an_eviction_killed_after_its_mark_loses_nothing() {
             std::thread::sleep(Duration::from_millis(200));
         }
     });
-    assert_eq!(opened.await.unwrap(), "hello");
+    assert_eq!(opened.await, "hello");
     tokio::time::sleep(Duration::from_secs(3)).await;
     let remote = w.remote(&w.library).await;
     assert_eq!(remote["a.txt"].as_deref(), Some(&b"hello"[..]));
@@ -383,9 +385,7 @@ async fn a_fetch_killed_before_its_record_is_no_edit() {
     })
     .await;
     let opened = d.folder.join("a.txt");
-    let read = tokio::task::spawn_blocking(move || std::fs::read_to_string(opened))
-        .await
-        .unwrap();
+    let read = in_drive("a.txt opened", move || std::fs::read_to_string(opened)).await;
     assert_eq!(read.unwrap(), "hello");
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert_eq!(

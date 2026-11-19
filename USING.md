@@ -4,24 +4,59 @@ The Theca app for macOS, Windows and Linux keeps local folders identical to Thec
 
 ## Install
 
-Download it from the [releases](https://github.com/theca-cloud/computer/releases), for your system and processor (`arm64`: Apple Silicon, ARM servers and Raspberry Pis; `x86_64`: Intel and AMD):
+From the channel your system already uses, which keeps Theca up to date too ([Updating](#updating)):
 
-| | The app | Headless (servers) |
+| | The app | CLI (servers) |
+|---|---|---|
+| macOS | [Homebrew](https://brew.sh): `brew install theca-cloud/tap/theca` | the app's own `theca`, which Homebrew puts on your `PATH` |
+| Windows | the Microsoft Store (search for Theca), or `winget install Theca.Theca` | `theca-cli-<version>-windows-x86_64.zip` ([direct downloads](#direct-downloads)) |
+| Debian, Ubuntu | our apt repository: `theca` | our apt repository: `theca-cli` |
+| Fedora | our dnf repository: `theca` | our dnf repository: `theca-cli` |
+| Other Linux (Arch too) | the `.AppImage` ([direct downloads](#direct-downloads)) | `theca-cli-<version>-linux-<arch>.tar.gz` |
+
+### Debian, Ubuntu: apt
+
+```sh
+sudo curl -fsSL https://packages.theca.rs/theca.gpg -o /usr/share/keyrings/theca.gpg
+sudo curl -fsSL https://packages.theca.rs/theca.sources -o /etc/apt/sources.list.d/theca.sources
+sudo apt update && sudo apt install theca      # or theca-cli, without the window
+```
+
+### Fedora: dnf
+
+```sh
+sudo curl -fsSL https://packages.theca.rs/RPM-GPG-KEY-theca -o /etc/pki/rpm-gpg/RPM-GPG-KEY-theca
+sudo curl -fsSL https://packages.theca.rs/theca.repo -o /etc/yum.repos.d/theca.repo
+sudo dnf install theca                         # or theca-cli, without the window
+```
+
+The repositories and the `.rpm` files are signed with one key, fingerprint `B7AE 400C DAA6 5388 CEC6 316D 43CE 4F13 6D66 5585`: `apt` and `dnf` check it, as the files above say. `theca` and `theca-cli` both own the `theca` command, so only one is installed at a time: `apt` replaces one with the other, `dnf` is asked to (`sudo dnf install --allowerasing theca-cli`). Installing a `.deb` or an `.rpm` downloaded from the releases adds the same repository, so `apt` and `dnf` update it from then on. The `.rpm` is built for Fedora: Red Hat Enterprise Linux 9 and its clones (Rocky, Alma) are too old for it (glibc 2.34, no WebKitGTK 4.1): use the `.AppImage`, or on a server the CLI archive.
+
+### Direct downloads
+
+From the [releases](https://github.com/theca-cloud/computer/releases), for your system and processor (`arm64`: Apple Silicon, ARM servers and Raspberry Pis; `x86_64`: Intel and AMD):
+
+| | The app | CLI (servers) |
 |---|---|---|
 | macOS | `theca-<version>-macos-<arch>.dmg`: open it, drag Theca to Applications | the app's own `theca` (below) |
-| Windows | `theca-<version>-windows-x86_64.exe`: installs for you alone, no admin | `theca-headless-<version>-windows-x86_64.zip` |
-| Linux | `theca-<version>-linux-<arch>.deb` (Debian, Ubuntu: `sudo apt install ./theca-….deb`), or the `.AppImage` anywhere else (`chmod +x`, then run it) | `theca-headless-<version>-linux-<arch>.tar.gz` |
+| Windows | `theca-<version>-windows-x86_64.exe`: installs for you alone, no admin | `theca-cli-<version>-windows-x86_64.zip` |
+| Linux | `theca-<version>-linux-<arch>.AppImage` (`chmod +x`, then run it), or the `.deb` / `.rpm` | `theca-cli-<version>-linux-<arch>.tar.gz`, or the `theca-cli` `.deb` / `.rpm` |
 
-The app also answers the CLI (`theca --help`). Headless, unpack the archive and put `theca` on your `PATH` (`sudo install theca-headless-*/theca /usr/local/bin/`), then `theca login`. On a Mac used from the command line, install the app and use its `theca`: `/Applications/Theca.app/Contents/MacOS/theca` (a Mac's drives need the app's extension; there is no headless Mac archive from 1.2.0). Linux builds run on Ubuntu 22.04 and Debian 12 or newer; drives on Linux need `fuse3` (the `.deb` installs it; elsewhere, install it).
+The app also answers the CLI (`theca --help`). For the CLI archive, unpack it and put `theca` on your `PATH` (`sudo install theca-cli-*/theca /usr/local/bin/`), then `theca login`. On a Mac there is no CLI archive (since 1.2.0, a Mac's drives need the app's extension): use the app's own `theca`, which Homebrew puts on your `PATH`; installed from a `.dmg`, link it once with `sudo ln -sf /Applications/Theca.app/Contents/MacOS/theca /usr/local/bin/theca`. Linux builds run on Ubuntu 22.04 and Debian 12 or newer; drives on Linux need `fuse3` (the packages install it; elsewhere, install it).
 
-To update, install the new version over the old one: what the app keeps is upgraded the first time the new version starts.
+### Updating
 
-### Opening an unsigned app
+The app and the CLI update themselves from Theca's releases, except what a package manager installed (`theca` and `theca-cli` from our apt and dnf repositories or a `.deb` / `.rpm`): `apt` and `dnf` update those with the rest of the system (`theca update` says so there). An update is checked against Theca's release key before anything is replaced, and none is installed while one of your accounts is on a server older than it needs, or one that can't be reached (tried again at the next check). What the app keeps is upgraded the first time the new version starts; installing the new version over the old one by hand still works.
 
-The apps aren't signed by Apple or Microsoft yet, so the first time:
+- **When**: at start, then every 6 hours, in the app and in `theca run`, as its setting says: `auto` installs and restarts (the app's default), `ask` says a new version is out (a notification, the window and the tray; the CLI, the log and `theca status`; the CLI's default), `off` never checks by itself.
+- **In the app**: Settings, Updates: the setting, **Check for updates**, and a new version with its release notes and **Install and restart**. The tray has **Check for updates…**, and says **Update to X.Y.Z** while one waits: click it to install.
+- **CLI**: `theca updates auto`, `ask` or `off` sets it (`theca updates` shows it). `theca update` checks and installs now, whatever the setting: the binary is replaced where it is, by a user who can write it (`sudo theca update` for `/usr/local/bin/theca`); a running `theca run` goes on with the old version until it starts again. In `auto`, `theca run` installs the new version and starts it in its place, when it can write its binary.
+- **`theca update` with the app open** hands over: the app installs and restarts. Without a display (a server over ssh), there is no app to hand over to: it installs itself, and says so.
+- **What it leaves**: on Windows, the binary it replaced, set aside as `theca.exe.old` beside it (it may still be running), removed at the next update. `theca status` waits 3 seconds at most to say a new version is out: offline, it says nothing of it.
 
-- **macOS** says Apple could not verify Theca. Open **System Settings → Privacy & Security**, scroll to Security, click **Open Anyway** next to Theca, and confirm.
-- **Windows** SmartScreen says "Windows protected your PC": click **More info**, then **Run anyway**.
+### Windows' SmartScreen
+
+The apps are signed by their developer: macOS opens them without a warning, Apple having checked them. On Windows, the installer and the app name their publisher, "Open Source Developer Pascal Perrenoud"; until that certificate has earned a reputation with Microsoft, SmartScreen may still say "Windows protected your PC": click **More info**, check the publisher, then **Run anyway**. An install from the Microsoft Store never shows it.
 
 ### Checking a download
 
@@ -31,7 +66,7 @@ Each release lists the SHA-256 of every file in `SHA256SUMS`: `shasum -a 256 -c 
 
 Logging in creates an app password for this computer, revocable from the web app (**Account → App passwords**). It is kept in the system's keychain: the login keychain on macOS, the Credential Manager on Windows, the Secret Service (GNOME Keyring, KWallet) on Linux. Where there is none, as on most headless servers, it is kept in the app's state file instead, readable by you alone, and the login says so; `theca login --no-keyring` keeps it there by choice.
 
-On macOS, until the app is signed, each new version asks once for your password to read its keychain entry: click **Always Allow**.
+On macOS, the first signed version (after 1.2 or earlier) asks once for your password to read its keychain entry: click **Always Allow**. The versions after it shouldn't ask again.
 
 ## Choosing libraries
 
@@ -80,7 +115,53 @@ A library can be a **drive** instead of a synced folder: your file manager shows
 - **Removing a drive** moves the edits not uploaded yet to `<default folder>/<library> (not uploaded)`, never deleted; everything else goes (it is on the server). Uninstalling Theca on Windows removes its drives first, the same way.
 - **On Linux, a file saved into the drive's folder while Theca wasn't running** (so not into the drive) stops the drive until you move it out; the drive then comes back by itself.
 
-## Headless use
+## Starting with the computer
+
+A computer that restarts keeps syncing without anyone opening Theca: the app starts at login on a desktop, a service runs the CLI on a server.
+
+**The app.** A fresh install turns **Start at login** on at its first launch, once; it is a switch in the app's window, and one you turn off stays off. An upgrade doesn't turn it on for you. Started at login, the app stays in the tray, with no window.
+
+**A Linux server.** The `theca-cli` package (apt, dnf) ships a systemd unit, `theca@<user>`, that runs `theca run` as that user at boot, with their state and folders, never as root, whether or not they are logged in:
+
+```sh
+theca login https://cloud.example.com --no-keyring   # a service can't reach a desktop's keychain
+theca add Documents
+sudo systemctl enable --now theca@$USER
+```
+
+`theca login` ends by printing that last line when it fits (it names you, not root, under `sudo`). `systemctl status theca@<user>` and `journalctl -u theca@<user>` say how it runs, `theca logs` what it does. The packages restart the running services when they upgrade and stop them when removed. A service restarts itself 10 seconds after a failure, so one that was refused because the app holds the state starts by itself once the app quits. On a desktop use the app: it and a service can't sync one state at once, and an app started at login says so in a notification when a service holds it. With the `.tar.gz` archive, which has no unit, save this as `/etc/systemd/system/theca@.service` (and put `theca` at `/usr/bin/theca`, or change `ExecStart`):
+
+```ini
+[Unit]
+Description=Theca, keeping %i's folders identical to their libraries
+Documentation=https://theca.rs/computer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=%i
+ExecStart=/usr/bin/theca run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+A drive under the service isn't tried yet: use synced folders on a server.
+
+**A Windows server.** In a terminal opened **as administrator**, with the account logged in the same way (`theca login <instance> --no-keyring`, then `theca add`):
+
+```sh
+theca service on     # asks for your Windows password, once; Theca doesn't keep it
+theca service off    # stops the service and removes it
+```
+
+`theca service on` registers a Windows service, `theca-<your user name>`, that starts with Windows, runs `theca run` as you (your folders and state) and restarts after a failure. `--account <name>` registers another user's account, and `theca --state <file> service on` runs the service on that state file. Windows' own **Services** window shows and stops it. Like the Linux unit it can't share a state with the app: use one or the other. Run it again to change the password or the binary: the service is stopped, changed and started. The service runs the `theca.exe` that registered it, as the account. For an **administrator's** account `theca service on` refuses unless that file is under Program Files, where only administrators can write: otherwise any program of yours could replace a `theca.exe` under your own profile and have it run with your full rights at the next start. Copy it to `C:\Program Files\Theca\` and run `theca service on` from there. A standard account can run it from anywhere. A wrong password is refused at once.
+
+**A Mac** needs nothing more than the app at login: there is no service for the CLI.
+
+## CLI use
 
 ```sh
 theca login https://cloud.example.com   # prints a page to open and a code to check, then the libraries
@@ -92,7 +173,7 @@ theca status                            # what syncs, what it's doing, errors
 
 A login adds no library: it lists them with the `theca add` lines to choose with. What libraries new to the account later do is `--new-libraries`: `silent` by default (listed only, `theca libraries`), `sync` (up to the size limit), or `drive`.
 
-Every command and its options: `theca --help`, `theca <command> --help`. The commands: `login`, `accounts`, `account` (an account's default folder, and what libraries new to it do: `--new-libraries sync|drive|notify|silent`, `--auto-sync-limit 2GB`, 0 for no limit), `remove-account`, `libraries`, `add`, `remove`, `pause`, `resume`, `locate` (a folder moved or on another disk), `status`, `undo` (restores what the last deletion moved to the trash), `run`, `logs`; for drives, `keep`, `free`, `drive-limit`. A script logs in without a browser with an app password made in the web app: `THECA_TOKEN=… theca login <instance>`.
+Every command and its options: `theca --help`, `theca <command> --help`. The commands: `login`, `accounts`, `account` (an account's default folder, and what libraries new to it do: `--new-libraries sync|drive|notify|silent`, `--auto-sync-limit 2GB`, 0 for no limit), `remove-account`, `libraries`, `add`, `remove`, `pause`, `resume`, `locate` (a folder moved or on another disk), `status`, `undo` (restores what the last deletion moved to the trash), `run`, `service` (Windows: `on`, `off`, above), `logs`, `update` and `updates` (above); for drives, `keep`, `free`, `drive-limit`. A script logs in without a browser with an app password made in the web app: `THECA_TOKEN=… theca login <instance>`.
 
 One `theca run`, or the app, syncs a state file at a time: a second one refuses to start. `run` stops within a few seconds on Ctrl-C or `SIGTERM`.
 

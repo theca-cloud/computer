@@ -12,7 +12,7 @@ use std::io;
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -55,6 +55,7 @@ pub fn mount(pair: &Pair, folder: &Path, fetcher: Fetcher) -> io::Result<Mount> 
         fetcher,
         uid: meta.uid(),
         gid: meta.gid(),
+        own_call: AtomicBool::new(false),
     }));
     let mut config = Config::default();
     config.mount_options = vec![
@@ -242,6 +243,17 @@ struct Shared {
     fetcher: Fetcher,
     uid: u32,
     gid: u32,
+    /// This process called into its own drive (said once per mount).
+    own_call: AtomicBool,
+}
+
+/// What the warning of a call from the drive's own process says: the tests
+/// fail a scenario whose daemon logged it.
+pub const OWN_CALL: &str = "called into its own drive";
+
+/// `pid`, a request's caller (a thread's ID), is a thread of this process.
+fn own(pid: u32) -> bool {
+    pid != 0 && Path::new(&format!("/proc/self/task/{pid}")).exists()
 }
 
 struct Drive(Arc<Shared>);
@@ -264,6 +276,15 @@ fn hidden(name: &OsStr) -> bool {
 }
 
 impl Shared {
+    /// A request from this very process is answered, and said once: the
+    /// thread making it waits on the threads serving it, and if the process
+    /// is killed meanwhile, nothing can end it (theca/computer#1).
+    fn note_caller(&self, req: &Request, operation: &str) {
+        if own(req.pid()) && !self.own_call.swap(true, Ordering::Relaxed) {
+            tracing::warn!(pair = self.pair.id, operation, "Theca {OWN_CALL}");
+        }
+    }
+
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
         m.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -374,14 +395,16 @@ impl Filesystem for Drive {
         Ok(())
     }
 
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        self.0.note_caller(req, "lookup");
         match self.0.child(parent, name).and_then(|p| self.0.attr(&p)) {
             Ok(a) => reply.entry(&TTL, &a, Generation(0)),
             Err(e) => reply.error(e),
         }
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+    fn getattr(&self, req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        self.0.note_caller(req, "getattr");
         match self.0.path(ino).and_then(|p| self.0.attr(&p)) {
             Ok(a) => reply.attr(&TTL, &a),
             Err(e) => reply.error(e),
@@ -390,7 +413,7 @@ impl Filesystem for Drive {
 
     fn setattr(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         mode: Option<u32>,
         _uid: Option<u32>,
@@ -406,6 +429,7 @@ impl Filesystem for Drive {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
+        self.0.note_caller(req, "setattr");
         let s = &self.0;
         let res = (|| -> Result<FileAttr, Errno> {
             let rel = s.path(ino)?;
@@ -452,13 +476,14 @@ impl Filesystem for Drive {
 
     fn mkdir(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
         umask: u32,
         reply: ReplyEntry,
     ) {
+        self.0.note_caller(req, "mkdir");
         let res = self.0.child(parent, name).and_then(|rel| {
             fs::DirBuilder::new()
                 .mode(mode & !umask)
@@ -472,7 +497,8 @@ impl Filesystem for Drive {
         }
     }
 
-    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        self.0.note_caller(req, "unlink");
         let s = &self.0;
         let res = s.child(parent, name).and_then(|rel| {
             let _taken = s.busy.take(&rel);
@@ -486,7 +512,8 @@ impl Filesystem for Drive {
         }
     }
 
-    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        self.0.note_caller(req, "rmdir");
         let s = &self.0;
         let res = s.child(parent, name).and_then(|rel| {
             fs::remove_dir(s.abs(&rel)).map_err(errno)?;
@@ -501,7 +528,7 @@ impl Filesystem for Drive {
 
     fn rename(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         newparent: INodeNo,
@@ -509,6 +536,7 @@ impl Filesystem for Drive {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
+        self.0.note_caller(req, "rename");
         let s = &self.0;
         let res = (|| -> Result<(), Errno> {
             let from = s.child(parent, name)?;
@@ -538,7 +566,8 @@ impl Filesystem for Drive {
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        self.0.note_caller(req, "open");
         let rel = match self.0.path(ino) {
             Ok(r) => r,
             Err(e) => return reply.error(e),
@@ -559,7 +588,7 @@ impl Filesystem for Drive {
 
     fn read(
         &self,
-        _req: &Request,
+        req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
         offset: u64,
@@ -568,6 +597,7 @@ impl Filesystem for Drive {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        self.0.note_caller(req, "read");
         let file = match self.0.handle(fh) {
             Ok(f) => f,
             Err(e) => return reply.error(e),
@@ -586,7 +616,7 @@ impl Filesystem for Drive {
 
     fn write(
         &self,
-        _req: &Request,
+        req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
         offset: u64,
@@ -596,6 +626,7 @@ impl Filesystem for Drive {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        self.0.note_caller(req, "write");
         let written = self
             .0
             .handle(fh)
@@ -608,18 +639,19 @@ impl Filesystem for Drive {
 
     fn flush(
         &self,
-        _req: &Request,
+        req: &Request,
         _ino: INodeNo,
         _fh: FileHandle,
         _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        self.0.note_caller(req, "flush");
         reply.ok();
     }
 
     fn release(
         &self,
-        _req: &Request,
+        req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
         _flags: OpenFlags,
@@ -627,6 +659,7 @@ impl Filesystem for Drive {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        self.0.note_caller(req, "release");
         if let Some((rel, _)) = Shared::lock(&self.0.handles).remove(&fh.0) {
             self.0.busy.closed(&rel);
         }
@@ -635,12 +668,13 @@ impl Filesystem for Drive {
 
     fn fsync(
         &self,
-        _req: &Request,
+        req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
         datasync: bool,
         reply: ReplyEmpty,
     ) {
+        self.0.note_caller(req, "fsync");
         let synced = self.0.handle(fh).and_then(|f| {
             if datasync {
                 f.sync_data()
@@ -657,12 +691,13 @@ impl Filesystem for Drive {
 
     fn readdir(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         _fh: FileHandle,
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        self.0.note_caller(req, "readdir");
         let s = &self.0;
         let rel = match s.path(ino) {
             Ok(r) => r,
@@ -702,7 +737,7 @@ impl Filesystem for Drive {
 
     fn create(
         &self,
-        _req: &Request,
+        req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
@@ -710,6 +745,7 @@ impl Filesystem for Drive {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        self.0.note_caller(req, "create");
         let s = &self.0;
         let res = (|| -> Result<(FileAttr, u64), Errno> {
             let rel = s.child(parent, name)?;
@@ -732,7 +768,8 @@ impl Filesystem for Drive {
         }
     }
 
-    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+    fn statfs(&self, req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        self.0.note_caller(req, "statfs");
         match rustix::fs::statvfs(&self.0.pair.path) {
             Ok(v) => reply.statfs(
                 v.f_blocks,
@@ -746,5 +783,27 @@ impl Filesystem for Drive {
             ),
             Err(e) => reply.error(errno(e.into())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::own;
+
+    /// This thread's ID (`/proc/thread-self` is `<pid>/task/<tid>`).
+    fn tid() -> u32 {
+        let me = std::fs::read_link("/proc/thread-self").unwrap();
+        me.file_name().unwrap().to_str().unwrap().parse().unwrap()
+    }
+
+    /// A thread of this process is its own; the kernel (0) and another
+    /// process (the parent) aren't. (A thread ended isn't checked: its entry
+    /// can outlive its `join`.)
+    #[test]
+    fn a_caller_is_own_only_when_a_thread_of_this_process() {
+        assert!(own(tid()));
+        assert!(own(std::process::id()), "the main thread");
+        assert!(!own(0));
+        assert!(!own(std::os::unix::process::parent_id()));
     }
 }
