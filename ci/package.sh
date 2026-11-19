@@ -344,23 +344,9 @@ if [ "$os" = linux ]; then
         --bundles deb,rpm
 fi
 # theca-cli, the command line for apt and dnf: the CLI a third time, without
-# self-update, packaged by nfpm (pinned, its checksum checked), with the same
-# repository files as the app's.
+# self-update (ci/cli-package.sh).
 if [ "$os" = linux ]; then
-    cargo build --release --target-dir target/cli-pkg
-    case $arch in
-    x86_64) nfpm_arch=amd64 nfpm_sha=6d7f9a28b2f397934403950fcbba83f598b08d02edbe79a0815b3b4897341750 ;;
-    arm64) nfpm_arch=arm64 nfpm_sha=a9a75213763783b7669719e505474c748c5ad7dc66591a195619deb50f85c2f4 ;;
-    esac
-    curl -fsSL --retry 3 -o "$tmp/nfpm.tar.gz" \
-        "https://github.com/goreleaser/nfpm/releases/download/v2.48.0/nfpm_2.48.0_Linux_$arch.tar.gz"
-    echo "$nfpm_sha  $tmp/nfpm.tar.gz" | sha256sum -c --quiet -
-    mkdir "$tmp/nfpm" && tar -xzf "$tmp/nfpm.tar.gz" -C "$tmp/nfpm" nfpm
-    cp "$tmp/theca.gpg" target/cli-pkg/theca.gpg
-    for format in deb rpm; do
-        NFPM_VERSION=$version NFPM_ARCH=$nfpm_arch "$tmp/nfpm/nfpm" package -f ci/packages/nfpm.yaml \
-            -p "$format" -t "dist/$cli.$format" >/dev/null
-    done
+    ci/cli-package.sh "$version" "$arch" dist "$cli" deb rpm
 fi
 
 # The CLI: no GUI library linked (ADR 0004). Not on macOS since 1.2.0: a

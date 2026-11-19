@@ -1,0 +1,26 @@
+# Theca's sync daemon for one user: `sudo systemctl enable --now theca@alice`
+# runs `theca run` at boot as alice, with alice's state and folders, whether or
+# not she is logged in (as Syncthing's syncthing@.service). Shipped by
+# theca-cli (ci/packages/nfpm.yaml); USING.md gives the same text to the
+# archive's users.
+#
+# No NoNewPrivileges: a drive mounts through the setuid fusermount3. No
+# ProtectSystem: nothing here updates itself (apt and dnf do). Restart every
+# 10 s: a `theca run` refused because the app holds the state (exit 1) starts
+# by itself once the app closes, and systemd's burst limit (5 in 10 s) never
+# trips. A signed-out account doesn't end `theca run`, so no exit code needs
+# special care.
+[Unit]
+Description=Theca, keeping %i's folders identical to their libraries
+Documentation=https://theca.rs/computer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=%i
+ExecStart=/usr/bin/theca run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -18,6 +18,20 @@ use sqlx::Connection;
 /// the first and exits (its test's window gone).
 static ONE_APP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// A config folder of the tests' own, for every app they start. The app turns
+/// autostart on for a fresh state (a fresh install): its entry in a
+/// developer's own `~/.config/autostart` would start a debug build, on no
+/// state of its own, at their next login (the keychain rule: tests never touch
+/// a developer's). One folder for the run, left in the temp folder.
+fn config_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("theca-app-tests-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    })
+}
+
 /// `tauri-driver`, killed when dropped.
 struct Driver(Child);
 
@@ -51,6 +65,7 @@ async fn app_from(
     let driver = Driver(
         Command::new("tauri-driver")
             .args(["--port", &port.to_string()])
+            .env("XDG_CONFIG_HOME", config_home())
             .envs(env.iter().copied())
             .stdout(Stdio::null())
             .spawn()
@@ -229,6 +244,7 @@ async fn sign_in_sync_and_an_error() {
     // C19: launched again on its state, it hands over to the running app
     // (whose window comes forward) and exits, instead of failing on the lock.
     let again = Command::new(env!("CARGO_BIN_EXE_theca"))
+        .env("XDG_CONFIG_HOME", config_home())
         .arg("--state")
         .arg(dir.path().join("state.sqlite"))
         .status()
@@ -383,6 +399,183 @@ async fn the_first_step_later_adds_nothing() {
         theca::state::NewLibraries::Notify
     );
     client.close().await.unwrap();
+}
+
+/// The app started at login (`--background`) while `theca run` (the service)
+/// holds its state: it says so in one notification and ends non-zero, instead
+/// of vanishing with a line on an error output nobody reads. Started by hand
+/// (no `--background`) it keeps that line and notifies nothing. The session
+/// bus's notifications are read with `dbus-monitor`, which sees a call even
+/// where no notification daemon answers it (as here).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_background_app_says_when_a_daemon_holds_its_state() {
+    let _one = ONE_APP.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state.sqlite");
+    // What holds a state while `theca run` runs: its lock.
+    let _held = theca::lock(&state).unwrap();
+    let seen = dir.path().join("notifications");
+    let mut monitor = Command::new("dbus-monitor")
+        .args([
+            "--session",
+            "interface='org.freedesktop.Notifications',member='Notify'",
+        ])
+        .stdout(std::fs::File::create(&seen).unwrap())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("dbus-monitor (the CI image has it)");
+    // It prints once it is a monitor: nothing sent before is missed.
+    wait_until("the monitor is listening", || {
+        std::fs::read_to_string(&seen).is_ok_and(|s| !s.is_empty())
+    });
+    let run = |args: &[&str]| {
+        let mut app = Command::new(env!("CARGO_BIN_EXE_theca"))
+            .arg("--state")
+            .arg(&state)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = app.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "the app kept running");
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let mut said = String::new();
+        std::io::Read::read_to_string(&mut app.stderr.take().unwrap(), &mut said).unwrap();
+        (status, said)
+    };
+    let notifications = || {
+        std::fs::read_to_string(&seen)
+            .unwrap()
+            .matches("member=Notify")
+            .count()
+    };
+
+    let (status, said) = run(&["--background"]);
+    assert!(!status.success(), "the app started on a held state");
+    assert!(said.contains("already running"), "{said}");
+    wait_until("the notification", || notifications() == 1);
+    let text = std::fs::read_to_string(&seen).unwrap();
+    assert!(text.contains("already syncing this state"), "{text}");
+
+    // By hand: the line on the error output, and no notification.
+    let (status, said) = run(&[]);
+    assert!(!status.success());
+    assert!(said.contains("already running"), "{said}");
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(notifications(), 1, "a second notification");
+    let _ = monitor.kill();
+    let _ = monitor.wait();
+}
+
+/// The app on `state`, with `home` for its home (where Linux's autostart
+/// entry goes), killed when dropped.
+struct Launched(Child);
+
+impl Launched {
+    fn new(home: &std::path::Path, state: &std::path::Path) -> Self {
+        Self(
+            Command::new(env!("CARGO_BIN_EXE_theca"))
+                .arg("--state")
+                .arg(state)
+                .env("HOME", home)
+                .env_remove("XDG_CONFIG_HOME")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+}
+
+impl Drop for Launched {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// The autostart entries under `home` (what the app's switch writes on Linux).
+fn autostart_entries(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(home.join(".config/autostart"))
+        .map(|dir| dir.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default()
+}
+
+/// Whether the app recorded that it decided about autostart (a row of the
+/// state's `setting` table).
+fn autostart_decided(state: &std::path::Path) -> bool {
+    rusqlite::Connection::open(state)
+        .and_then(|db| {
+            db.query_row(
+                "SELECT COUNT(*) FROM setting WHERE key = 'autostart_decided'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+        })
+        .is_ok_and(|rows| rows == 1)
+}
+
+/// A fresh install's first launch turns the switch on, once: the entry starts
+/// the app with `--background`, and one the user then removes (the switch
+/// turned off) doesn't come back at the next launch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_install_starts_at_login_and_stays_as_the_user_leaves_it() {
+    let _one = ONE_APP.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    let state = home.path().join("state.sqlite");
+    {
+        let _app = Launched::new(home.path(), &state);
+        wait_until("the autostart entry", || {
+            !autostart_entries(home.path()).is_empty()
+        });
+        wait_until("the decision recorded", || autostart_decided(&state));
+        let entries = autostart_entries(home.path());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let entry = std::fs::read_to_string(&entries[0]).unwrap();
+        assert!(entry.contains("--background"), "{entry}");
+        // The user turns it off.
+        std::fs::remove_file(&entries[0]).unwrap();
+    }
+    let _app = Launched::new(home.path(), &state);
+    wait_until("the app running again", || theca::lock(&state).is_err());
+    // Its setup is done well within this.
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        autostart_entries(home.path()).is_empty(),
+        "autostart came back after the user turned it off"
+    );
+}
+
+/// An upgrade (an account already, no row yet) is left as it is: not turned
+/// on behind the user's back, and the decision recorded all the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upgrade_does_not_turn_autostart_on() {
+    let _one = ONE_APP.lock().await;
+    let w = world().await;
+    let (_dir, state, _account) = w.logged_in("upgrade").await;
+    let home = tempfile::tempdir().unwrap();
+    let _app = Launched::new(home.path(), &state);
+    wait_until("the decision recorded", || autostart_decided(&state));
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        autostart_entries(home.path()).is_empty(),
+        "autostart turned on for a state with an account"
+    );
+}
+
+/// Polls `done` for 10 s, then fails with `what`.
+fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "never happened: {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// An app that doesn't update itself (the .deb): its version, no update
@@ -554,6 +747,7 @@ mod self_update {
         assert!(off.status.success());
         let mut app = Command::new(&r.appimage)
             .env("APPIMAGE", &r.appimage)
+            .env("XDG_CONFIG_HOME", config_home())
             .arg("--state")
             .arg(&state)
             .arg("--background")
@@ -704,6 +898,7 @@ mod self_update {
         theca::update::set_mode(&s, theca::update::Mode::Auto).unwrap();
         let mut app = Command::new(&r.appimage)
             .env("APPIMAGE", &r.appimage)
+            .env("XDG_CONFIG_HOME", config_home())
             .arg("--state")
             .arg(&state)
             .args(["--manifest", &r.manifest, "--background"])

@@ -1,7 +1,7 @@
 # The app and macOS's File Provider extension (fileprovider/: every unsafe
 # call there).
 [workspace]
-members = ["fileprovider"]
+members = ["fileprovider", "winservice"]
 
 [package]
 name = "theca"
@@ -76,6 +76,12 @@ apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
 cloud-filter = "0.0.7"
 nt-time = "0.15"
 windows-native-keyring-store = "1.1.0"
+# Windows' service (`theca run --service`, `theca service on`): its `unsafe`
+# lives in winservice/, the rest is windows-service's safe API.
+theca-winservice = { version = "1.2.0", path = "winservice" }
+windows-service = "0.8.1"
+# The Windows password `theca service on` asks for, not shown.
+rpassword = "7.5.5"
 # The CLI archive is a .zip here, a .tar.gz elsewhere.
 zip = { version = "9.5.1", default-features = false, features = ["deflate"] }
 

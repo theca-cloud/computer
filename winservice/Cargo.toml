@@ -1,0 +1,26 @@
+[package]
+name = "theca-winservice"
+version = "1.2.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+
+# Windows' service for `theca run --service` and `theca service on`: the two
+# things that need `unsafe` (the "Log on as a service" right, and the service
+# dispatcher's entry point, which `windows-service`'s macro expands to unsafe
+# code), so `theca` keeps `forbid(unsafe_code)`. The rest of the service
+# (creating it, its recovery actions) is `windows-service`'s safe API, used by
+# `theca`. Empty on other systems.
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8.1"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

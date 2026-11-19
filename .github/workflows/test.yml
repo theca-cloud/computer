@@ -11,6 +11,14 @@ on:
     # As Woodpecker: nothing built or tested changed.
     paths-ignore: ["**/*.md", LICENSE, .gitignore, cliff.toml]
   workflow_dispatch:
+    inputs:
+      # By hand only: the tests whose names match (`scripts/ci.sh test
+      # <filter>`), to run a runner-only test alone: a drive test that failed
+      # first stops the run before the tests of the binaries after it.
+      filter:
+        description: "Only the tests whose names match (empty: all)"
+        required: false
+        default: ""
   # release.yml, on the version tag.
   workflow_call:
 
@@ -61,12 +69,17 @@ jobs:
       # The tests' app passwords in the real OS keychain where the runner has
       # one that never prompts (macOS, Windows); Linux runners have no Secret
       # Service: the in-memory one (tests/common, keychain()).
-      - run: scripts/ci.sh test
+      - run: scripts/ci.sh test "$FILTER"
         env:
+          # An input, never written into the script itself.
+          FILTER: ${{ github.event.inputs.filter }}
           THECA_TEST_KEYCHAIN: ${{ runner.os != 'Linux' && 'os' || 'mock' }}
           # Every OS's drive backend is there: its scenarios fail rather than
           # skip (Linux FUSE, Windows Cloud Files, macOS's installed app).
           THECA_TEST_DRIVE: "1"
+          # The Windows runner is an administrator: tests/service_windows.rs
+          # makes a local user and a service on it (skipped elsewhere).
+          THECA_TEST_WINDOWS_SERVICE: ${{ runner.os == 'Windows' && '1' || '' }}
           THECA_TEST_MAC_APP: ${{ runner.os == 'macOS' && '/Applications/Theca.app' || '' }}
           THECA_TEST_MATERIALIZE: ${{ runner.os == 'macOS' && format('{0}/target/debug/theca-materialize', github.workspace) || '' }}
       # Why the macOS drive failed: its extension's and the system's logs.

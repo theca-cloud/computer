@@ -26,9 +26,18 @@ overrides:
   deb:
     replaces:
       - theca
+# The unit theca@.service, and what the package does about the daemons running
+# from it (ci/packages/postinst.sh, prerm.sh, postrm.sh: one script each for
+# the .deb's and the .rpm's arguments; the unit's own comments say why).
+scripts:
+  postinstall: ci/packages/postinst.sh
+  preremove: ci/packages/prerm.sh
+  postremove: ci/packages/postrm.sh
 contents:
   - src: target/cli-pkg/release/theca
     dst: /usr/bin/theca
+  - src: ci/packages/theca@.service
+    dst: /usr/lib/systemd/system/theca@.service
   - src: ci/packages/theca.sources
     dst: /etc/apt/sources.list.d/theca.sources
     packager: deb

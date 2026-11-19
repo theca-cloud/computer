@@ -115,6 +115,52 @@ A library can be a **drive** instead of a synced folder: your file manager shows
 - **Removing a drive** moves the edits not uploaded yet to `<default folder>/<library> (not uploaded)`, never deleted; everything else goes (it is on the server). Uninstalling Theca on Windows removes its drives first, the same way.
 - **On Linux, a file saved into the drive's folder while Theca wasn't running** (so not into the drive) stops the drive until you move it out; the drive then comes back by itself.
 
+## Starting with the computer
+
+A computer that restarts keeps syncing without anyone opening Theca: the app starts at login on a desktop, a service runs the CLI on a server.
+
+**The app.** A fresh install turns **Start at login** on at its first launch, once; it is a switch in the app's window, and one you turn off stays off. An upgrade doesn't turn it on for you. Started at login, the app stays in the tray, with no window.
+
+**A Linux server.** The `theca-cli` package (apt, dnf) ships a systemd unit, `theca@<user>`, that runs `theca run` as that user at boot, with their state and folders, never as root, whether or not they are logged in:
+
+```sh
+theca login https://cloud.example.com --no-keyring   # a service can't reach a desktop's keychain
+theca add Documents
+sudo systemctl enable --now theca@$USER
+```
+
+`theca login` ends by printing that last line when it fits (it names you, not root, under `sudo`). `systemctl status theca@<user>` and `journalctl -u theca@<user>` say how it runs, `theca logs` what it does. The packages restart the running services when they upgrade and stop them when removed. A service restarts itself 10 seconds after a failure, so one that was refused because the app holds the state starts by itself once the app quits. On a desktop use the app: it and a service can't sync one state at once, and an app started at login says so in a notification when a service holds it. With the `.tar.gz` archive, which has no unit, save this as `/etc/systemd/system/theca@.service` (and put `theca` at `/usr/bin/theca`, or change `ExecStart`):
+
+```ini
+[Unit]
+Description=Theca, keeping %i's folders identical to their libraries
+Documentation=https://theca.rs/computer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=%i
+ExecStart=/usr/bin/theca run
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+A drive under the service isn't tried yet: use synced folders on a server.
+
+**A Windows server.** In a terminal opened **as administrator**, with the account logged in the same way (`theca login <instance> --no-keyring`, then `theca add`):
+
+```sh
+theca service on     # asks for your Windows password, once; Theca doesn't keep it
+theca service off    # stops the service and removes it
+```
+
+`theca service on` registers a Windows service, `theca-<your user name>`, that starts with Windows, runs `theca run` as you (your folders and state) and restarts after a failure. `--account <name>` registers another user's account, and `theca --state <file> service on` runs the service on that state file. Windows' own **Services** window shows and stops it. Like the Linux unit it can't share a state with the app: use one or the other. Run it again to change the password or the binary: the service is stopped, changed and started. The service runs the `theca.exe` that registered it, as the account. For an **administrator's** account `theca service on` refuses unless that file is under Program Files, where only administrators can write: otherwise any program of yours could replace a `theca.exe` under your own profile and have it run with your full rights at the next start. Copy it to `C:\Program Files\Theca\` and run `theca service on` from there. A standard account can run it from anywhere. A wrong password is refused at once.
+
+**A Mac** needs nothing more than the app at login: there is no service for the CLI.
+
 ## CLI use
 
 ```sh
@@ -127,7 +173,7 @@ theca status                            # what syncs, what it's doing, errors
 
 A login adds no library: it lists them with the `theca add` lines to choose with. What libraries new to the account later do is `--new-libraries`: `silent` by default (listed only, `theca libraries`), `sync` (up to the size limit), or `drive`.
 
-Every command and its options: `theca --help`, `theca <command> --help`. The commands: `login`, `accounts`, `account` (an account's default folder, and what libraries new to it do: `--new-libraries sync|drive|notify|silent`, `--auto-sync-limit 2GB`, 0 for no limit), `remove-account`, `libraries`, `add`, `remove`, `pause`, `resume`, `locate` (a folder moved or on another disk), `status`, `undo` (restores what the last deletion moved to the trash), `run`, `logs`, `update` and `updates` (above); for drives, `keep`, `free`, `drive-limit`. A script logs in without a browser with an app password made in the web app: `THECA_TOKEN=… theca login <instance>`.
+Every command and its options: `theca --help`, `theca <command> --help`. The commands: `login`, `accounts`, `account` (an account's default folder, and what libraries new to it do: `--new-libraries sync|drive|notify|silent`, `--auto-sync-limit 2GB`, 0 for no limit), `remove-account`, `libraries`, `add`, `remove`, `pause`, `resume`, `locate` (a folder moved or on another disk), `status`, `undo` (restores what the last deletion moved to the trash), `run`, `service` (Windows: `on`, `off`, above), `logs`, `update` and `updates` (above); for drives, `keep`, `free`, `drive-limit`. A script logs in without a browser with an app password made in the web app: `THECA_TOKEN=… theca login <instance>`.
 
 One `theca run`, or the app, syncs a state file at a time: a second one refuses to start. `run` stops within a few seconds on Ctrl-C or `SIGTERM`.
 

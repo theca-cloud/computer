@@ -167,6 +167,21 @@ rename. The check installs from the repositories in Debian 12, Ubuntu 24.04 and 
 dnf, where the two packages are told to replace each other with `--allowerasing`), refuses a
 repository signed by another key and a package that isn't the one the index lists.
 
+**The daemon as a service**, on every run. Linux: `release.yml`'s `service-check` job runs
+`scripts/ci.sh service` on this run's `theca-cli` `.deb` (`tests/service.rs`): a Debian 12
+booted with systemd (a privileged container; the runner's Docker allows it, assumed until a run
+shows it) installs it, enables `theca@tester` against the test server, and the unit runs as the
+user and syncs both ways, an upgrade restarts it, a second `theca run` is refused, one refused
+beside another process starts once that one ends, and removing the package stops it. By hand
+here: `scripts/ci.sh service` builds the package (`ci/cli-package.sh`, which `ci/package.sh`
+uses too) and needs Docker and the test Postgres; `THECA_TEST_SERVICE_IMAGE=debian:13` is the
+base for a package built on a newer system than Ubuntu 22.04 (its glibc is newer than Debian
+12's). Windows: `test.yml`'s Windows run sets `THECA_TEST_WINDOWS_SERVICE`, so
+`tests/service_windows.rs` makes a local user (`net user`) and registers `theca-<user>` for it
+with `theca service on`, then removes both: the runner is an administrator. Not covered: a
+self-update under the service, and the app password in Credential Manager (the test keeps it
+in the state file).
+
 **The channels** `release.yml` doesn't host: on every run `cask-check`, `aur-check` and
 `winget-check` build the file and check it (`ci/cask.sh`, `ci/aur.sh`, `ci/winget.sh`: a cask
 installed by `brew` on a Mac runner, `theca-bin` by `makepkg` in Arch's container, winget's

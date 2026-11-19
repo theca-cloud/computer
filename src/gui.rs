@@ -175,7 +175,20 @@ pub fn run(
             // Taken here, once the single-instance plugin had its turn: a
             // second launch hands over to the running app (its window comes
             // forward) instead of failing on the lock.
-            app.manage(Lock(crate::lock(&state_path)?));
+            let lock = match crate::lock(&state_path) {
+                Ok(lock) => lock,
+                Err(e) => {
+                    // Started at login, nobody reads the error output: a
+                    // `theca run` (the service) that syncs this state is said
+                    // in a notification. Any other failure (a lock file that
+                    // can't be made) isn't that, and is left to the error.
+                    if background && e.kind() == std::io::ErrorKind::WouldBlock {
+                        say_a_daemon_holds_the_state(app.handle());
+                    }
+                    return Err(e.into());
+                }
+            };
+            app.manage(Lock(lock));
             let handle = app.handle().clone();
             #[cfg(feature = "self-update")]
             keep_updated(&handle, stopped.clone());
@@ -193,6 +206,7 @@ pub fn run(
             refresh_tray(&handle);
             notify_stops(&handle);
             let first_launch = state(&handle).accounts().map_or(true, |a| a.is_empty());
+            decide_autostart(&handle, !first_launch);
             if !background || first_launch {
                 open_window(&handle);
             } else {
@@ -887,6 +901,68 @@ fn summary(
     }
 }
 
+/// The `setting` row saying the app already decided about starting at login.
+const AUTOSTART_DECIDED: &str = "autostart_decided";
+
+#[derive(Debug, PartialEq, Eq)]
+enum Autostart {
+    Enable,
+    Leave,
+}
+
+/// What the app does about starting at login, once per state: turned on only
+/// by a fresh install's first launch (no account yet), so a user upgrading
+/// keeps what they have, and one who turns it off stays off.
+fn autostart_rule(decided: bool, has_account: bool) -> Autostart {
+    if decided || has_account {
+        Autostart::Leave
+    } else {
+        Autostart::Enable
+    }
+}
+
+/// Applies `autostart_rule` at launch, and records that it was decided. A
+/// failure to turn it on (no autostart folder, say) is logged and the row is
+/// not written, so the next launch tries again.
+fn decide_autostart(app: &AppHandle, has_account: bool) {
+    use tauri_plugin_autostart::ManagerExt;
+    let state = state(app);
+    let decided = match state.setting(AUTOSTART_DECIDED) {
+        Ok(row) => row.is_some(),
+        Err(e) => {
+            tracing::warn!("autostart: the state can't be read ({e})");
+            return;
+        }
+    };
+    if autostart_rule(decided, has_account) == Autostart::Enable
+        && let Err(e) = app.autolaunch().enable()
+    {
+        tracing::warn!("autostart: not turned on ({e})");
+        return;
+    }
+    if !decided && let Err(e) = state.set_setting(AUTOSTART_DECIDED, "1") {
+        tracing::warn!("autostart: not recorded ({e})");
+    }
+}
+
+/// The app, started at login, can't take the state's lock: `theca run` holds
+/// it (a second app would have handed over to the first, `single_instance`).
+/// The app ends right after, and the plugin sends a notification on a task of
+/// its own: it is given a moment to leave.
+fn say_a_daemon_holds_the_state(app: &AppHandle) {
+    use tauri_plugin_notification::NotificationExt;
+    let sent = app
+        .notification()
+        .builder()
+        .title("Theca is already running")
+        .body("`theca run` is already syncing this state: stop it to use the app.")
+        .show();
+    if let Err(e) = sent {
+        tracing::info!("no notification ({e})");
+    }
+    std::thread::sleep(std::time::Duration::from_secs(1));
+}
+
 /// Check for updates… in the tray: what it found, said by a notification.
 #[cfg(feature = "self-update")]
 fn checked_from_tray(app: &AppHandle, checked: Answer<Updates>) {
@@ -1469,6 +1545,17 @@ fn quit(app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a fresh install gets autostart turned on, once: an upgrade (an
+    /// account, no row yet) is left as the user has it, and nothing decided
+    /// twice, so a user who turned it off stays off.
+    #[test]
+    fn only_a_fresh_install_turns_autostart_on() {
+        assert_eq!(autostart_rule(false, false), Autostart::Enable);
+        assert_eq!(autostart_rule(false, true), Autostart::Leave);
+        assert_eq!(autostart_rule(true, false), Autostart::Leave);
+        assert_eq!(autostart_rule(true, true), Autostart::Leave);
+    }
 
     fn account(signed_out: bool) -> crate::state::Account {
         crate::state::Account {

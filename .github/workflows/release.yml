@@ -166,6 +166,31 @@ jobs:
           path: repository/repository.tar.gz
           if-no-files-found: error
 
+  # The daemon as a Linux service (tests/service.rs): this run's theca-cli
+  # .deb installed on a Debian 12 booted with systemd, enabled as
+  # `theca@<user>`, syncing against the test server, upgraded, refused beside
+  # a second `theca run`, removed. On every run, a manual one included. Its
+  # container is privileged (systemd as PID 1): the runner's Docker allows it
+  # (tried on a developer's Docker; assumed here until a run shows it).
+  service-check:
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: Swatinem/rust-cache@v2.9.3
+      # The test server's Postgres, as test.yml's Linux runs it.
+      - name: Postgres
+        run: scripts/dev.sh
+      - name: The service
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          THECA_TEST_DEB="$PWD/dist/theca-cli-$version-linux-x86_64.deb" scripts/ci.sh service
+
   # The channels we don't host (wiki: Releases). On every run, a manual one
   # included, each builds its file from this run's packages and checks it,
   # publishing nothing: the cask installed by Homebrew, `theca-bin` by makepkg
@@ -228,7 +253,7 @@ jobs:
 
   release:
     if: github.ref_type == 'tag'
-    needs: [manifest, repository, cask-check, aur-check, winget-check]
+    needs: [manifest, repository, service-check, cask-check, aur-check, winget-check]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

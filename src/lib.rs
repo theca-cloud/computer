@@ -11,6 +11,8 @@ pub mod local;
 pub mod logs;
 pub mod ops;
 pub mod plan;
+#[cfg(windows)]
+pub mod service;
 pub mod state;
 pub mod update;
 
@@ -55,12 +57,17 @@ pub fn lock(state: &std::path::Path) -> std::io::Result<std::fs::File> {
     let mut name = state.file_name().unwrap_or_default().to_owned();
     name.push(".lock");
     let lock = std::fs::File::create(state.with_file_name(name))?;
-    if lock.try_lock().is_err() {
-        return Err(std::io::Error::other(
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        // WouldBlock, told from the file that can't be made and from a
+        // filesystem that can't lock: the app says a service holds the state
+        // only for this one (gui.rs).
+        Err(std::fs::TryLockError::WouldBlock) => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
             "theca is already running on this state (the app, or `theca run`)",
-        ));
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
     }
-    Ok(lock)
 }
 
 #[cfg(test)]
@@ -76,5 +83,22 @@ mod tests {
         std::fs::write(&state, b"state").unwrap();
         let _x = super::lock(&state).unwrap();
         assert_eq!(std::fs::read(&state).unwrap(), b"state");
+    }
+
+    /// A state another process holds is `WouldBlock`; a lock file that can't
+    /// be made is not: the app says "`theca run` is syncing this state" for
+    /// the first only.
+    #[test]
+    fn a_held_state_is_told_from_a_lock_that_cant_be_made() {
+        use std::io::ErrorKind;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state.sqlite");
+        let _held = super::lock(&state).unwrap();
+        let held = super::lock(&state).unwrap_err();
+        assert_eq!(held.kind(), ErrorKind::WouldBlock, "{held}");
+        assert!(held.to_string().contains("already running"), "{held}");
+        // No folder to make the lock file in.
+        let missing = super::lock(&dir.path().join("none/state.sqlite")).unwrap_err();
+        assert_ne!(missing.kind(), ErrorKind::WouldBlock, "{missing}");
     }
 }

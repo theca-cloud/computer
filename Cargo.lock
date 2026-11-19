@@ -5797,6 +5797,7 @@ dependencies = [
  "proptest",
  "renamore",
  "reqwest",
+ "rpassword",
  "rusqlite",
  "rustix",
  "rustls",
@@ -5817,6 +5818,7 @@ dependencies = [
  "theca-client",
  "theca-common",
  "theca-fileprovider",
+ "theca-winservice",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -5824,6 +5826,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows-native-keyring-store",
+ "windows-service",
  "zbus-secret-service-keyring-store",
  "zip",
 ]
@@ -5886,6 +5889,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "theca-winservice"
+version = "1.2.0"
+dependencies = [
+ "windows-service",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6963,6 +6974,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "windows-service"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "857224b3b211c6f3616921f081ee54721ee3ad2ace2fac6a6337e032f7b4dcf2"
+dependencies = [
+ "bitflags 2.13.2",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

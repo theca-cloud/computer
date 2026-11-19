@@ -11,15 +11,21 @@
 #   app   the app driven through its window (Linux: tauri-driver, under a
 #         virtual screen; the CI image has them)
 #   deny  licenses, advisories, sources (Rust and the page's npm packages)
+#   service  (not in `all`: it needs Docker and a privileged container, so
+#         GitHub's runner and a developer's machine, not Woodpecker) the
+#         theca-cli package installed on a systemd machine, the daemon run as
+#         `theca@<user>` (tests/service.rs); THECA_TEST_DEB names a package
+#         already built, else it is built here (ci/cli-package.sh). Needs the
+#         test Postgres, as `test` does.
 set -eu
 cd "$(dirname "$0")/.."
 
 step=${1:-all}
 filter=${2:-}
 case "$step" in
-    all | lint | test | app | deny) ;;
+    all | lint | test | app | deny | service) ;;
     *)
-        echo "usage: scripts/ci.sh [lint|test [<filter>]|app|deny]" >&2
+        echo "usage: scripts/ci.sh [lint|test [<filter>]|app|deny|service]" >&2
         exit 2
         ;;
 esac
@@ -121,6 +127,8 @@ if [ "$step" = all ] || [ "$step" = lint ]; then
     # macOS's File Provider extension and calls (a stub elsewhere: its
     # protocol is still checked).
     cargo clippy -p theca-fileprovider --all-targets -- -D warnings
+    # Windows' service (empty elsewhere: linted for real on the Windows runner).
+    cargo clippy -p theca-winservice --all-targets -- -D warnings
     # The app: its page (formatting, lint, types), built, then embedded in the
     # `gui` build, linted too (needs WebKitGTK on Linux).
     [ -d ui/node_modules ] || npm --prefix ui ci
@@ -152,6 +160,21 @@ if [ "$step" = all ] || [ "$step" = test ]; then
         tests --features self-update --lib update:: || exit
         tests --features self-update --test update with_the_feature || exit
     fi
+fi
+if [ "$step" = service ]; then
+    server
+    if [ -z "${THECA_TEST_DEB:-}" ]; then
+        version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+        case $(uname -m) in
+        x86_64) arch=x86_64 ;;
+        aarch64 | arm64) arch=arm64 ;;
+        esac
+        ci/cli-package.sh "$version" "$arch" target/service-check theca-cli deb
+        THECA_TEST_DEB=$PWD/target/service-check/theca-cli.deb
+    fi
+    export THECA_TEST_DEB
+    # Required here: a missing Docker or package fails, not skips.
+    THECA_TEST_SERVICE=1 tests --test service || exit
 fi
 # Only Linux has a WebDriver for WebKit: elsewhere, `all` skips it, and the app
 # is checked by hand (the sprint's checklist).

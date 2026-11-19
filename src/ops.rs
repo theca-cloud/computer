@@ -71,6 +71,27 @@ pub fn device_name() -> String {
         .to_owned()
 }
 
+/// What `theca login` ends by saying, to keep syncing at boot without anyone
+/// opening Theca (`os`: `std::env::consts::OS`). Linux: the `systemctl` line
+/// for the user (who ran it, or `sudo`'s caller), but only when the app
+/// password is in the state file: a system service can't reach a desktop's
+/// keychain, so it would be signed out. Windows: the service's command, whose
+/// password the user gives it; the app password is in Credential Manager, which
+/// a service run as that user reaches (assumed, `theca service on`'s test).
+/// macOS: nothing (the app starts at login, and has no headless build).
+pub fn service_hint(os: &str, password_in_state: bool, user: Option<&str>) -> Option<String> {
+    match os {
+        "linux" if password_in_state => user.map(|user| {
+            format!("To keep syncing at boot, run: sudo systemctl enable --now theca@{user}")
+        }),
+        "windows" => Some(
+            "To keep syncing at boot, run in a terminal opened as administrator: theca service on"
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
 /// The default folder proposed for a new account: `~/theca` for the first,
 /// `~/theca-<instance host>` once that one is taken.
 pub fn proposed_folder(state: &State, instance: &str) -> Result<PathBuf> {
@@ -1101,6 +1122,27 @@ pub fn find_account(state: &State, which: Option<&str>) -> Result<Account> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The line `login` ends with, per OS and where the app password is: only
+    /// a state file's password can serve a Linux service; none on a Mac.
+    #[test]
+    fn login_says_how_to_keep_syncing_at_boot() {
+        assert_eq!(
+            service_hint("linux", true, Some("alice")).as_deref(),
+            Some("To keep syncing at boot, run: sudo systemctl enable --now theca@alice")
+        );
+        // The keychain: a system service couldn't reach it.
+        assert_eq!(service_hint("linux", false, Some("alice")), None);
+        // Nobody to name.
+        assert_eq!(service_hint("linux", true, None), None);
+        // Windows: always, whatever holds the password.
+        for in_state in [true, false] {
+            let said = service_hint("windows", in_state, None).expect("a Windows hint");
+            assert!(said.ends_with("theca service on"), "{said}");
+        }
+        assert_eq!(service_hint("macos", true, Some("alice")), None);
+        assert_eq!(service_hint("macos", false, Some("alice")), None);
+    }
 
     /// A server older than the minimum, or whose version can't be read, is
     /// refused; a release candidate of a newer one is not.

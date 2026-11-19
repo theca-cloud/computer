@@ -78,7 +78,10 @@ apt-get -qq update >/dev/null
 apt-get -qq install -y gnupg ca-certificates >/dev/null
 gpg --dearmor </check/signer.asc >/usr/share/keyrings/test.gpg
 use() { echo "deb [signed-by=/usr/share/keyrings/test.gpg] http://127.0.0.1:$1/deb stable main" >/etc/apt/sources.list.d/test.list; }
-installed() { dpkg -s "$1" >/dev/null 2>&1; }
+# Installed, not just known: a package with a postrm (theca-cli's) stays in
+# dpkg's database as `rc` (config-files) once removed, and `dpkg -s` is then
+# still 0.
+installed() { [ "$(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null)" = "ii " ]; }
 say() { echo "ok: $*"; }
 no() { echo "FAIL: $*" >&2; exit 1; }
 has_files() { [ -e /etc/apt/sources.list.d/theca.sources ] && [ -e /usr/share/keyrings/theca.gpg ]; }
