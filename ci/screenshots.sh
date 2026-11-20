@@ -29,6 +29,10 @@ demo=https://demo.theca.rs
 demo_email=demo@theca.rs
 demo_password=thecademo
 jar=$(mktemp)
+# curl is a native Windows program there, and MSYS2_ARG_CONV_EXCL leaves
+# /tmp/… as it is: it can't write its cookie, and the app password's request
+# has no session (401). Tried on windows-2025.
+if [ "$os" = windows ]; then jar=$(cygpath -m "$jar"); fi
 app_password_id=
 theca=
 mkdir -p shots
@@ -208,6 +212,8 @@ status=$(wait_synced)
 # The drive's folder, from the line `theca status` gives it: `  Photos  <path>  up to date…`.
 drive=$(awk -F'  ' '$2 == "Photos" { print $3 }' <<<"$status")
 [ -n "$drive" ] || { echo "no Photos folder in theca status:" >&2; echo "$status" >&2; exit 1; }
+# `theca status` answers from the state: the window may still be loading.
+sleep 10
 shot app
 show "$HOME/theca"
 shot folders
