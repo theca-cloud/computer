@@ -66,7 +66,7 @@ PublisherUrl: https://theca.rs
 PackageName: Theca
 PackageUrl: https://theca.rs/computer
 License: AGPL-3.0-only
-LicenseUrl: https://github.com/theca-cloud/computer/blob/prod/LICENSE
+LicenseUrl: https://github.com/theca-cloud/computer/blob/main/LICENSE
 ShortDescription: Folders kept identical to Theca libraries, or libraries as drives.
 Moniker: theca
 Tags:

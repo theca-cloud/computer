@@ -14,6 +14,14 @@ From the channel your system already uses, which keeps Theca up to date too ([Up
 | Fedora | our dnf repository: `theca` | our dnf repository: `theca-cli` |
 | Other Linux (Arch too) | the `.AppImage` ([direct downloads](#direct-downloads)) | `theca-cli-<version>-linux-<arch>.tar.gz` |
 
+If Homebrew refuses our tap as untrusted (Homebrew 7 asks before loading a tap that isn't its own), trust it first:
+
+```sh
+brew tap theca-cloud/tap
+brew trust theca-cloud/tap
+brew install theca-cloud/tap/theca
+```
+
 ### Debian, Ubuntu: apt
 
 ```sh
