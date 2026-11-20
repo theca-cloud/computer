@@ -1,0 +1,125 @@
+# One-off, never merged: the Microsoft Store's screenshots, from the signed
+# 1.3.0 installer on a Windows runner, logged in to the public demo
+# (demo@theca.rs, the account theca.rs gives). Runs on a push of its branch.
+name: store-screenshot
+
+on:
+  push:
+    branches: [chore/store-screenshot]
+
+permissions:
+  contents: read
+
+jobs:
+  shot:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Screen at 1920x1080
+        run: |
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Display {
+              [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+              public struct DEVMODE {
+                  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+                  public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+                  public int dmFields, dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+                  public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+                  [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+                  public short dmLogPixels;
+                  public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+                  public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+              }
+              [DllImport("user32.dll")] public static extern bool EnumDisplaySettings(string d, int m, ref DEVMODE dm);
+              [DllImport("user32.dll")] public static extern int ChangeDisplaySettings(ref DEVMODE dm, int flags);
+              public static int Set(int w, int h) {
+                  var dm = new DEVMODE(); dm.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+                  EnumDisplaySettings(null, -1, ref dm);
+                  dm.dmPelsWidth = w; dm.dmPelsHeight = h; dm.dmFields = 0x80000 | 0x100000;
+                  return ChangeDisplaySettings(ref dm, 0);
+              }
+          }
+          '@
+          Write-Host "ChangeDisplaySettings: $([Display]::Set(1920, 1080)) (0: changed)"
+          Add-Type -AssemblyName System.Windows.Forms
+          Write-Host "screen: $([System.Windows.Forms.Screen]::PrimaryScreen.Bounds)"
+
+      - name: Install the signed 1.3.0
+        run: |
+          $ErrorActionPreference = 'Stop'
+          curl.exe -fsSL -o setup.exe https://github.com/theca-cloud/computer/releases/download/1.3.0/theca-1.3.0-windows-x86_64.exe
+          $sha = (Get-FileHash setup.exe -Algorithm SHA256).Hash
+          if ($sha -ne 'A4C57FD8D145A8AD88F8AC54D3795F526C5201B33F260CF2B786CA4F0503D459') { throw "not the release's installer: $sha" }
+          Start-Process -Wait -FilePath .\setup.exe -ArgumentList '/S'
+          $exe = Get-ChildItem $env:LOCALAPPDATA -Recurse -Depth 3 -Filter theca.exe | Where-Object FullName -match 'theca' | Select-Object -First 1
+          if (-not $exe) { throw 'no theca.exe under LOCALAPPDATA' }
+          & $exe.FullName --version
+          "THECA=$($exe.FullName)" >> $env:GITHUB_ENV
+
+      - name: Log in to the demo, add its libraries
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $demo = 'https://demo.theca.rs'
+          $s = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+          Invoke-RestMethod -Method Post -Uri "$demo/api/v1/auth/login" -WebSession $s -ContentType 'application/json' `
+            -Body '{"email":"demo@theca.rs","password":"thecademo"}' | Out-Null
+          $ap = Invoke-RestMethod -Method Post -Uri "$demo/api/v1/auth/app-passwords" -WebSession $s -ContentType 'application/json' `
+            -Body '{"name":"Microsoft Store screenshot (GitHub runner)"}'
+          Write-Host "::add-mask::$($ap.password)"
+          "APP_PASSWORD_ID=$($ap.app_password.id)" >> $env:GITHUB_ENV
+          $env:THECA_TOKEN = $ap.password
+          & $env:THECA login $demo --name 'Windows PC'
+          Remove-Item Env:THECA_TOKEN
+          & $env:THECA updates off
+          & $env:THECA add Documents
+          & $env:THECA add 'My files'
+          & $env:THECA add Photos --drive
+          & $env:THECA status
+
+      - name: The app's window
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Start-Process -FilePath $env:THECA
+          Start-Sleep -Seconds 45
+          & $env:THECA status
+          New-Item -ItemType Directory -Force shots | Out-Null
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          function Shot($name) {
+              $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+              $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+              $bmp.Save("shots\$name.png", [System.Drawing.Imaging.ImageFormat]::Png)
+              $g.Dispose(); $bmp.Dispose()
+              Write-Host "shots\$name.png: $($b.Width)x$($b.Height)"
+          }
+          Shot 'app'
+          Start-Process explorer.exe "$env:USERPROFILE\theca"
+          Start-Sleep -Seconds 10
+          Shot 'explorer'
+          Start-Process explorer.exe "$env:USERPROFILE\theca\Photos"
+          Start-Sleep -Seconds 10
+          Shot 'drive'
+
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: store-screenshots
+          path: shots/
+          if-no-files-found: warn
+
+      - name: Revoke the app password
+        if: always()
+        run: |
+          if (-not $env:APP_PASSWORD_ID) { exit 0 }
+          $demo = 'https://demo.theca.rs'
+          $s = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+          Invoke-RestMethod -Method Post -Uri "$demo/api/v1/auth/login" -WebSession $s -ContentType 'application/json' `
+            -Body '{"email":"demo@theca.rs","password":"thecademo"}' | Out-Null
+          Invoke-RestMethod -Method Delete -Uri "$demo/api/v1/auth/app-passwords/$env:APP_PASSWORD_ID" -WebSession $s | Out-Null
+          Write-Host 'revoked'
