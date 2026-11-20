@@ -182,6 +182,23 @@ with `theca service on`, then removes both: the runner is an administrator. Not 
 self-update under the service, and the app password in Credential Manager (the test keeps it
 in the state file).
 
+**The installed app in pictures** (theca/computer#96), on every run: `release.yml`'s `screenshots` job
+installs each OS's package from this run (Windows, macOS arm64, Linux x86_64: the `.exe`, the
+`.dmg`, the `.deb`), logs in to the public demo (`demo.theca.rs`, the account theca.rs shows
+everyone) with an app password made for the run and revoked after it, adds `Documents` and
+`My files` as synced folders and `Photos` as a drive, waits until all three are up to date, and
+takes `app.png` (the window), `folders.png` and `drive.png` (the file manager) with
+`ci/screenshots.sh`. Windows' screen is set to 1920×1080 (`ci/screenshots.ps1`), Linux gets a
+desktop (Xvfb and Xfce: the panel's tray and Thunar; not what most users run), macOS keeps its
+runner's 1024×768 and has its drive switched on the way `tests/mac_drive.rs` does. They stay on
+the run, as the artifacts `screenshots-<os>-<arch>`: the prefix keeps them off the GitHub release,
+which takes `{macos-*,windows-*,linux-*,…}` (so does each job that reads packages: a name like
+`windows-x86_64-screenshots` would put them in the packages). No job needs `screenshots`: a red one
+(the demo down) holds nothing back. Nothing compares the pictures: CLAUDE.md has the agent look at
+them after a release. By hand: `gh workflow run release.yml --ref <branch>`; `ci/screenshots.sh <os>
+<arch>` runs on a machine of that OS with the package in `dist/` (it installs the app and revokes
+its app password on exit).
+
 **The channels** `release.yml` doesn't host: on every run `cask-check`, `aur-check` and
 `winget-check` build the file and check it (`ci/cask.sh`, `ci/aur.sh`, `ci/winget.sh`: a cask
 installed by `brew` on a Mac runner, `theca-bin` by `makepkg` in Arch's container, winget's

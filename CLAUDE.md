@@ -44,6 +44,7 @@ Theca on computers (desktops, laptops, servers): one crate and binary, `theca` (
 - **CI in two systems** (ADR 0005): Woodpecker checks Linux on every push; GitHub Actions tests macOS, Windows and Linux arm64 from `dev`, and, on a tag, runs those tests again, then builds the packages and the release. Check GitHub with `gh run list -R theca-cloud/computer` (`ci/README.md`), not only `woodpecker-cli`.
 - **`dev` is mirrored to GitHub** (public) once Woodpecker's checks pass; feature branches stay on Gitea.
 - **`scripts/release.sh`** also checks GitHub's latest `dev` test run; the release itself (packages, GitHub release) happens on GitHub after the tag is pushed. No Gitea release.
+- **`/release` ends with a quick look at the screenshots** (`ci/README.md`, The installed app in pictures): once the tag's `release.yml` run has finished, download its `screenshots-*` artifacts (`gh run download <run> -R theca-cloud/computer -p 'screenshots-*'`), look at each picture (the app's window, the synced folders, the drive; Windows, macOS, Linux), and say in a few lines what looks wrong (a stray window, a missing icon, a library not up to date) or that nothing does, before drafting the Discord announcement. Not a gate: the release is out by then, and a red `screenshots` job (the demo down) is told, not fixed on the spot.
 
 Build, run and test commands: see the README.
 
