@@ -357,6 +357,55 @@ if [ "$os" != macos ]; then
     cp LICENSE README.md USING.md "$tmp/$cli/"
 fi
 
+# Windows: the app, started as Explorer starts a program, opens no console
+# window (theca/computer#95), and the CLI archive's theca.exe still is a
+# console program. A console program started without a console gets a
+# conhost.exe child (the window); a GUI one doesn't. The app is started on a
+# state of its own (a fresh one turns autostart on: only a runner, thrown away
+# after, or an install this script just made, sees the entry), and must have
+# its window (a WebView2 child: a fresh state shows it even with
+# --background); the CLI is checked by its PE header, because CI reads its
+# output through pipes, which a GUI program also fills: nothing else would see
+# the attribute reach it. $1: theca.exe as installed, $2: the CLI's.
+console_check() {
+    local state children subsystem
+    state=$(cygpath -w "$tmp/console-state.sqlite")
+    # No release looked for, no account needed: a setting.
+    "$1" --state "$state" updates off >/dev/null
+    children=$(THECA_CHECK_APP=$(cygpath -w "$1") THECA_CHECK_STATE=$state powershell -NoProfile -Command '
+        $p = Start-Process -PassThru -FilePath $env:THECA_CHECK_APP -ArgumentList "--state `"$env:THECA_CHECK_STATE`" --background"
+        Start-Sleep -Seconds 10
+        $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($p.Id)" | ForEach-Object { $_.Name })
+        taskkill /T /F /PID $p.Id | Out-Null
+        $kids -join " "' | tr -d '\r')
+    case " $children " in
+    *" conhost.exe "*)
+        echo "the installed app opens a console window (conhost.exe among its children: $children)" >&2
+        exit 1
+        ;;
+    esac
+    case " $children " in
+    *" msedgewebview2.exe "*) ;;
+    *)
+        echo "the installed app has no window of its own (children: ${children:-none})" >&2
+        exit 1
+        ;;
+    esac
+    # The 2-byte Subsystem field of the PE optional header (2: GUI, 3: console).
+    subsystem=$(python - "$(cygpath -w "$2")" <<'PY'
+import struct, sys
+with open(sys.argv[1], "rb") as f:
+    data = f.read(4096)
+pe = struct.unpack_from("<I", data, 0x3C)[0]
+assert data[pe:pe + 4] == b"PE\0\0", "not a PE file"
+print(struct.unpack_from("<H", data, pe + 24 + 68)[0])
+PY
+)
+    [ "$subsystem" = 3 ] ||
+        { echo "the CLI's theca.exe is subsystem $subsystem, not 3 (console): a terminal would show nothing of it" >&2; exit 1; }
+    echo "checked: the installed app opens no console window, the CLI's theca.exe is a console program"
+}
+
 # The uninstaller removes every drive first (ci/installer.nsh), but for an
 # upgrade: a drive put in the installed app's state (its folder holding a
 # file not uploaded) stays through an uninstall run in place, as an
@@ -444,6 +493,7 @@ windows)
     installed=$(find "$(cygpath "$LOCALAPPDATA")" -maxdepth 3 -ipath '*theca*/theca.exe' | head -1)
     [ -n "$installed" ] || { echo "the installer put no theca.exe under %LOCALAPPDATA%" >&2; exit 1; }
     check "$installed"
+    console_check "$installed" target/cli/release/theca.exe
     # Before uninstall_removes_drives removes them.
     if $signed; then
         authenticode "$installed"
