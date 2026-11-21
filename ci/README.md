@@ -191,10 +191,11 @@ takes `app.png` (the window), `folders.png` and `drive.png` (the file manager) w
 `ci/screenshots.sh`. Windows' screen is set to 1920×1080 (`ci/screenshots.ps1`), Linux gets a
 desktop (Xvfb and Xfce: the panel's tray and Thunar; not what most users run), macOS keeps its
 runner's 1024×768 and has its drive switched on the way `tests/mac_drive.rs` does. They stay on
-the run, as the artifacts `screenshots-<os>-<arch>`: the prefix keeps them off the GitHub release,
-which takes `{macos-*,windows-*,linux-*,…}` (so does each job that reads packages: a name like
-`windows-x86_64-screenshots` would put them in the packages). No job needs `screenshots`: a red one
-(the demo down) holds nothing back. Nothing compares the pictures: CLAUDE.md has the agent look at
+the run, as the artifacts `screenshots-<os>-<arch>`: the GitHub release, `manifest`, `repository` and
+`service-check` take the package artifacts by name (`THECA_PACKAGES`, `release.yml`'s `env`, to
+extend with the matrix), never by a glob, so neither a picture nor anything else the job uploads
+(it opens the public demo's files in a file manager) can end up in a release or in the signed
+repository's index. No job needs `screenshots`: a red one (the demo down) holds nothing back. Nothing compares the pictures: CLAUDE.md has the agent look at
 them after a release. By hand: `gh workflow run release.yml --ref <branch>`; `ci/screenshots.sh <os>
 <arch>` runs on a machine of that OS with the package in `dist/` (it installs the app and revokes
 its app password on exit).
