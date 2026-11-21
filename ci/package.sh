@@ -363,8 +363,9 @@ fi
 # conhost.exe child (the window); a GUI one doesn't. The app is started on a
 # state of its own (a fresh one turns autostart on: only a runner, thrown away
 # after, or an install this script just made, sees the entry), and must have
-# its window (a WebView2 child: a fresh state shows it even with
-# --background); the CLI is checked by its PE header, because CI reads its
+# its window (a WebView2 child, waited for up to 30 s: a slow cold start must
+# not fail a release; a console, if there were one, is there from the start; a
+# fresh state shows the window even with --background); the CLI is checked by its PE header, because CI reads its
 # output through pipes, which a GUI program also fills: nothing else would see
 # the attribute reach it. $1: theca.exe as installed, $2: the CLI's.
 console_check() {
@@ -374,8 +375,12 @@ console_check() {
     "$1" --state "$state" updates off >/dev/null
     children=$(THECA_CHECK_APP=$(cygpath -w "$1") THECA_CHECK_STATE=$state powershell -NoProfile -Command '
         $p = Start-Process -PassThru -FilePath $env:THECA_CHECK_APP -ArgumentList "--state `"$env:THECA_CHECK_STATE`" --background"
-        Start-Sleep -Seconds 10
-        $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($p.Id)" | ForEach-Object { $_.Name })
+        $kids = @()
+        for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            $kids = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($p.Id)" | ForEach-Object { $_.Name })
+            if ($kids -contains "msedgewebview2.exe") { break }
+        }
         taskkill /T /F /PID $p.Id | Out-Null
         $kids -join " "' | tr -d '\r')
     case " $children " in
