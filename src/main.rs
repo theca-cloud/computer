@@ -1,5 +1,11 @@
 //! `theca`: the CLI and daemon (and, with the `gui` feature, the app).
 
+// On Windows the app is a GUI program: started from the Start menu, at login or
+// by an installer, it gets no console window beside its own (theca/computer#95).
+// Every app build, a debug one too, and never the CLI's (no `gui`), which must
+// print in a terminal.
+#![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 use std::process::ExitCode;
 
