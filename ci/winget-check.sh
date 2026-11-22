@@ -35,6 +35,10 @@ done
 
 check() { # <manifest> <kind>
     "$out/venv/bin/check-jsonschema" --schemafile "$out/manifest.$2.$schema_version.json" "$1"
+    # winget-pkgs' validation refuses a manifest whose first line isn't this
+    # header (SchemaHeaderNotFound), which no JSON schema checks.
+    local header="# yaml-language-server: \$schema=https://aka.ms/winget-manifest.$2.$schema_version.schema.json"
+    [ "$(head -n 1 "$1")" = "$header" ] || { echo "$1: its first line isn't $header" >&2; exit 1; }
 }
 check "$folder/Theca.Theca.yaml" version
 check "$folder/Theca.Theca.installer.yaml" installer
