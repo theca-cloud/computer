@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.3.1] - 2026-11-22
+
+### Fixes
+
+- **ci**: The cask's macOS requirement in Homebrew 7's form, and winget's license link
+- **windows**: The app opens no console window, and every release run keeps screenshots of the installed app
+- **deps**: Url 2.5.9, for RUSTSEC-2026-0592 (a stack overflow in Url::origin on nested blob: URLs)
+
+### Documentation
+
+- The release from this workspace stops at the merge, and its pipelines run alone
+- A release ends with its announcement on Discord
+
 ## [1.3.0] - 2026-11-19
 
 ### Features

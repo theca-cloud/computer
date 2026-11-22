@@ -19,6 +19,16 @@ on:
 permissions:
   contents: read
 
+# The package job's artifacts, by name (its matrix), for every job that reads
+# packages and for the release: never a glob like `windows-*`, which would also
+# take an artifact any other job of the run uploads, the screenshots' job
+# included (it opens files of a public demo account in a file manager, and
+# nothing makes the release wait for it): a file of the same name as a signed
+# package would replace it in dist/. A new platform is added here and in the
+# matrix.
+env:
+  THECA_PACKAGES: macos-arm64,macos-x86_64,windows-x86_64,linux-x86_64,linux-arm64
+
 jobs:
   test:
     uses: ./.github/workflows/test.yml
@@ -104,6 +114,42 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # The installed app in pictures (ci/screenshots.sh): each OS's package from
+  # this run, installed, logged in to the public demo, three screenshots, kept
+  # on the run for the agent to look at after a release (CLAUDE.md). No job
+  # needs this one: the demo down, or a runner's quirk, turns only it red, and
+  # holds back no release.
+  screenshots:
+    needs: package
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15, os: macos, arch: arm64 }
+          - { runner: windows-2025, os: windows, arch: x86_64 }
+          - { runner: ubuntu-22.04, os: linux, arch: x86_64 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: ${{ matrix.os }}-${{ matrix.arch }}
+          path: dist
+      - run: ci/screenshots.sh ${{ matrix.os }} ${{ matrix.arch }}
+      # Named `screenshots-…`: the release and every job that reads packages
+      # name theirs (THECA_PACKAGES above), so no picture, and nothing else this
+      # job could upload, reaches a release.
+      - uses: actions/upload-artifact@v7.0.2
+        if: always()
+        with:
+          name: screenshots-${{ matrix.os }}-${{ matrix.arch }}
+          path: shots/
+          if-no-files-found: warn
+
   # latest.json, the updater's manifest (ci/manifest.py), from every
   # package's .sig: on every run, a manual one included (kept with the run),
   # so a release's is known good before one is made.
@@ -115,6 +161,7 @@ jobs:
       - uses: actions/download-artifact@v8.0.2
         with:
           path: dist
+          pattern: "{${{ env.THECA_PACKAGES }}}"
           merge-multiple: true
       - name: latest.json
         run: |
@@ -146,6 +193,7 @@ jobs:
       - uses: actions/download-artifact@v8.0.2
         with:
           path: dist
+          pattern: "{${{ env.THECA_PACKAGES }}}"
           merge-multiple: true
       - name: Tools
         run: |
@@ -181,6 +229,7 @@ jobs:
       - uses: actions/download-artifact@v8.0.2
         with:
           path: dist
+          pattern: "{${{ env.THECA_PACKAGES }}}"
           merge-multiple: true
       - uses: Swatinem/rust-cache@v2.9.3
       # The test server's Postgres, as test.yml's Linux runs it.
@@ -262,7 +311,7 @@ jobs:
       - uses: actions/download-artifact@v8.0.2
         with:
           path: dist
-          pattern: "{macos-*,windows-*,linux-*,manifest,repository}"
+          pattern: "{${{ env.THECA_PACKAGES }},manifest,repository}"
           merge-multiple: true
       - name: Release
         env:

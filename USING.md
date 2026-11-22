@@ -14,6 +14,14 @@ From the channel your system already uses, which keeps Theca up to date too ([Up
 | Fedora | our dnf repository: `theca` | our dnf repository: `theca-cli` |
 | Other Linux (Arch too) | the `.AppImage` ([direct downloads](#direct-downloads)) | `theca-cli-<version>-linux-<arch>.tar.gz` |
 
+If Homebrew refuses our tap as untrusted (Homebrew 7 asks before loading a tap that isn't its own), trust it first:
+
+```sh
+brew tap theca-cloud/tap
+brew trust theca-cloud/tap
+brew install theca-cloud/tap/theca
+```
+
 ### Debian, Ubuntu: apt
 
 ```sh
@@ -42,7 +50,7 @@ From the [releases](https://github.com/theca-cloud/computer/releases), for your 
 | Windows | `theca-<version>-windows-x86_64.exe`: installs for you alone, no admin | `theca-cli-<version>-windows-x86_64.zip` |
 | Linux | `theca-<version>-linux-<arch>.AppImage` (`chmod +x`, then run it), or the `.deb` / `.rpm` | `theca-cli-<version>-linux-<arch>.tar.gz`, or the `theca-cli` `.deb` / `.rpm` |
 
-The app also answers the CLI (`theca --help`). For the CLI archive, unpack it and put `theca` on your `PATH` (`sudo install theca-cli-*/theca /usr/local/bin/`), then `theca login`. On a Mac there is no CLI archive (since 1.2.0, a Mac's drives need the app's extension): use the app's own `theca`, which Homebrew puts on your `PATH`; installed from a `.dmg`, link it once with `sudo ln -sf /Applications/Theca.app/Contents/MacOS/theca /usr/local/bin/theca`. Linux builds run on Ubuntu 22.04 and Debian 12 or newer; drives on Linux need `fuse3` (the packages install it; elsewhere, install it).
+The app also answers the CLI (`theca --help`), except on Windows: there the app's `theca.exe` has no console, so it opens no black window when started from the Start menu but prints nothing in a terminal either, and the command line is the CLI archive's. For the CLI archive, unpack it and put `theca` on your `PATH` (`sudo install theca-cli-*/theca /usr/local/bin/`), then `theca login`. On a Mac there is no CLI archive (since 1.2.0, a Mac's drives need the app's extension): use the app's own `theca`, which Homebrew puts on your `PATH`; installed from a `.dmg`, link it once with `sudo ln -sf /Applications/Theca.app/Contents/MacOS/theca /usr/local/bin/theca`. Linux builds run on Ubuntu 22.04 and Debian 12 or newer; drives on Linux need `fuse3` (the packages install it; elsewhere, install it).
 
 ### Updating
 

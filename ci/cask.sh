@@ -41,7 +41,7 @@ cask "theca" do
 
   # The app updates itself.
   auto_updates true
-  depends_on macos: ">= :ventura"
+  depends_on macos: :ventura
 
   app "Theca.app"
   # \`theca\` on the PATH: the app's own, a Mac has no other CLI.
