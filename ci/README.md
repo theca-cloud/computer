@@ -223,7 +223,12 @@ developer's machine, `gh secret set <NAME> --env channels -R theca-cloud/compute
   `STORE_PRODUCT_ID`: the Azure AD application of the developer's Partner Center account
   (Account settings, Manage users, Azure AD applications, role Manager) and the product's ID.
   The `store` job (`msstore`, Microsoft's CLI) runs once a first submission exists, made by hand in
-  Partner Center: the repository variable `STORE_LISTED` is then set to `true`.
+  Partner Center: the repository variable `STORE_LISTED` is then set to `true`. The Store
+  refuses an installer URL that redirects, as GitHub's release assets all do: it takes
+  `https://packages.theca.rs/windows/<version>/theca-<version>-windows-x86_64.exe`, served once
+  `pull.sh <version>` ran on `chapter.li` (which keeps the previous release's too). The job
+  waits up to three hours for that URL to answer 200, then fails: run `pull.sh`, then re-run
+  the job alone.
 
 ## 5. Keeping it up
 
