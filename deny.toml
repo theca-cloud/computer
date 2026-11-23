@@ -18,6 +18,11 @@ ignore = [
     # chrono: unmaintained, every version, no known vulnerability; used here
     # and by core's crates. Goes once a core release drops it (theca/core#33).
     { id = "RUSTSEC-2026-0543", reason = "chrono, ours and core's (theca/core#33)" },
+    # cookie: private cookies' nonces can repeat after a fork. 0.18.3 fixes it
+    # (Tauri's); 0.16 has no fix, and comes only with the tests' webdriver
+    # (fantoccini), built without the `private` feature, so the affected
+    # `PrivateJar` isn't even compiled. Drop it when fantoccini moves to 0.18.
+    { id = "RUSTSEC-2026-0594", reason = "cookie 0.16, tests only, no private cookies" },
 ]
 
 [licenses]

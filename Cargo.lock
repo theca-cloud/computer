@@ -816,9 +816,9 @@ dependencies = [
 
 [[package]]
 name = "cookie"
-version = "0.18.2"
+version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+checksum = "d55f2d6c30eeec7d5c6f98bd4395d4abb1895629eab97ee6522d340623615f8a"
 dependencies = [
  "percent-encoding",
  "time",
@@ -1450,7 +1450,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7737298823a6f9ca743e372e8cb03658d55354fbab843424f575706ba9563046"
 dependencies = [
  "base64 0.22.1",
- "cookie 0.18.2",
+ "cookie 0.18.3",
  "http 1.5.0",
  "http-body-util",
  "hyper",
@@ -5364,7 +5364,7 @@ checksum = "5fb0244332cfb9cee7e2a568bf5da29a36ed8fdbd717f6f47a66b6b7b358c072"
 dependencies = [
  "anyhow",
  "bytes",
- "cookie 0.18.2",
+ "cookie 0.18.3",
  "dirs 7.0.0",
  "dunce",
  "embed_plist",
@@ -5642,7 +5642,7 @@ version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c55766d99cea69055904d1735b93c2049302b2e09effd462120deb5581d78e9"
 dependencies = [
- "cookie 0.18.2",
+ "cookie 0.18.3",
  "dpi",
  "gtk",
  "http 1.5.0",
@@ -7300,7 +7300,7 @@ checksum = "759c50ddad0ef9913bb5496cb9d509a50433a3b78cb0238d61105526589cf0e9"
 dependencies = [
  "base64 0.23.1",
  "block2",
- "cookie 0.18.2",
+ "cookie 0.18.3",
  "crossbeam-channel",
  "dirs 7.0.0",
  "dom_query",
