@@ -518,6 +518,16 @@ const DRIVE_RUNS: Runs = if cfg!(target_os = "linux") {
     Runs::Here
 };
 
+/// A state of a test's own: its drives folder inside `dir` (never the
+/// developer's `~/theca-drives`, where an engine adding a drive would make one)
+/// and, on a Mac, its domain's name (macOS refuses two of one name).
+pub fn own_drives(state: &State, dir: &Path) {
+    state.set_drives_folder(&dir.join("theca-drives")).unwrap();
+    state
+        .set_drives_name(&dir.file_name().unwrap().to_string_lossy())
+        .unwrap();
+}
+
 /// The drive's scenarios run where its backend is (Linux: `/dev/fuse` and
 /// `fusermount3`; Windows: always), and skip without it, unless
 /// `THECA_TEST_DRIVE` says it must be there (GitHub's runners). Safe to run
@@ -640,6 +650,41 @@ impl World {
         (client, member.id)
     }
 
+    /// A second account on `state`, one of the world's members with access to
+    /// `library`, logged in by an app password (its default folder in `dir`).
+    pub async fn second_account(
+        &self,
+        state: &State,
+        dir: &Path,
+        email: &str,
+        library: &api::Library,
+    ) -> Account {
+        let (member, user) = self.member(email).await;
+        self.set_member(library, user, true).await;
+        let created = member
+            .create_app_password(&api::CreateAppPassword {
+                name: email.into(),
+                organization: None,
+                library: None,
+                read_only: false,
+            })
+            .await
+            .unwrap();
+        ops::login(
+            state,
+            &self.server.url,
+            email,
+            Some(dir.join("theca-second")),
+            Some(created.password),
+            false,
+            Some(NewLibraries::Silent),
+            NewLibraries::Silent,
+            |_| panic!("a token needs no browser"),
+        )
+        .await
+        .unwrap()
+    }
+
     /// Gives `user` write access to `library`, or takes it away.
     pub async fn set_member(&self, library: &api::Library, user: Uuid, member: bool) {
         let path = format!("/api/v1/libraries/{}/members/{user}", library.id);
@@ -702,9 +747,18 @@ impl World {
             })
             .await
             .unwrap();
+        // Windows takes no sync root in the temp folder (`UNABLE_TO_MASK_PATH`):
+        // the drives folder, in the user's profile, as a user's is.
+        #[cfg(windows)]
+        let dir = tempfile::Builder::new()
+            .prefix("theca-drive-")
+            .tempdir_in(std::env::var("USERPROFILE").unwrap())
+            .unwrap();
+        #[cfg(not(windows))]
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("state.sqlite");
         let state = State::open(&state_path).unwrap();
+        own_drives(&state, dir.path());
         let account = ops::login(
             &state,
             &self.server.url,
@@ -803,6 +857,7 @@ impl World {
         let state_path = dir.path().join("state.sqlite");
         let folder = dir.path().join("theca");
         let state = State::open(&state_path).unwrap();
+        own_drives(&state, dir.path());
         // The app password as a script gives it (`THECA_TOKEN`): no flow.
         let account = ops::login(
             &state,
@@ -818,16 +873,14 @@ impl World {
         )
         .await
         .unwrap();
-        let pair = ops::add(
-            &state,
-            &account,
-            &library.id.to_string(),
-            Some(folder.join(&library.name)),
-            false,
-            mode,
-        )
-        .await
-        .unwrap();
+        // A drive takes no folder: it is in the state's drives folder.
+        let path = match mode {
+            Mode::Sync => Some(folder.join(&library.name)),
+            Mode::Drive => None,
+        };
+        let pair = ops::add(&state, &account, &library.id.to_string(), path, false, mode)
+            .await
+            .unwrap();
         let (stop, stopped) = watch::channel(false);
         let mut device = Device {
             app_password: None,
@@ -929,12 +982,21 @@ impl World {
 }
 
 /// Polls `check` until it holds (or panics after 30 s, with `what`).
-pub async fn eventually<F, Fut>(what: &str, mut check: F)
+pub async fn eventually<F, Fut>(what: &str, check: F)
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    eventually_within(30, what, check).await;
+}
+
+/// `eventually`, for `seconds` at most.
+pub async fn eventually_within<F, Fut>(seconds: u64, what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + Duration::from_secs(seconds);
     while !check().await {
         assert!(Instant::now() < deadline, "never happened: {what}");
         tokio::time::sleep(Duration::from_millis(200)).await;

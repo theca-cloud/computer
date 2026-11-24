@@ -107,11 +107,15 @@ One limitation: an ignore file arriving after the files it names (a copy still i
 
 A library can be a **drive** instead of a synced folder: your file manager shows all of it, a file is downloaded when you open it, and downloads are kept within a limit, the least recently used freed first. Tick **Drive** beside a library when adding it, or `theca add <library> --drive`.
 
-| | Where it is | Needs |
+Every drive is a folder of one entry, **Theca**, in the list your file manager keeps (Finder's sidebar, Explorer's navigation pane, the devices of a Linux file manager), however many libraries you keep as drives and whichever accounts they are of. A drive has no folder of its own to choose (`theca add <library> <folder> --drive` is refused); its folder is named after the library, `<organization> - <library>` when another drive has that name, with your account's address after it when that is taken too.
+
+| | The entry | Needs |
 |---|---|---|
-| Windows | the folder you choose, as a synced one (NTFS only) | Windows 10 1709 or newer; Theca running for a file not downloaded to open |
-| macOS | `~/Library/CloudStorage/Theca-<library>`, where macOS puts it (in Finder's sidebar); `Theca-<library> (<organization>)` when another drive has the library's name (then numbered) | macOS 13; the app (its `theca` from the command line) running for a file not downloaded to open |
-| Linux | the folder you choose, as a synced one | `fuse3`; Theca running for the folder to show anything (it is mounted while Theca runs) |
+| Windows | **Theca** in Explorer's navigation pane, the folder `%USERPROFILE%\theca-drives` (NTFS only) | Windows 10 1709 or newer; Theca running for a file not downloaded to open |
+| macOS | **Theca** in Finder's sidebar, the folder `~/Library/CloudStorage/Theca`, where macOS puts it | macOS 13; the app (its `theca` from the command line) running for a file not downloaded to open |
+| Linux | **theca-drives** in the file manager's devices, the folder `~/theca-drives`, there only while Theca runs (it is mounted by Theca, and removed when Theca stops) | `fuse3`; Theca running for the folder to show anything |
+
+The entry's top level is Theca's: a drive's folder is never renamed, moved or deleted from the file manager (that refuses), and a file moves from a drive to another only as a copy. On Windows a file made at the top of `theca-drives` stays where it is, belongs to no drive, and is never uploaded. A drive made by an earlier version moves into the entry the first time the new version runs (a notice says so, once); nothing not uploaded is lost, and on Windows the files you kept are kept again once the drive has been listed.
 
 **On a Mac, macOS adds a drive switched off**: switch it on in **System Settings → General → Login Items & Extensions → File Providers → Theca** (the app has a button to that pane; `theca status` says when a drive waits for it).
 
@@ -120,8 +124,9 @@ A library can be a **drive** instead of a synced folder: your file manager shows
 - **The drive limit**, one for the computer: `theca drive-limit` shows it, `theca drive-limit 20GB` (or `20GiB`) sets it, `theca drive-limit default` goes back to the default (10 GiB, or a tenth of the disk if smaller). Kept files and edits not uploaded yet don't count. Windows and macOS may free more on their own when the disk is low.
 - **What counts as a use** (the limit frees the least recently used first): every open on Linux; on Windows, an open by any program but Theca; on macOS, an open through Finder or "Open With" (a file read by a script isn't seen as used). A file never opened since its download counts from its download.
 - **Offline**, a file already downloaded opens; one that isn't fails to open (Theca says so on Windows and Linux; Finder shows its error on a Mac).
-- **Removing a drive** moves the edits not uploaded yet to `<default folder>/<library> (not uploaded)`, never deleted; everything else goes (it is on the server). Uninstalling Theca on Windows removes its drives first, the same way.
-- **On Linux, a file saved into the drive's folder while Theca wasn't running** (so not into the drive) stops the drive until you move it out; the drive then comes back by itself.
+- **A drive paused or stopped** stays in the entry, as a synced folder stays on disk: a file already downloaded opens, one that isn't fails to open, and what you change waits until the drive syncs again.
+- **Removing a drive** moves the edits not uploaded yet to `<default folder>/<library> (not uploaded)`, never deleted; everything else goes (it is on the server). The last drive takes the entry with it. On a Mac, an edit macOS holds and can't upload yet (offline) keeps the drive from being removed: the removal says so, and works once it is online. Uninstalling Theca on Windows removes its drives first, the same way.
+- **On Linux, a file saved into `~/theca-drives` while Theca wasn't running** (so not into a drive) stops every drive until you move it out; the drives then come back by themselves.
 
 ## Starting with the computer
 

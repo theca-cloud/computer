@@ -48,6 +48,8 @@ CREATE TABLE account (
 -- A local folder kept identical to a whole library.
 CREATE TABLE pair (
     id INTEGER PRIMARY KEY,
+    -- What leaves the state (macOS's item identifiers): a UUIDv7.
+    uuid TEXT NOT NULL UNIQUE,
     account INTEGER NOT NULL REFERENCES account ON DELETE CASCADE,
     library TEXT NOT NULL,
     -- The library's root folder (the parent of the top-level entries).
@@ -166,7 +168,7 @@ CREATE TABLE setting (
 );
 "#;
 
-const VERSION: i32 = 4;
+const VERSION: i32 = 5;
 
 /// The oldest version migrated (`0.2.0`'s): before it, the schema was
 /// rewritten in place, and a state is deleted by hand.
@@ -174,8 +176,11 @@ const OLDEST: i32 = 2;
 
 /// The migration steps, from `OLDEST` + 1 up to `VERSION`: one per version,
 /// never edited once released (`scripts/ci.sh`).
-const STEPS: [fn(&rusqlite::Transaction<'_>) -> Result<()>; 2] =
-    [migrations::v3::migrate, migrations::v4::migrate];
+const STEPS: [fn(&rusqlite::Transaction<'_>) -> Result<()>; 3] = [
+    migrations::v3::migrate,
+    migrations::v4::migrate,
+    migrations::v5::migrate,
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
@@ -813,10 +818,68 @@ impl State {
         Ok(self.pairs()?.into_iter().find(|p| p.id == id))
     }
 
+    /// A pair's UUID, what leaves the state (macOS's item identifiers); a
+    /// pair's integer ID is reused after a removal.
+    pub fn pair_uuid(&self, pair: i64) -> Result<Option<Uuid>> {
+        let text: Option<String> = self
+            .db()
+            .query_row("SELECT uuid FROM pair WHERE id = ?1", [pair], |r| r.get(0))
+            .optional()?;
+        Ok(text.map(uuid))
+    }
+
+    /// The pair with this UUID.
+    pub fn pair_by_uuid(&self, uuid: Uuid) -> Result<Option<Pair>> {
+        let id: Option<i64> = self
+            .db()
+            .query_row(
+                "SELECT id FROM pair WHERE uuid = ?1",
+                [uuid.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => self.pair(id),
+            None => Ok(None),
+        }
+    }
+
+    /// This state's drives folder (Windows and Linux), if one was recorded
+    /// with its first drive: where the drives are listed as one entry.
+    pub fn drives_folder(&self) -> Result<Option<PathBuf>> {
+        Ok(self.setting("drives_folder")?.map(PathBuf::from))
+    }
+
+    pub fn set_drives_folder(&self, folder: &Path) -> Result<()> {
+        self.set_setting("drives_folder", &folder.to_string_lossy())
+    }
+
+    /// The UUIDv7 naming this state's one drive entry (the Windows sync root,
+    /// the macOS domain), made with the first drive: two states on one machine
+    /// (the tests') never share one.
+    pub fn drives_id(&self) -> Result<Uuid> {
+        if let Some(id) = self.setting("drives_id")? {
+            return Ok(uuid(id));
+        }
+        let id = Uuid::now_v7();
+        self.set_setting("drives_id", &id.to_string())?;
+        Ok(id)
+    }
+
+    /// The display name of the one macOS domain: empty (Finder shows
+    /// "Theca"), unless a test sets one (macOS refuses two domains of one name).
+    pub fn drives_name(&self) -> Result<String> {
+        Ok(self.setting("drives_name")?.unwrap_or_default())
+    }
+
+    pub fn set_drives_name(&self, name: &str) -> Result<()> {
+        self.set_setting("drives_name", name)
+    }
+
     pub fn add_pair(&self, p: &Pair) -> Result<i64> {
         self.db().execute(
-            "INSERT INTO pair (account, library, root, library_name, path, writable, mode)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO pair (uuid, account, library, root, library_name, path, writable, mode)
+             VALUES (?8, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 p.account,
                 p.library.to_string(),
@@ -824,7 +887,8 @@ impl State {
                 p.library_name,
                 p.path.to_string_lossy(),
                 p.writable,
-                p.mode.as_str()
+                p.mode.as_str(),
+                Uuid::now_v7().to_string()
             ],
         )?;
         let id = self.db().last_insert_rowid();
@@ -1425,7 +1489,7 @@ impl State {
             (false, "error") => tracing::error!(account, pair, path = path_, "{message}"),
             (false, _) => tracing::info!(account, pair, path = path_, "{message}"),
         }
-        self.db().execute(
+        let inserted = self.db().execute(
             "INSERT INTO notice (account, pair, at, level, path, message, undo)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -1437,7 +1501,18 @@ impl State {
                 message,
                 undo
             ],
-        )?;
+        );
+        match inserted {
+            // The pair was removed meanwhile (an engine's round that found its
+            // folder gone): nothing to tell of it, and not an error that
+            // would stop the account's engine for 30 s (theca/computer#113).
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if pair.is_some() && e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Ok(());
+            }
+            other => other?,
+        };
         self.publish(Update::Notices);
         Ok(())
     }
@@ -1545,6 +1620,19 @@ fn put_remote(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A notice about a pair removed meanwhile is dropped, not an error.
+    #[test]
+    fn a_notice_of_a_removed_pair_is_dropped() {
+        let state = State::memory().unwrap();
+        let id = pair(&state);
+        let p = state.pair(id).unwrap().unwrap();
+        state.remove_pair(&p).unwrap();
+        state
+            .notify(Some(p.account), Some(id), "error", None, "stopped", None)
+            .unwrap();
+        assert!(state.notices().unwrap().is_empty());
+    }
 
     /// A pair syncs nothing when stopped, or when its account's engine
     /// stopped on an error (said until a retry goes through).

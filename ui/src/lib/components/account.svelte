@@ -47,8 +47,6 @@
 	let unavailable = $state<string | null>(null);
 	/** The libraries ticked as drives. */
 	let asDrive = $state<Record<string, boolean>>({});
-	/** A Mac places a drive's folder itself. */
-	const mac = navigator.userAgent.includes('Mac');
 
 	onMount(() => {
 		void attempt(() => invoke<string | null>('drive_support')).then(
@@ -184,7 +182,8 @@
 				/>
 				<Label for="drive-{id}" class="text-xs">{m.drive()}</Label>
 			</div>
-			{#if !(mac && asDrive[id])}
+			<!-- A drive takes no folder: it is in the drives folder. -->
+			{#if !asDrive[id]}
 				<Button
 					size="sm"
 					variant="ghost"

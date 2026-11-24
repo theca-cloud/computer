@@ -15,6 +15,9 @@ name = "theca"
 path = "src/main.rs"
 
 [dependencies]
+# Start at login (the app): called directly, not through Tauri's plugin, which
+# gives macOS's launch agent no bundle identifier (theca/computer#92).
+auto-launch = { version = "0.6.0", optional = true }
 # The updater's keys and signatures, as Tauri writes them.
 base64 = "0.23.1"
 bytesize = "2.7.0"
@@ -49,7 +52,6 @@ semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tauri = { version = "2", features = ["tray-icon", "image-png"], optional = true }
-tauri-plugin-autostart = { version = "2", optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
 tauri-plugin-notification = { version = "2", optional = true }
 tauri-plugin-opener = { version = "2", optional = true }
@@ -65,7 +67,7 @@ tempfile = "3.27.0"
 tracing = "0.1.44"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-uuid = { version = "1.29.0", features = ["v4", "serde"] }
+uuid = { version = "1.29.0", features = ["v4", "v7", "serde"] }
 # The app updated on macOS and Windows (with `self-update`; ADR 0006).
 tauri-plugin-updater = { version = "2.14.1", optional = true }
 
@@ -119,7 +121,7 @@ minisign = "0.10.0"
 gui = [
     "dep:tauri",
     "dep:tauri-build",
-    "dep:tauri-plugin-autostart",
+    "dep:auto-launch",
     "dep:tauri-plugin-dialog",
     "dep:tauri-plugin-notification",
     "dep:tauri-plugin-opener",

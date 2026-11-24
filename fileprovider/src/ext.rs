@@ -78,14 +78,13 @@ fn path_of(url: Option<&NSURL>) -> Option<PathBuf> {
     url.and_then(|u| u.to_file_path())
 }
 
-/// The anchor's bytes: the drive's counter, big-endian.
-fn anchor_data(anchor: u64) -> Retained<NSData> {
-    NSData::with_bytes(&anchor.to_be_bytes())
+/// The anchor's bytes: the app's text (every drive's counter).
+fn anchor_data(anchor: &str) -> Retained<NSData> {
+    NSData::with_bytes(anchor.as_bytes())
 }
 
-fn anchor_of(data: &NSData) -> Option<u64> {
-    let bytes = data.to_vec();
-    Some(u64::from_be_bytes(bytes.try_into().ok()?))
+fn anchor_of(data: &NSData) -> Option<String> {
+    String::from_utf8(data.to_vec()).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -138,10 +137,13 @@ define_class!(
                 can |= NSFileProviderItemCapabilities::AllowsContentEnumerating;
             }
             if entry.writable {
-                can |= NSFileProviderItemCapabilities::AllowsWriting
-                    | NSFileProviderItemCapabilities::AllowsRenaming
-                    | NSFileProviderItemCapabilities::AllowsReparenting
-                    | NSFileProviderItemCapabilities::AllowsDeleting;
+                can |= NSFileProviderItemCapabilities::AllowsWriting;
+                // A drive's folder takes items, and is nothing's to move.
+                if !entry.fixed {
+                    can |= NSFileProviderItemCapabilities::AllowsRenaming
+                        | NSFileProviderItemCapabilities::AllowsReparenting
+                        | NSFileProviderItemCapabilities::AllowsDeleting;
+                }
             }
             can
         }
@@ -213,10 +215,12 @@ define_class!(
             let keys = [
                 &*NSString::from_str("kept"),
                 &*NSString::from_str("keptItself"),
+                &*NSString::from_str("fixed"),
             ];
             let values = [
                 &*NSNumber::new_bool(entry.kept),
                 &*NSNumber::new_bool(entry.kept_itself),
+                &*NSNumber::new_bool(entry.fixed),
             ];
             let info = NSDictionary::from_slices(&keys, &values);
             // SAFETY: NSDictionary's generics are Rust-only; the object is
@@ -334,7 +338,7 @@ define_class!(
                             ));
                         }
                         observer.finishEnumeratingChangesUpToSyncAnchor_moreComing(
-                            &anchor_data(anchor),
+                            &anchor_data(&anchor),
                             false,
                         );
                     }
@@ -354,7 +358,7 @@ define_class!(
             };
             match ipc::ask(&asked) {
                 Ok(Reply::Anchor { anchor }) => {
-                    let data = anchor_data(anchor);
+                    let data = anchor_data(&anchor);
                     done.call((Retained::as_ptr(&data).cast_mut(),));
                 }
                 // None: the system tries again later.
@@ -514,7 +518,10 @@ define_class!(
             done: &DynBlock<dyn Fn(*mut NSURL, *mut NSFileProviderItem, *mut NSError)>,
         ) -> Retained<NSProgress> {
             let id = identifier.to_string();
-            let into = self.staging().join(format!("{id}-{}", unique()));
+            // An identifier is `<drive>/<node>`: one file name, not a folder.
+            let into = self
+                .staging()
+                .join(format!("{}-{}", id.replace('/', "-"), unique()));
             let asked = Request::Fetch {
                 domain: self.ivars().id.clone(),
                 id,

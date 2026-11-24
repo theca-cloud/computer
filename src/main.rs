@@ -170,13 +170,15 @@ enum Command {
     /// Start syncing a library (by name) into a folder.
     Add {
         library: String,
-        /// Default: <default folder>/<library>.
+        /// Default: <default folder>/<library>. Not for a drive: it is a
+        /// folder of the drives folder.
         path: Option<PathBuf>,
         /// The folder already holds files: merge them with the library.
         #[arg(long)]
         merge: bool,
-        /// A drive: the whole library shown, each file downloaded when
-        /// opened, kept within the drive limit.
+        /// A drive, in the drives folder (`~/theca-drives`; on a Mac, Theca in
+        /// Finder's sidebar): the whole library shown, each file downloaded
+        /// when opened, kept within the drive limit.
         #[arg(long)]
         drive: bool,
         #[arg(long)]
@@ -1040,7 +1042,7 @@ fn status(state: &State) -> Result<()> {
             println!("  {}  {}  {what}{when}", p.library_name, p.path.display());
             #[cfg(target_os = "macos")]
             if p.mode == state::Mode::Drive {
-                let domain = theca::drive::provider::domain_of(p);
+                let domain = theca::drive::provider::domain_of(state).unwrap_or_default();
                 match theca_fileprovider::host::enabled(&domain) {
                     Ok(Some(true)) => println!("    a drive, switched on"),
                     Ok(Some(false)) => {

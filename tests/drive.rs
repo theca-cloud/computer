@@ -22,6 +22,494 @@ fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+/// Drives are folders of the state's drives folder, named when added
+/// (theca/computer#94): the library's, then with its organization when
+/// another drive has the name. Two accounts of one state with the same
+/// library; the first one removed and added again takes the plain name back,
+/// the second keeps its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn drives_are_named_in_the_drives_folder() {
+    use theca::state::{Mode, State};
+    let w = world().await;
+    let (dir, state_path, first) = w.logged_in("names").await;
+    let state = State::open(&state_path).unwrap();
+    let drives = dir.path().join("theca-drives");
+    // A second account on the same state, a member of the library.
+    let second = w
+        .second_account(&state, dir.path(), "second@test.theca", &w.library)
+        .await;
+    let library = w.library.name.clone();
+    let id = w.library.id.to_string();
+    let add = async |account: &theca::state::Account| {
+        theca::ops::add(&state, account, &id, None, false, Mode::Drive)
+            .await
+            .unwrap()
+    };
+    let a = add(&first).await;
+    let b = add(&second).await;
+    let name = |p: &theca::state::Pair| {
+        assert_eq!(
+            p.path.parent(),
+            Some(drives.as_path()),
+            "in the drives folder"
+        );
+        p.path.file_name().unwrap().to_string_lossy().into_owned()
+    };
+    assert_eq!(name(&a), library);
+    let other = name(&b);
+    assert!(
+        other != library && other.ends_with(&format!(" - {library}")),
+        "{other}"
+    );
+
+    // The first removed and added again: the plain name is free again, and
+    // the second's is not renamed.
+    theca::ops::remove(&state, &a, false).unwrap();
+    let again = add(&first).await;
+    assert_eq!(name(&again), library);
+    let b_now = state.pair(b.id).unwrap().unwrap();
+    assert_eq!(name(&b_now), other);
+}
+
+/// Two drives of two accounts of one state (the same library in both) are
+/// two folders of one sync root, the drives folder (theca/computer#94,
+/// Windows): each fetches what is opened of its own; a drive's folder isn't
+/// deleted nor renamed, nor a file moved across two drives; a file made at
+/// the top stays a file of nobody's; removing one drive leaves the other and
+/// the root, the last takes the sync root and the folder. (Run by GitHub's
+/// Windows runner only.)
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn drives_are_folders_of_one_sync_root() {
+    use theca::state::Mode;
+    let w = world().await;
+    let notes = w
+        .admin
+        .create_library(w.organization, "Notes")
+        .await
+        .unwrap();
+    w.upload(&notes, "n.txt", b"notes").await;
+    let mut a = w.device_for("a", &w.library, false).await;
+    let state = a.state();
+    let first = state.accounts().unwrap().remove(0);
+    let dir = state.path().unwrap().parent().unwrap().to_owned();
+    // Windows takes no sync root in the temp folder (`UNABLE_TO_MASK_PATH`):
+    // the drives folder in the user's profile, as a user's is.
+    let profile = tempfile::Builder::new()
+        .prefix("theca-drive-")
+        .tempdir_in(std::env::var("USERPROFILE").unwrap())
+        .unwrap();
+    own_drives(&state, profile.path());
+    let second = w
+        .second_account(&state, &dir, "two@test.theca", &notes)
+        .await;
+    let id = notes.id.to_string();
+    let one = theca::ops::add(&state, &first, &id, None, false, Mode::Drive)
+        .await
+        .unwrap();
+    let two = theca::ops::add(&state, &second, &id, None, false, Mode::Drive)
+        .await
+        .unwrap();
+    let drives = one.path.parent().unwrap().to_owned();
+    let name = |p: &theca::state::Pair| p.path.file_name().unwrap().to_string_lossy().into_owned();
+    let (n1, n2) = (name(&one), name(&two));
+    assert_ne!(n1, n2);
+    assert!(
+        theca::drive::cloud::registered(&state),
+        "one sync root, on the drives folder"
+    );
+
+    a.restart();
+    // Each drive's own file, fetched when opened.
+    for p in [&one, &two] {
+        eventually("its own file", || async {
+            listed(&p.path).await.contains("n.txt")
+        })
+        .await;
+        let file = p.path.join("n.txt");
+        let content = in_drive("a file opened", move || std::fs::read_to_string(file)).await;
+        assert_eq!(content.unwrap(), "notes");
+    }
+    assert_eq!(top(&drives).await, BTreeSet::from([n1.clone(), n2.clone()]));
+
+    // A drive's folder isn't the user's to delete nor to rename, and nothing
+    // moves from a drive to another.
+    let at = |name: &str| drives.join(name);
+    // As Explorer does (`move`, `rmdir`): Rust's `rename` and `remove_dir_all`
+    // go by POSIX semantics, which Windows doesn't tell the sync root about.
+    let classic = |command: &str, args: &[&Path]| {
+        let out = std::process::Command::new("cmd")
+            .args(["/C", command])
+            .args(args)
+            .output()
+            .unwrap();
+        out.status.success()
+    };
+    assert!(
+        !classic("move", &[&at(&n1), &at("renamed")]),
+        "a drive was renamed"
+    );
+    assert!(one.path.exists() && !at("renamed").exists());
+    assert!(
+        !classic(
+            "move",
+            &[&one.path.join("n.txt"), &two.path.join("moved.txt")]
+        ),
+        "a file moved across two drives"
+    );
+    assert!(one.path.join("n.txt").exists() && !two.path.join("moved.txt").exists());
+    // Inside a drive, what a drive does.
+    assert_eq!(
+        errno("a folder in a drive", {
+            let p = one.path.join("sub");
+            move || std::fs::create_dir(p)
+        })
+        .await,
+        None
+    );
+    // A file made at the top can't be refused: it stays, belongs to no drive,
+    // and nothing uploads it.
+    let loose = at("loose.txt");
+    std::fs::write(&loose, "nobody's").unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(loose.exists());
+    assert!(!w.remote(&notes).await.contains_key("loose.txt"));
+
+    // Last: `rmdir /S` first deletes what the drive holds.
+    assert!(
+        !classic("rmdir", &[Path::new("/S"), Path::new("/Q"), &at(&n1)]),
+        "a drive's folder was deleted"
+    );
+    assert!(one.path.exists());
+
+    // One drive removed: its folder goes, the other stays open, the root stays.
+    theca::ops::remove(&state, &one, false).unwrap();
+    eventually("the first drive withdrawn", || async {
+        !one.path.exists() && top(&drives).await.contains(&n2)
+    })
+    .await;
+    assert!(theca::drive::cloud::registered(&state));
+    assert!(!listed(&two.path).await.is_empty());
+    // The last takes the sync root and the folder.
+    std::fs::remove_file(&loose).unwrap();
+    theca::ops::remove(&state, &two, false).unwrap();
+    // Once the engines have closed the connection: one that stopped on a
+    // removal under its feet (theca/computer#113) does so after its retry
+    // 30 s later.
+    eventually_within(90, "the sync root and the folder taken", || async {
+        !theca::drive::cloud::registered(&state) && !drives.exists()
+    })
+    .await;
+    a.stop().await;
+}
+
+/// What the drives folder lists, through the mount.
+async fn top(drives: &Path) -> BTreeSet<String> {
+    let drives = drives.to_owned();
+    in_drive("the drives folder listed", move || {
+        std::fs::read_dir(&drives)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+    .await
+}
+
+/// The error number an operation in the drives folder failed with (none: it
+/// worked).
+async fn errno(
+    what: &'static str,
+    call: impl FnOnce() -> std::io::Result<()> + Send + 'static,
+) -> Option<i32> {
+    in_drive(what, move || {
+        call().err().map(|e| e.raw_os_error().unwrap_or(-1))
+    })
+    .await
+}
+
+/// Two drives of two accounts of one state (the same library in both) are
+/// two folders of one mount of the drives folder (theca/computer#94): each
+/// opens its own files; the top level refuses what isn't Theca's to make,
+/// and a move across two drives; removing one leaves the other, and the last
+/// takes the mount and the folder with it.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn drives_are_folders_of_one_mount() {
+    use theca::state::Mode;
+    if !fuse() {
+        return;
+    }
+    // The top folder is read-only: the kernel refuses what changes it, before
+    // the mount is asked.
+    const EACCES: i32 = 13;
+    const EXDEV: i32 = 18;
+    let w = world().await;
+    let notes = w
+        .admin
+        .create_library(w.organization, "Notes")
+        .await
+        .unwrap();
+    w.upload(&notes, "n.txt", b"notes").await;
+    let mut a = w.device_in_a_child("a", false).await;
+    let state = a.state();
+    let first = state.accounts().unwrap().remove(0);
+    let dir = state.path().unwrap().parent().unwrap().to_owned();
+    let second = w
+        .second_account(&state, &dir, "two@test.theca", &notes)
+        .await;
+    let id = notes.id.to_string();
+    let one = theca::ops::add(&state, &first, &id, None, false, Mode::Drive)
+        .await
+        .unwrap();
+    let two = theca::ops::add(&state, &second, &id, None, false, Mode::Drive)
+        .await
+        .unwrap();
+    let drives = one.path.parent().unwrap().to_owned();
+    assert!(
+        !drives.exists(),
+        "the drives folder exists while mounted only"
+    );
+    let name = |p: &theca::state::Pair| p.path.file_name().unwrap().to_string_lossy().into_owned();
+    let (n1, n2) = (name(&one), name(&two));
+    assert_ne!(n1, n2);
+
+    a.restart();
+    eventually("both drives listed", || async {
+        top(&drives).await == BTreeSet::from([n1.clone(), n2.clone()])
+    })
+    .await;
+    for p in [&one, &two] {
+        eventually("its own files", || async {
+            listed(&p.path).await.contains("n.txt")
+        })
+        .await;
+        // Read back through the mount (the same node, in two drives: two inodes).
+        let file = p.path.join("n.txt");
+        let content = in_drive("a file opened", move || std::fs::read_to_string(file)).await;
+        assert_eq!(content.unwrap(), "notes");
+    }
+    // One mount, on the drives folder: no drive has one of its own.
+    assert!(theca::drive::fuse::mounted(&drives));
+    assert!(!theca::drive::fuse::mounted(&one.path) && !theca::drive::fuse::mounted(&two.path));
+
+    // The top level is Theca's.
+    let at = |name: &str| drives.join(name);
+    assert_eq!(
+        errno("a file at the top", {
+            let p = at("x.txt");
+            move || std::fs::File::create(p).map(|_| ())
+        })
+        .await,
+        Some(EACCES)
+    );
+    assert_eq!(
+        errno("a folder at the top", {
+            let p = at("x");
+            move || std::fs::create_dir(p)
+        })
+        .await,
+        Some(EACCES)
+    );
+    assert_eq!(
+        errno("a drive renamed", {
+            let (from, to) = (at(&n1), at("renamed"));
+            move || std::fs::rename(from, to)
+        })
+        .await,
+        Some(EACCES)
+    );
+    assert_eq!(
+        errno("a drive deleted", {
+            let p = at(&n1);
+            move || std::fs::remove_dir(p)
+        })
+        .await,
+        Some(EACCES)
+    );
+    assert_eq!(
+        errno("a move across two drives", {
+            let (from, to) = (one.path.join("n.txt"), two.path.join("moved.txt"));
+            move || std::fs::rename(from, to)
+        })
+        .await,
+        Some(EXDEV)
+    );
+    // Inside a drive, anything a drive does.
+    assert_eq!(
+        errno("a folder in a drive", {
+            let p = one.path.join("sub");
+            move || std::fs::create_dir(p)
+        })
+        .await,
+        None
+    );
+    assert_eq!(
+        errno("a file renamed in a drive", {
+            let (from, to) = (one.path.join("n.txt"), one.path.join("sub/n.txt"));
+            move || std::fs::rename(from, to)
+        })
+        .await,
+        None
+    );
+
+    // One drive removed: it leaves the list, the other stays open.
+    theca::ops::remove(&state, &one, false).unwrap();
+    eventually("the first drive withdrawn", || async {
+        top(&drives).await == BTreeSet::from([n2.clone()])
+    })
+    .await;
+    // (Its own library's file, where the other drive's rename put it.)
+    let still = listed(&two.path).await;
+    assert!(
+        still.contains("n.txt") || still.contains("sub/n.txt"),
+        "{still:?}"
+    );
+    // The last one takes the mount, and the folder, with it.
+    theca::ops::remove(&state, &two, false).unwrap();
+    eventually("nothing mounted, no drives folder", || async {
+        !theca::drive::fuse::mounted(&drives) && !drives.exists()
+    })
+    .await;
+    a.stop().await;
+}
+
+/// A drive made by 1.3.x (a folder of its own outside the drives folder, its
+/// own mount) moves into the drives folder at the first start of this
+/// version (theca/computer#94): the same drive, its files and an edit not
+/// uploaded kept, its old folder gone, said once.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drive_made_by_1_3_moves_into_the_drives_folder() {
+    use theca::state::Mode;
+    if !fuse() {
+        return;
+    }
+    let w = world().await;
+    let notes = w
+        .admin
+        .create_library(w.organization, "Notes")
+        .await
+        .unwrap();
+    w.upload(&notes, "n.txt", b"notes").await;
+    let mut a = w.device_in_a_child("a", false).await;
+    let state = a.state();
+    let account = state.accounts().unwrap().remove(0);
+    let dir = state.path().unwrap().parent().unwrap().to_owned();
+    let made = theca::ops::add(
+        &state,
+        &account,
+        &notes.id.to_string(),
+        None,
+        false,
+        Mode::Drive,
+    )
+    .await
+    .unwrap();
+    let drives = made.path.parent().unwrap().to_owned();
+    // Put back as 1.3.x had it: a folder of its own, outside the drives folder.
+    let old = dir.join("elsewhere").join("Notes");
+    std::fs::create_dir_all(&old).unwrap();
+    let root_file_id = state.pair(made.id).unwrap().unwrap().root_file_id;
+    state
+        .set_pair_path(made.id, &old, root_file_id.as_deref())
+        .unwrap();
+    // An edit not uploaded, in the drive's files.
+    let backing = theca::drive::backing(&state, made.id).unwrap();
+    std::fs::write(backing.join("edit.txt"), "not uploaded").unwrap();
+
+    a.restart();
+    eventually("the drive in the drives folder", || async {
+        state.pair(made.id).unwrap().unwrap().path == drives.join("Notes")
+    })
+    .await;
+    assert!(!old.exists(), "the old folder is left behind");
+    let moved = state.pair(made.id).unwrap().unwrap();
+    assert_eq!(moved.library, notes.id, "the same drive");
+    let folder = drives.join("Notes");
+    eventually("its files in the one mount", || async {
+        let listed = listed(&folder).await;
+        listed.contains("n.txt") && listed.contains("edit.txt")
+    })
+    .await;
+    eventually("the edit not uploaded went up", || async {
+        w.remote(&notes).await.get("edit.txt") == Some(&Some(b"not uploaded".to_vec()))
+    })
+    .await;
+    let said = |a: &Device| {
+        a.notices()
+            .iter()
+            .filter(|n| n.contains("Your drives moved"))
+            .count()
+    };
+    assert_eq!(said(&a), 1, "said once");
+    // A second start has nothing to move, and says nothing more.
+    a.stop().await;
+    a.restart();
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(said(&a), 1);
+    a.stop().await;
+}
+
+/// A drive paused stays listed, as a stopped sync pair's folder stays: what
+/// is downloaded opens, a placeholder doesn't (and nothing is fetched for
+/// it), a file saved there is uploaded once it resumes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paused_drive_stays_listed() {
+    if !fuse() {
+        return;
+    }
+    let w = world().await;
+    let s = w.device("sync").await;
+    s.write("a.txt", "hello");
+    s.write("b.txt", "world");
+    w.converge(&[&s]).await;
+    let mut d = w.drive("drive").await;
+    let (folder, backing) = (d.folder.clone(), d.backing());
+    eventually("listed", || async { listed(&folder).await.len() == 2 }).await;
+    let opened = |name: &str| {
+        let path = folder.join(name);
+        in_drive("a file opened", move || std::fs::read_to_string(path))
+    };
+    assert_eq!(opened("a.txt").await.unwrap(), "hello");
+
+    let (state, id) = (d.state(), d.pair().id);
+    state.set_paused(id, true).unwrap();
+    // The engine looks every second: once it has, it no longer serves the
+    // drive, and a placeholder fails to open (opened before, it would be
+    // fetched).
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let refused = opened("b.txt").await.expect_err("a placeholder opened");
+    // (FUSE answers EIO; Windows says its own cloud error.)
+    #[cfg(target_os = "linux")]
+    assert_eq!(refused.raw_os_error(), Some(5), "EIO: {refused}");
+    #[cfg(windows)]
+    let _ = refused;
+    assert!(
+        is_placeholder(&backing.join("b.txt")),
+        "nothing was fetched"
+    );
+    assert_eq!(opened("a.txt").await.unwrap(), "hello", "downloaded opens");
+    assert!(listed(&folder).await.contains("b.txt"), "still listed");
+    let saved = folder.join("saved.txt");
+    in_drive("a file saved", move || std::fs::write(saved, "meanwhile"))
+        .await
+        .unwrap();
+
+    state.set_paused(id, false).unwrap();
+    eventually("uploaded on resume", || async {
+        w.remote(&w.library).await.get("saved.txt") == Some(&Some(b"meanwhile".to_vec()))
+    })
+    .await;
+    eventually("b.txt opens again", || async {
+        opened("b.txt").await.is_ok_and(|c| c == "world")
+    })
+    .await;
+    d.stop().await;
+}
+
 /// Everything listed as placeholders; a file fetched when asked, recorded;
 /// changed on the server, evicted again; kept (its folder), downloaded; an
 /// edit in the drive uploaded.
@@ -207,16 +695,16 @@ async fn files_saved_while_stopped_block_the_mount() {
     w.converge(&[&s]).await;
     let mut d = w.drive("drive").await;
     let folder = d.folder.clone();
+    let drives = folder.parent().unwrap().to_owned();
     eventually("mounted", || async {
         listed(&folder).await.contains("a.txt")
     })
     .await;
     d.stop().await;
-    assert!(
-        listed(&folder).await.is_empty(),
-        "unmounted with the engine"
-    );
-    std::fs::write(folder.join("saved.txt"), "while stopped").unwrap();
+    // The drives folder is Theca's while mounted only: gone with the engine.
+    assert!(!drives.exists(), "the drives folder outlives its mount");
+    std::fs::create_dir_all(&drives).unwrap();
+    std::fs::write(drives.join("saved.txt"), "while stopped").unwrap();
     d.restart();
     eventually("stopped, saying why", || async {
         d.pair().stop.is_some()
@@ -226,17 +714,18 @@ async fn files_saved_while_stopped_block_the_mount() {
     })
     .await;
     assert_eq!(
-        read(&folder.join("saved.txt")),
+        read(&drives.join("saved.txt")),
         "while stopped",
         "never hidden"
     );
-    std::fs::remove_file(folder.join("saved.txt")).unwrap();
+    std::fs::remove_file(drives.join("saved.txt")).unwrap();
     eventually("mounted again", || async {
         listed(&folder).await.contains("a.txt")
     })
     .await;
     assert!(d.pair().stop.is_none());
     d.stop().await;
+    assert!(!drives.exists(), "the drives folder outlives its mount");
 }
 
 /// Over the drive limit after a fetch, the least recently used leave first,

@@ -70,11 +70,22 @@ fn every_release_state_reads_back() {
     let (_fresh, fresh) = fresh();
     let current = version(&fresh);
     let expected = schema(&fresh);
+    // The UUIDv7 every pair has from version 5: its own, in every release's.
+    let mut uuids = std::collections::HashSet::new();
     for release in releases {
         let (dir, path, manifest) = copy_of(&release);
         let was = version(&path);
         let state = State::open(&path).unwrap_or_else(|e| panic!("{}: {e}", release.display()));
         assert_eq!(schema(&path), expected, "{}", release.display());
+        for pair in state.pairs().unwrap() {
+            let uuid = state.pair_uuid(pair.id).unwrap().expect("a pair UUID");
+            assert_eq!(uuid.get_version_num(), 7, "{}", release.display());
+            assert!(uuids.insert(uuid), "{}: {uuid} twice", release.display());
+            assert_eq!(
+                state.pair_by_uuid(uuid).unwrap().map(|p| p.id),
+                Some(pair.id)
+            );
+        }
         let mut read = manifest_of(&state, &manifest["version"]);
         // An entry the migration made has a name of its own.
         let pairs_of = |account: &Value| -> Vec<Value> {

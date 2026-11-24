@@ -44,6 +44,35 @@ fn usage_and_errors() {
     );
 }
 
+/// A drive takes no folder (theca/computer#94): `add --drive <folder>`, and
+/// `--drive --merge`, are refused before anything is written, and say where
+/// drives live.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drive_takes_no_folder() {
+    let w = world().await;
+    let (dir, state_path, _account) = w.logged_in("nofolder").await;
+    let folder = dir.path().join("elsewhere");
+    let folder = folder.to_str().unwrap();
+    let library = w.library.name.as_str();
+    for args in [
+        vec!["add", library, folder, "--drive"],
+        vec!["add", library, "--drive", "--merge"],
+    ] {
+        let out = theca(&state_path, &args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(code(&out), exit::ERROR, "{args:?}: {stderr}");
+        assert!(stderr.contains("drives take no folder"), "{stderr}");
+    }
+    assert!(
+        theca::state::State::open(&state_path)
+            .unwrap()
+            .pairs()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!std::path::Path::new(folder).exists());
+}
+
 /// `drive-limit`: the default until one is set, then that one; a size it
 /// can't read is a usage error, and changes nothing.
 #[test]

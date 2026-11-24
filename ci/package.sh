@@ -424,14 +424,19 @@ uninstall_removes_drives() {
     drive="$home\theca-ci\Docs"
     mkdir -p "$(cygpath "$drive")"
     echo "not uploaded" >"$(cygpath "$drive")/edit.txt"
-    python - "$state" "$home\theca-ci" "$drive" <<'PY'
+    # The drive is a folder of the drives folder (theca-ci), the account's
+    # default folder another (where its edits go).
+    python - "$state" "$home\theca-ci-default" "$home\theca-ci" "$drive" <<'PY'
 import sqlite3, sys, uuid
-state, default, drive = sys.argv[1:]
+state, default, drives, drive = sys.argv[1:]
 db = sqlite3.connect(state)
 db.execute("INSERT INTO account (instance, uuid, email, device, password, default_folder)"
            " VALUES ('https://ci.invalid', ?, 'ci@ci.invalid', 'ci', 'x', ?)", (str(uuid.uuid4()), default))
-db.execute("INSERT INTO pair (account, library, root, library_name, path, mode)"
-           " VALUES (1, ?, ?, 'Docs', ?, 'drive')", (str(uuid.uuid4()), str(uuid.uuid4()), drive))
+db.execute("INSERT INTO pair (uuid, account, library, root, library_name, path, mode)"
+           " VALUES (?, 1, ?, ?, 'Docs', ?, 'drive')",
+           (str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4()), drive))
+db.execute("INSERT INTO setting (key, value) VALUES ('drives_folder', ?), ('drives_id', ?)",
+           (drives, str(uuid.uuid4())))
 db.commit()
 PY
     # In place (`_?=`), as "Uninstall before installing" runs it: the drive
@@ -451,7 +456,7 @@ PY
         sleep 1
     done
     [ ! -e "$(cygpath "$drive")" ] || { echo "the uninstaller left the drive's folder" >&2; exit 1; }
-    grep -q "not uploaded" "$(cygpath "$home")/theca-ci/Docs (not uploaded)/edit.txt" ||
+    grep -q "not uploaded" "$(cygpath "$home")/theca-ci-default/Docs (not uploaded)/edit.txt" ||
         { echo "the uninstaller didn't move the drive's edit out" >&2; exit 1; }
 }
 

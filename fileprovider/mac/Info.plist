@@ -36,7 +36,8 @@
 		<true/>
 		<!--
 		  Finder's actions, on the items' userInfo (kept: it or a folder
-		  above; keptItself: it; never the drive itself, its root). Always Keep on This Mac while one isn't kept;
+		  above; keptItself: it; never a drive's folder, nor the drives
+		  folder: fixed). Always Keep on This Mac while one isn't kept;
 		  Free Up Space when all are kept themselves (what a folder keeps
 		  is undone on the folder). The identifiers: protocol::KEEP, FREE.
 		-->
@@ -48,7 +49,7 @@
 				<key>NSExtensionFileProviderActionName</key>
 				<string>Always Keep on This Mac</string>
 				<key>NSExtensionFileProviderActionActivationRule</key>
-				<string>fileproviderItems.@count &gt; 0 AND SUBQUERY(fileproviderItems, $item, $item.userInfo.kept == NO).@count &gt; 0 AND SUBQUERY(fileproviderItems, $item, $item.itemIdentifier == "NSFileProviderRootContainerItemIdentifier").@count == 0</string>
+				<string>fileproviderItems.@count &gt; 0 AND SUBQUERY(fileproviderItems, $item, $item.userInfo.kept == NO).@count &gt; 0 AND SUBQUERY(fileproviderItems, $item, $item.itemIdentifier == "NSFileProviderRootContainerItemIdentifier").@count == 0 AND SUBQUERY(fileproviderItems, $item, $item.userInfo.fixed == YES).@count == 0</string>
 			</dict>
 			<dict>
 				<key>NSExtensionFileProviderActionIdentifier</key>

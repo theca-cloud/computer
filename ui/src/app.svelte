@@ -4,7 +4,6 @@
 	// the settings.
 	import { onMount } from 'svelte';
 	import { invoke } from '@tauri-apps/api/core';
-	import { disable, enable, isEnabled } from '@tauri-apps/plugin-autostart';
 	import AccountCard from '#lib/components/account.svelte';
 	import AccountSettings from '#lib/components/account-settings.svelte';
 	import AskDialog from '#lib/components/ask-dialog.svelte';
@@ -30,7 +29,9 @@
 	let autostart = $state(false);
 
 	onMount(() => {
-		void attempt(isEnabled).then((on) => (autostart = on ?? false));
+		void attempt(() => invoke<boolean>('autostart_enabled')).then(
+			(on) => (autostart = on ?? false)
+		);
 	});
 
 	const status = $derived(app.status);
@@ -58,8 +59,7 @@
 	}
 
 	async function setAutostart(on: boolean) {
-		await attempt(() => (on ? enable() : disable()));
-		autostart = (await attempt(isEnabled)) ?? false;
+		autostart = (await attempt(() => invoke<boolean>('set_autostart', { on }))) ?? autostart;
 	}
 </script>
 

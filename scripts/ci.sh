@@ -183,7 +183,7 @@ if [ "$step" = app ] || { [ "$step" = all ] && [ "$(uname)" = Linux ]; }; then
     npm --prefix ui run build
     dbus-run-session -- xvfb-run -a cargo test --features gui,custom-protocol --test app
     # The app's own unit tests (the tray's summary).
-    cargo test --features gui,custom-protocol,self-update --lib gui::
+    cargo test --features gui,custom-protocol,self-update --lib -- gui:: autostart::
     # The app with self-update, built with a key made for this run (never
     # stored): its tests sign releases with it, as release.yml signs.
     key_dir=$(mktemp -d)
