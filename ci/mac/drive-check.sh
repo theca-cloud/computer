@@ -201,14 +201,32 @@ pgrep -fl theca | grep -q AppTranslocation &&
     stop "opened" "translocated (run from a temporary copy, its drive off): was it dragged in with Finder?"
 result PASS "opened" "theca running from /Applications"
 
+# Start at login named Theca (theca/computer#92): a fresh install turns it on at
+# its first launch, its launch agent naming the app by its bundle identifier,
+# which is what Login Items lists it by (the signer's name otherwise).
+agent=$HOME/Library/LaunchAgents/Theca.plist
+for _ in $(seq 30); do [ -f "$agent" ] && break; sleep 1; done
+if [ ! -f "$agent" ]; then
+    result FAIL "start at login named Theca" "no $agent after 30 s"
+elif plutil -p "$agent" | grep -q rs.theca.computer; then
+    result PASS "start at login named Theca" "$agent names rs.theca.computer"
+else
+    result FAIL "start at login named Theca" "$agent names no app: $(plutil -p "$agent" | tr '\n' ' ')"
+fi
+if confirm "In System Settings → General → Login Items & Extensions, \"Allow in the Background\": is it listed as Theca (not as a person's name)?"; then
+    result PASS "Login Items lists Theca" "by hand"
+else
+    result FAIL "Login Items lists Theca" "listed otherwise"
+fi
+
 pluginkit -m -i rs.theca.computer.drive 2>/dev/null | grep -q rs.theca.computer.drive ||
     stop "extension registered" "pluginkit doesn't list rs.theca.computer.drive"
 result PASS "extension registered" "$(pluginkit -m -i rs.theca.computer.drive | tr -s ' ')"
 
 # A clean start: earlier checks' drives (one left keeps its folder's name,
 # and a new drive of that name is refused).
-if [ -n "$(ls -A "$HOME/Library/CloudStorage" 2>/dev/null | grep '^Theca-')" ]; then
-    echo "Theca drives are on this Mac already: $(ls "$HOME/Library/CloudStorage" | grep '^Theca-' | tr '\n' ' ')"
+if [ -n "$(ls -A "$HOME/Library/CloudStorage" 2>/dev/null | grep '^Theca')" ]; then
+    echo "Theca drives are on this Mac already: $(ls "$HOME/Library/CloudStorage" | grep '^Theca' | tr '\n' ' ')"
     confirm "Remove them all (what isn't uploaded is kept by macOS)?" ||
         stop "a clean start" "Theca drives left on this Mac"
     cleaned=$("$theca" --state "$work/clean.sqlite" remove-drives --all 2>&1) ||
@@ -238,13 +256,14 @@ else
     result PASS "switched on" "by hand"
 fi
 
-# The folder macOS made: the one new in ~/Library/CloudStorage, listed once
-# the app serves the drive (the app notices an account the CLI logged in
-# within 30 s).
+# The folder macOS made for the one entry, Theca: the one new in
+# ~/Library/CloudStorage; the drive is a folder of it, named as its library,
+# listed once the app serves the drive (the app notices an account the CLI
+# logged in within 30 s).
 folder=
 for _ in $(seq 90); do
     new=$(comm -13 <(echo "$before") <(ls -A "$storage" 2>/dev/null))
-    [ -n "$new" ] && folder=$storage/$(echo "$new" | head -1)
+    [ -n "$new" ] && folder=$storage/$(echo "$new" | head -1)/$library
     [ -n "$folder" ] && [ -e "$folder/top.txt" ] && break
     sleep 1
 done
@@ -344,6 +363,13 @@ fi
 
 if removed=$("$theca" remove "$library" 2>&1); then
     result PASS "drive removed" "$library"
+    # The last drive takes the one entry with it.
+    for _ in $(seq 30); do [ ! -e "$folder" ] && break; sleep 1; done
+    if [ -e "$folder" ]; then
+        result FAIL "the entry removed with the last drive" "$folder is still there after 30 s"
+    else
+        result PASS "the entry removed with the last drive" "$folder gone"
+    fi
 else
     result FAIL "drive removed" "$removed"
 fi

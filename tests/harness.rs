@@ -390,7 +390,7 @@ fn a_killed_drive_test_leaves_nothing() {
         processes: vec![daemon, server],
         database: Some(said[3].to_owned()),
     };
-    let mounted = || theca::drive::fuse::mounted(folder);
+    let mounted = || theca::drive::fuse::mounted(folder.parent().unwrap());
     assert!(
         running(daemon) && running(server) && mounted(),
         "nothing to leave behind"
@@ -429,7 +429,7 @@ async fn a_daemon_killed_mid_read_fails_the_read() {
         read.recv_timeout(Duration::from_secs(2)).is_err(),
         "the read wasn't stalled"
     );
-    let mounted = || theca::drive::fuse::mounted(&d.folder);
+    let mounted = || theca::drive::fuse::mounted(d.folder.parent().unwrap());
     assert!(running(daemon) && mounted());
     let killed = Command::new("kill")
         .args(["-KILL", &daemon.to_string()])
@@ -499,11 +499,11 @@ async fn a_drive_that_never_answers_fails_at_its_deadline() {
 
     // The read was stalled for real, and ends once its drive's engine has.
     assert!(!returned.load(Ordering::SeqCst), "the read wasn't stalled");
-    assert!(running(daemon) && theca::drive::fuse::mounted(&folder));
+    assert!(running(daemon) && theca::drive::fuse::mounted(folder.parent().unwrap()));
     drop(d);
     assert!(
         within(Duration::from_secs(5), || returned.load(Ordering::SeqCst)),
         "the read still waits, its drive's engine stopped"
     );
-    assert!(!running(daemon) && !theca::drive::fuse::mounted(&folder));
+    assert!(!running(daemon) && !theca::drive::fuse::mounted(folder.parent().unwrap()));
 }

@@ -8,6 +8,25 @@ use std::path::Path;
 use crate::local::{self, Scan};
 use crate::state::{self, State};
 
+/// A mutex's guard, a poisoned one included: a thread that panicked holding it
+/// left the data as it was, and a drive goes on (what it serves is rebuilt from
+/// the state and the disk).
+pub(crate) fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `lock`, for a read lock.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn lock_read<T>(m: &std::sync::RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    m.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `lock`, for a write lock.
+#[cfg(any(target_os = "linux", windows))]
+pub(crate) fn lock_write<T>(m: &std::sync::RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    m.write().unwrap_or_else(|e| e.into_inner())
+}
+
 pub mod busy;
 #[cfg(windows)]
 pub mod cloud;
@@ -17,6 +36,8 @@ pub mod fuse;
 #[cfg(target_os = "linux")]
 pub mod placeholder;
 pub mod provider;
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+pub mod relocate;
 pub mod runs;
 
 /// The default limit: at most this, and at most a tenth of the disk holding
@@ -48,36 +69,44 @@ pub fn backing(state: &State, pair: i64) -> Option<std::path::PathBuf> {
     Some(data.join("drives").join(pair.to_string()))
 }
 
-/// A drive served while its engine runs: mounted (FUSE), or connected
-/// (Windows' sync root); what it serves is busy for the rounds.
+/// The drives of a process, listed in one entry: the one mount of the drives
+/// folder (FUSE), or its one connected sync root (Windows).
+#[cfg(target_os = "linux")]
+pub type Drives = fuse::Drives;
+#[cfg(windows)]
+pub type Drives = cloud::Drives;
+
+/// A drive served while its engine runs; what it serves is busy for the
+/// rounds.
 #[cfg(target_os = "linux")]
 pub type Served = fuse::Mount;
 #[cfg(windows)]
-pub type Served = cloud::Root;
+pub type Served = cloud::Mount;
 
-/// `pair` (as its rounds see it) served on its own folder: a FUSE drive
-/// mounted once that folder is bare; a Windows drive's sync root connected.
-/// Why not, otherwise (the pair stops for its folder).
+/// `pair` (as its rounds see it) served in its folder of the drives folder,
+/// which is mounted (FUSE, once it is bare) or connected (Windows) with the
+/// first drive. Why not, otherwise (the pair stops for its folder).
 #[cfg(any(target_os = "linux", windows))]
 pub fn serve(
+    drives: &std::sync::Arc<Drives>,
     pair: &crate::state::Pair,
     folder: &Path,
     fetcher: fetch::Fetcher,
 ) -> Result<Served, String> {
-    #[cfg(target_os = "linux")]
-    return fuse::bare(folder).and_then(|()| {
-        fuse::mount(pair, folder, fetcher).map_err(|e| {
+    let place = folder.parent().unwrap_or(folder);
+    drives.serve(pair, folder, fetcher).map_err(|e| {
+        #[cfg(target_os = "linux")]
+        {
             let fuse = if fuse::available() {
                 ""
             } else {
                 " (install fuse3)"
             };
-            format!("{} can't be mounted{fuse}: {e}", folder.display())
-        })
-    });
-    #[cfg(windows)]
-    return cloud::connect(pair, fetcher)
-        .map_err(|e| format!("{} can't be connected: {e}", folder.display()));
+            format!("{} can't be mounted{fuse}: {e}", place.display())
+        }
+        #[cfg(windows)]
+        format!("{} can't be connected: {e}", place.display())
+    })
 }
 
 /// Where a drive's rounds work: a FUSE drive's backing folder, a Windows
@@ -185,9 +214,15 @@ impl Removal {
         let step = |what: &'static str| {
             move |e: io::Error| io::Error::new(e.kind(), format!("{what}: {e}"))
         };
+        // A drive made by 1.3.x has a mount of its own on its folder, cleared
+        // here; one of the drives folder is only withdrawn by its engine.
         #[cfg(target_os = "linux")]
-        fuse::clear(&self.mount);
-        // Windows deletes the placeholders not downloaded, leaves the others.
+        if fuse::mounted(&self.mount) {
+            fuse::clear(&self.mount);
+        }
+        // A drive made by 1.3.x had a sync root of its own: unregistered (Windows
+        // deletes the placeholders not downloaded, leaves the others). A drive of
+        // the drives folder is only deleted below, the root being the last one's.
         #[cfg(windows)]
         cloud::unregister(self.library).map_err(step("its sync root not removed"))?;
         let mut moved = 0;
@@ -255,6 +290,8 @@ pub fn finish_removals(state: &State) {
             }
         }
     }
+    #[cfg(windows)]
+    cloud::release(state);
 }
 
 /// A drive's folder scanned: a sync pair's scan, each file saying whether

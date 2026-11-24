@@ -1149,7 +1149,7 @@ async fn a_new_library_becomes_a_drive() {
                 state.pairs().unwrap().iter().any(|p| {
                     p.library == photos.id
                         && p.mode == theca::state::Mode::Drive
-                        && theca::drive::fuse::mounted(&p.path)
+                        && theca::drive::fuse::mounted(p.path.parent().unwrap())
                 })
             })
             .await;
@@ -1235,11 +1235,9 @@ async fn own_call(expected: bool) -> Option<(World, Device)> {
         .await
         .unwrap();
     let drive = || {
-        state
-            .pairs()
-            .unwrap()
-            .into_iter()
-            .find(|p| p.library == photos.id && theca::drive::fuse::mounted(&p.path))
+        state.pairs().unwrap().into_iter().find(|p| {
+            p.library == photos.id && theca::drive::fuse::mounted(p.path.parent().unwrap())
+        })
     };
     eventually("Photos a drive, mounted", || async { drive().is_some() }).await;
     let inside = drive().unwrap().path.join("elsewhere");

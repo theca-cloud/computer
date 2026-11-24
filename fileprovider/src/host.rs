@@ -71,15 +71,42 @@ fn wait(call: impl FnOnce(&block2::DynBlock<dyn Fn(*mut NSError)>)) -> Result<()
 fn wait_coded(
     call: impl FnOnce(&block2::DynBlock<dyn Fn(*mut NSError)>),
 ) -> Result<(), (String, Option<isize>)> {
+    wait_within(WAIT, call)
+}
+
+/// A reply block's type, `void (^)(NSError *)`, which the block carries:
+/// without it (`RcBlock::new` gives none) a call the system forwards over XPC
+/// ends in "a NULL reply block was passed" (`caught_up`, on a runner).
+struct ErrorReply;
+
+// SAFETY: the encoding is that of `void (^)(NSError *)` on 64 bits (the
+// only Macs we build for).
+unsafe impl block2::ManualBlockEncoding for ErrorReply {
+    type Arguments = (*mut NSError,);
+    type Return = ();
+    const ENCODING_CSTR: &'static std::ffi::CStr = c"v16@?0@\"NSError\"8";
+}
+
+/// `wait_coded`, for `limit` at most.
+fn wait_within(
+    limit: Duration,
+    call: impl FnOnce(&block2::DynBlock<dyn Fn(*mut NSError)>),
+) -> Result<(), (String, Option<isize>)> {
     let (tx, rx) = mpsc::channel();
-    let block = RcBlock::new(move |error: *mut NSError| {
+    let block = RcBlock::with_encoding::<_, _, _, ErrorReply>(move |error: *mut NSError| {
         let _ = tx.send(describe(error).map(|why| (why, code(error))));
     });
     call(&block);
-    match rx.recv_timeout(WAIT) {
+    match rx.recv_timeout(limit) {
         Ok(None) => Ok(()),
         Ok(Some(error)) => Err(error),
-        Err(_) => Err(("no answer from the system".into(), None)),
+        Err(_) => {
+            // The system may still answer, to a block it holds: one freed
+            // by now raises an exception that ends this process (found with
+            // `caught_up`, on a runner).
+            std::mem::forget(block);
+            Err(("no answer from the system".into(), None))
+        }
     }
 }
 
@@ -176,6 +203,20 @@ fn manager(id: &str) -> Result<Retained<NSFileProviderManager>, String> {
         .ok_or_else(|| format!("no drive {id} on this Mac"))
 }
 
+/// What the system holds below `item` (a drive's folder) caught up with: its
+/// local changes handed to the extension and answered. Waited for `within`
+/// at most; why not, otherwise (offline, an upload refused). That it waits
+/// for the uploads still queued is assumed from Apple's documentation.
+pub fn caught_up(id: &str, item: &str, within: Duration) -> Result<(), String> {
+    let manager = manager(id)?;
+    let item = NSString::from_str(item);
+    // SAFETY: a valid identifier and block.
+    wait_within(within, |block| unsafe {
+        manager.waitForChangesOnItemsBelowItemWithIdentifier_completionHandler(&item, block)
+    })
+    .map_err(|(why, _)| why)
+}
+
 /// Changes to show: the system asks the extension for them.
 pub fn signal(id: &str) -> Result<(), String> {
     let manager = manager(id)?;
@@ -195,16 +236,13 @@ pub struct Refused {
     pub kept: bool,
 }
 
-/// A drive's file downloaded now, by reading its first byte on this thread
-/// with downloads on (a thread may have them off: a service's): what
-/// keeping a file means. Asked through the File Provider instead, macOS
-/// queues it as a background task, which may wait (sprint 18, on a laptop).
-pub fn materialize(path: &std::path::Path) -> Result<(), String> {
-    use std::io::Read;
-    // sys/resource.h (not in the libc crate).
-    const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: libc::c_int = 3;
-    const IOPOL_SCOPE_THREAD: libc::c_int = 1;
-    const IOPOL_MATERIALIZE_DATALESS_FILES_ON: libc::c_int = 2;
+// sys/resource.h (not in the libc crate).
+const IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES: libc::c_int = 3;
+const IOPOL_SCOPE_PROCESS: libc::c_int = 0;
+const IOPOL_SCOPE_THREAD: libc::c_int = 1;
+const IOPOL_MATERIALIZE_DATALESS_FILES_ON: libc::c_int = 2;
+
+fn downloads_on(scope: libc::c_int) {
     unsafe extern "C" {
         fn setiopolicy_np(
             iotype: libc::c_int,
@@ -212,14 +250,30 @@ pub fn materialize(path: &std::path::Path) -> Result<(), String> {
             policy: libc::c_int,
         ) -> libc::c_int;
     }
-    // SAFETY: a plain system call on this thread.
+    // SAFETY: a plain system call.
     unsafe {
         setiopolicy_np(
             IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES,
-            IOPOL_SCOPE_THREAD,
+            scope,
             IOPOL_MATERIALIZE_DATALESS_FILES_ON,
         )
     };
+}
+
+/// Downloads on for this whole process and the ones it starts: a service's
+/// (a CI runner's) refuses to read a drive's folders and files that aren't
+/// here (`EDEADLK`). For a test reading the domain as files.
+pub fn downloads_on_in_process() {
+    downloads_on(IOPOL_SCOPE_PROCESS);
+}
+
+/// A drive's file downloaded now, by reading its first byte on this thread
+/// with downloads on (a thread may have them off: a service's): what
+/// keeping a file means. Asked through the File Provider instead, macOS
+/// queues it as a background task, which may wait (sprint 18, on a laptop).
+pub fn materialize(path: &std::path::Path) -> Result<(), String> {
+    use std::io::Read;
+    downloads_on(IOPOL_SCOPE_THREAD);
     let mut byte = [0; 1];
     std::fs::File::open(path)
         .and_then(|mut f| f.read(&mut byte))

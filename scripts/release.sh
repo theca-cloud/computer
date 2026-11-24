@@ -131,9 +131,9 @@ fi
 cat <<AFTER
 
 Once GitHub's release run has published $next:
-  1. packages.theca.rs: on chapter.li, \`theca-packages/pull.sh $next\` (then \`docker compose\` needs nothing).
+  1. packages.theca.rs: on chapter.li, \`theca-packages/pull.sh $next\` (then \`docker compose\` needs nothing). Within three hours of the tag: the store job waits for the Windows installer it serves.
   2. A channel job that failed is re-run alone (\`gh run rerun <run> --job <id>\`); the release stays.
   3. theca.rs/computer: bump COMPUTER_VERSION in saas to $next, then deploy.
-  4. winget, a package's first version: submit the winget-manifests artifact of the run by hand; the Store's too (Partner Center), then set the repository variable STORE_LISTED to true.
+  4. winget, a package's first version: submit the winget-manifests artifact of the run by hand; the Store's too (Partner Center, the installer at https://packages.theca.rs/windows/$next/theca-$next-windows-x86_64.exe), then set the repository variable STORE_LISTED to true.
   5. Announce $next on Discord (https://discord.gg/JBTfacSm4G), once the steps above are done: what changed, from the release's notes.
 AFTER

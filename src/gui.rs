@@ -16,6 +16,7 @@ use theca_common::api;
 use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
+use crate::autostart;
 use crate::engine::{self, Handle};
 use crate::ops;
 use crate::state::{Mode, NewLibraries, Notice, State, Update};
@@ -119,10 +120,6 @@ pub fn run(
             let _ = args;
             open_window(app)
         }))
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            Some(vec!["--background"]),
-        ))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
@@ -169,6 +166,8 @@ pub fn run(
             set_updates,
             check_updates,
             install_update,
+            autostart_enabled,
+            set_autostart,
             quit,
         ])
         .setup(move |app| {
@@ -925,7 +924,6 @@ fn autostart_rule(decided: bool, has_account: bool) -> Autostart {
 /// failure to turn it on (no autostart folder, say) is logged and the row is
 /// not written, so the next launch tries again.
 fn decide_autostart(app: &AppHandle, has_account: bool) {
-    use tauri_plugin_autostart::ManagerExt;
     let state = state(app);
     let decided = match state.setting(AUTOSTART_DECIDED) {
         Ok(row) => row.is_some(),
@@ -934,15 +932,51 @@ fn decide_autostart(app: &AppHandle, has_account: bool) {
             return;
         }
     };
+    let launcher = match launcher(app) {
+        Ok(launcher) => launcher,
+        Err(e) => {
+            tracing::warn!("autostart: {e}");
+            return;
+        }
+    };
     if autostart_rule(decided, has_account) == Autostart::Enable
-        && let Err(e) = app.autolaunch().enable()
+        && let Err(e) = autostart::set(&launcher, true)
     {
         tracing::warn!("autostart: not turned on ({e})");
         return;
     }
+    // An entry already on is written again (1.3.x's has no bundle identifier).
+    if let Err(e) = autostart::refresh(&launcher) {
+        tracing::warn!("autostart: not refreshed ({e})");
+    }
     if !decided && let Err(e) = state.set_setting(AUTOSTART_DECIDED, "1") {
         tracing::warn!("autostart: not recorded ({e})");
     }
+}
+
+/// The start-at-login launcher of this app (`autostart.rs`).
+fn launcher(app: &AppHandle) -> Result<auto_launch::AutoLaunch, autostart::Error> {
+    // Only Linux has an AppImage (`tauri::Env` has the field there only).
+    #[cfg(target_os = "linux")]
+    let appimage = app.env().appimage.map(PathBuf::from);
+    #[cfg(not(target_os = "linux"))]
+    let appimage: Option<PathBuf> = None;
+    autostart::launcher(&app.package_info().name, appimage.as_deref())
+}
+
+/// Whether the app starts at login: the window's switch.
+#[tauri::command]
+fn autostart_enabled(app: AppHandle) -> Answer<bool> {
+    let launcher = launcher(&app).map_err(err)?;
+    launcher.is_enabled().map_err(err)
+}
+
+/// Turns the start at login on or off, and says what it is now.
+#[tauri::command]
+fn set_autostart(app: AppHandle, on: bool) -> Answer<bool> {
+    let launcher = launcher(&app).map_err(err)?;
+    autostart::set(&launcher, on).map_err(err)?;
+    launcher.is_enabled().map_err(err)
 }
 
 /// The app, started at login, can't take the state's lock: `theca run` holds
@@ -1090,8 +1124,9 @@ fn drive_view(state: &State, p: &crate::state::Pair) -> Option<DriveView> {
         downloaded: None,
         kept,
         waiting: None,
-        switch_on: theca_fileprovider::host::enabled(&crate::drive::provider::domain_of(p))
-            == Ok(Some(false)),
+        switch_on: crate::drive::provider::domain_of(state)
+            .ok()
+            .is_some_and(|d| theca_fileprovider::host::enabled(&d) == Ok(Some(false))),
     });
     view.or(Some(DriveView {
         downloaded: None,

@@ -1,6 +1,8 @@
 //! The Theca sync client: local folders kept identical to libraries, both
 //! ways (wiki: Sync client; ADR 0004).
 
+#[cfg(feature = "gui")]
+pub mod autostart;
 pub mod drive;
 pub mod engine;
 pub mod exec;

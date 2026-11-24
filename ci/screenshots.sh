@@ -4,7 +4,8 @@
 # demo, then three screenshots into shots/:
 #   app.png      the app's window, its libraries up to date
 #   folders.png  the file manager on the synced folders
-#   drive.png    the file manager on a library as a drive
+#   drive.png    the file manager on a library as a drive, the sidebar (or navigation
+#                pane) showing the one entry both drives are folders of
 # Used by .github/workflows/release.yml's `screenshots` job, after the package
 # job, on every run: the agent looks at them at /release (CLAUDE.md), nothing
 # here compares pictures. A failure (the demo down, a runner's quirk) holds
@@ -129,7 +130,7 @@ login() {
     # The .deb is updated by apt, and refuses (theca updates).
     if [ "$os" != linux ]; then "$theca" updates off; fi
     "$theca" add Documents
-    "$theca" add 'My files'
+    "$theca" add 'My files' --drive
     "$theca" add Photos --drive
 }
 

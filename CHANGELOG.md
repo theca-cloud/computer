@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.4.0] - 2026-11-24
+
+### Features
+
+- **drive**: One Theca entry for every drive, in a drives folder; start at login named Theca (**breaking**)
+
+### Fixes
+
+- **ci**: Winget's manifests start with their schema header
+- **ci**: The Microsoft Store takes the installer from packages.theca.rs
+- **deps**: Cookie 0.18.3, for RUSTSEC-2026-0594 (private cookie nonces repeating after a fork)
+- **state**: Every write transaction takes the write lock when it begins
+
 ## [1.3.1] - 2026-11-22
 
 ### Fixes

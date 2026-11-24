@@ -15,7 +15,6 @@
 	"license": "AGPL-3.0-only",
 	"dependencies": {
 		"@tauri-apps/api": "2.12.4",
-		"@tauri-apps/plugin-autostart": "2.7.0",
 		"@tauri-apps/plugin-dialog": "2.8.4",
 		"@tauri-apps/plugin-opener": "2.7.2"
 	},

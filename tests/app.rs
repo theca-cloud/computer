@@ -62,9 +62,13 @@ async fn app_from(
     env: &[(&str, &std::path::Path)],
 ) -> (Driver, Client) {
     let port = free_port();
+    // The native driver's port too: on the default one, a test's driver finds
+    // the previous test's native driver still running, and its app.
+    let native = free_port();
     let driver = Driver(
         Command::new("tauri-driver")
             .args(["--port", &port.to_string()])
+            .args(["--native-port", &native.to_string()])
             .env("XDG_CONFIG_HOME", config_home())
             .envs(env.iter().copied())
             .stdout(Stdio::null())
@@ -261,13 +265,15 @@ async fn sign_in_sync_and_an_error() {
 async fn a_drive_in_the_window() {
     let _one = ONE_APP.lock().await;
     let w = world().await;
-    let (dir, state_path, account) = w.logged_in("app").await;
+    let (_dir, state_path, account) = w.logged_in("app").await;
     let state = theca::state::State::open(&state_path).unwrap();
+    // A drive takes no folder: it goes in the state's drives folder (`logged_in`
+    // made it this test's own).
     theca::ops::add(
         &state,
         &account,
         "Docs",
-        Some(dir.path().join("theca/Docs")),
+        None,
         false,
         theca::state::Mode::Drive,
     )
@@ -549,6 +555,85 @@ async fn a_fresh_install_starts_at_login_and_stays_as_the_user_leaves_it() {
     assert!(
         autostart_entries(home.path()).is_empty(),
         "autostart came back after the user turned it off"
+    );
+}
+
+/// The window's Start at login switch (theca/computer#92): it shows what the
+/// entry is, and turns it on and off, through the app's own commands.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_start_at_login_switch_turns_the_entry_on_and_off() {
+    let _one = ONE_APP.lock().await;
+    let w = world().await;
+    // An account already: the app doesn't turn it on itself.
+    let (_dir, state, _account) = w.logged_in("switch").await;
+    // A home of its own: `auto-launch` writes under `$HOME/.config/autostart`.
+    let home = tempfile::tempdir().unwrap();
+    let entries = || -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(home.path().join(".config/autostart"))
+            .map(|dir| dir.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default()
+    };
+    let state_arg = state.to_string_lossy();
+    let (_driver, client) = app_from(
+        std::path::Path::new(env!("CARGO_BIN_EXE_theca")),
+        &["--state", &state_arg],
+        &[("HOME", home.path())],
+    )
+    .await;
+    let switch = client
+        .wait()
+        .at_most(Duration::from_secs(30))
+        .for_element(Locator::Id("autostart"))
+        .await
+        .unwrap();
+    assert_eq!(
+        switch.attr("aria-checked").await.unwrap().as_deref(),
+        Some("false")
+    );
+    assert!(entries().is_empty());
+
+    switch.click().await.unwrap();
+    eventually("the entry written", || async { !entries().is_empty() }).await;
+    let entry = std::fs::read_to_string(&entries()[0]).unwrap();
+    assert!(entry.contains("--background"), "{entry}");
+    eventually("the switch on", || async {
+        switch.attr("aria-checked").await.unwrap().as_deref() == Some("true")
+    })
+    .await;
+
+    switch.click().await.unwrap();
+    eventually("the entry removed", || async { entries().is_empty() }).await;
+    eventually("the switch off", || async {
+        switch.attr("aria-checked").await.unwrap().as_deref() == Some("false")
+    })
+    .await;
+    client.close().await.unwrap();
+}
+
+/// An entry already on (1.3.x's, or one made before the app moved) is written
+/// again at launch, so it names the app as it is now (theca/computer#92: a
+/// Mac's gets its bundle identifier that way).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_entry_already_on_is_written_again_at_launch() {
+    let _one = ONE_APP.lock().await;
+    let w = world().await;
+    let (_dir, state, _account) = w.logged_in("refresh").await;
+    let home = tempfile::tempdir().unwrap();
+    let entry = home.path().join(".config/autostart/Theca.desktop");
+    std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+    std::fs::write(
+        &entry,
+        "[Desktop Entry]\nExec=/old/place/theca --background\n",
+    )
+    .unwrap();
+    let _app = Launched::new(home.path(), &state);
+    wait_until("the entry written again", || {
+        std::fs::read_to_string(&entry).is_ok_and(|e| !e.contains("/old/place"))
+    });
+    let written = std::fs::read_to_string(&entry).unwrap();
+    assert!(
+        written.contains(env!("CARGO_BIN_EXE_theca")) && written.contains("--background"),
+        "{written}"
     );
 }
 

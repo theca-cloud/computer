@@ -404,13 +404,30 @@ jobs:
   # URL and submits it. A product's first submission is made by hand in
   # Partner Center (its listing); this job runs once the repository variable
   # STORE_LISTED is "true". Unproven until a release has gone through it.
+  # The Store refuses an installer URL that redirects, and GitHub's assets
+  # always do: it downloads the one packages.theca.rs serves, which exists
+  # once chapter.li's pull.sh ran by hand. The job waits for it.
   store:
     if: github.ref_type == 'tag' && vars.STORE_LISTED == 'true'
     needs: release
     runs-on: ubuntu-24.04
     environment: channels
+    timeout-minutes: 200
     steps:
       - uses: actions/checkout@v7.0.1
+      - name: The installer on packages.theca.rs
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          url="https://packages.theca.rs/windows/$version/theca-$version-windows-x86_64.exe"
+          # 200 with no redirect followed: what the Store needs. Three hours,
+          # then this job fails: run pull.sh, then re-run it alone.
+          for _ in $(seq 180); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -I "$url" || true)
+            [ "$code" = 200 ] && { echo "served: $url"; exit 0; }
+            sleep 60
+          done
+          echo "::error::$url isn't served ($code): run theca-packages/pull.sh $version on chapter.li, then re-run this job"
+          exit 1
       # msstore v0.4.4 by its checksum, as komac: the action that installs it
       # (microsoft-store-apppublisher) downloads it and checks nothing, in the
       # job that holds the Store's secrets. The archive holds the binary and
@@ -431,7 +448,7 @@ jobs:
           STORE_PRODUCT_ID: ${{ secrets.STORE_PRODUCT_ID }}
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$version/theca-$version-windows-x86_64.exe"
+          url="https://packages.theca.rs/windows/$version/theca-$version-windows-x86_64.exe"
           msstore reconfigure --tenantId "$STORE_TENANT_ID" --sellerId "$STORE_SELLER_ID" \
             --clientId "$STORE_CLIENT_ID" --clientSecret "$STORE_CLIENT_SECRET"
           msstore submission update "$STORE_PRODUCT_ID" \

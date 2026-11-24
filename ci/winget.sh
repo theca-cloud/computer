@@ -26,6 +26,7 @@ mkdir -p "$folder"
 manifest_version=1.10.0
 
 cat >"$folder/$id.yaml" <<YAML
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.$manifest_version.schema.json
 PackageIdentifier: $id
 PackageVersion: $version
 DefaultLocale: en-US
@@ -35,6 +36,7 @@ YAML
 
 # Tauri's NSIS installer, per user (no admin), silent with /S.
 cat >"$folder/$id.installer.yaml" <<YAML
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.$manifest_version.schema.json
 PackageIdentifier: $id
 PackageVersion: $version
 InstallerType: nullsoft
@@ -58,6 +60,7 @@ YAML
 publisher=$(sed -n 's/^ *"publisher": "\(.*\)",$/\1/p' "$(dirname "$0")/../tauri.conf.json" | head -1)
 [ -n "$publisher" ] || { echo "tauri.conf.json has no bundle.publisher" >&2; exit 1; }
 cat >"$folder/$id.locale.en-US.yaml" <<YAML
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.$manifest_version.schema.json
 PackageIdentifier: $id
 PackageVersion: $version
 PackageLocale: en-US

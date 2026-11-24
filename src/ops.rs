@@ -347,10 +347,39 @@ pub async fn add(
     {
         return refused(format!("{} is already synced", found.name));
     }
+    // A drive takes no folder: it is a folder of the drives folder.
+    if mode == Mode::Drive && (path.is_some() || merge) {
+        return refused(drives_refusal(state));
+    }
     // A Mac's drive: the system places its folder (in ~/Library/CloudStorage).
     #[cfg(target_os = "macos")]
     if mode == Mode::Drive {
         return add_mac_drive(state, account, &found).await;
+    }
+    #[cfg(not(target_os = "macos"))]
+    if mode == Mode::Drive {
+        let organization = organization_label(&client, found.organization).await;
+        let taken: Vec<String> = pairs
+            .iter()
+            .filter(|p| p.mode == Mode::Drive)
+            .filter_map(|p| Some(p.path.file_name()?.to_string_lossy().into_owned()))
+            .collect();
+        let name = drive_name(&found.name, &organization, &account.email, &taken);
+        let folder = drives_folder(state)?;
+        // Written with the first drive: the drives stay where they were made
+        // even if the default moves.
+        if state.drives_folder()?.is_none() {
+            state.set_drives_folder(&folder)?;
+        }
+        let path = folder.join(name);
+        // Never anywhere but directly in the drives folder, whatever the name.
+        if path.parent() != Some(folder.as_path()) {
+            return refused(format!(
+                "{} isn't a folder of the drives folder",
+                path.display()
+            ));
+        }
+        return add_local(state, account, &found, path, false, mode);
     }
     let path = match path {
         Some(path) => path,
@@ -362,6 +391,20 @@ pub async fn add(
         }
     };
     check_path(state, &path, None)?;
+    add_local(state, account, &found, path, merge, mode)
+}
+
+/// A pair on `path` (a sync pair's folder, or a drive's in the drives
+/// folder), added to the state and set up on the system.
+fn add_local(
+    state: &State,
+    account: &Account,
+    found: &api::Library,
+    path: PathBuf,
+    merge: bool,
+    mode: Mode,
+) -> Result<Pair> {
+    let found = found.clone();
     let holds = std::fs::read_dir(&path).is_ok_and(|mut d| d.next().is_some());
     if holds && !merge {
         let files = local::scan(&path).map_or(0, |s| s.items.iter().filter(|i| i.is_file).count());
@@ -371,8 +414,16 @@ pub async fn add(
             files,
         });
     }
-    std::fs::create_dir_all(&path)
-        .map_err(|e| OpError::Refused(format!("{}: {e}", path.display())))?;
+    // A Linux drive's folder is a folder of the mount, never made on disk (the
+    // drives folder exists only while mounted).
+    #[cfg(target_os = "linux")]
+    let made = mode != Mode::Drive;
+    #[cfg(not(target_os = "linux"))]
+    let made = true;
+    if made {
+        std::fs::create_dir_all(&path)
+            .map_err(|e| OpError::Refused(format!("{}: {e}", path.display())))?;
+    }
     let mut pair = Pair {
         id: 0,
         account: account.id,
@@ -408,21 +459,10 @@ pub async fn add(
                 return Err(e);
             }
         },
-        // A sync root on the folder: what it holds is merged by the first
-        // round, as a sync pair's.
+        // The drives folder a sync root (with the first drive), the drive's
+        // folder a folder of it.
         #[cfg(windows)]
-        Mode::Drive => match crate::drive::cloud::register(&pair).and_then(|()| {
-            // Registered, yet not one Windows serves (a folder in the temp
-            // folder, hidden or system: `UNABLE_TO_MASK_PATH`).
-            if crate::drive::cloud::registered(&pair) {
-                Ok(())
-            } else {
-                let _ = crate::drive::cloud::unregister(pair.library);
-                Err(std::io::Error::other(
-                    "Windows doesn't keep it as a sync root (a hidden, system or temporary folder?)",
-                ))
-            }
-        }) {
+        Mode::Drive => match crate::drive::cloud::prepare(state, &pair) {
             Ok(()) => &pair.path,
             Err(e) => {
                 state.remove_pair(&pair)?;
@@ -439,8 +479,47 @@ pub async fn add(
     Ok(pair)
 }
 
-/// A Mac's drive: its domain added (switched off: the user switches it on in
-/// System Settings), its folder where macOS puts it.
+/// The one domain made if it isn't (with the first drive: switched off, the
+/// user switches it on in System Settings): its folder, where the system put
+/// it; else where it puts it (`Theca`, or `Theca-<name>` for a domain named).
+#[cfg(target_os = "macos")]
+pub(crate) fn ensure_mac_domain(state: &State) -> Result<PathBuf> {
+    let domain = crate::drive::provider::domain_of(state)?;
+    let exists = theca_fileprovider::host::enabled(&domain)
+        .map_err(|e| OpError::Refused(format!("macOS didn't list the drives: {e}")))?
+        .is_some();
+    if !exists {
+        let display = state.drives_name()?;
+        theca_fileprovider::host::add(&domain, &display).map_err(|e| {
+            OpError::Refused(if e.contains("NSCocoaErrorDomain 516") {
+                "macOS refused the drives: ~/Library/CloudStorage/Theca is in the way (a \
+                 leftover Theca domain or folder: remove it in Finder's sidebar, or delete the \
+                 folder)"
+                    .to_owned()
+            } else {
+                format!("macOS refused the drives: {e}")
+            })
+        })?;
+    }
+    Ok(
+        theca_fileprovider::host::folder(&domain).unwrap_or_else(|_| {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            let display = state.drives_name().unwrap_or_default();
+            let folder = if display.is_empty() {
+                "Theca".to_owned()
+            } else {
+                format!("Theca-{display}")
+            };
+            home.join("Library/CloudStorage").join(folder)
+        }),
+    )
+}
+
+/// A Mac's drive: a folder of the one domain, which is added with the first
+/// (switched off: the user switches it on in System Settings), the domain's
+/// folder where macOS puts it.
 #[cfg(target_os = "macos")]
 async fn add_mac_drive(state: &State, account: &Account, found: &api::Library) -> Result<Pair> {
     // Translocated, macOS refuses the drive with a cryptic error (-2002).
@@ -465,79 +544,60 @@ async fn add_mac_drive(state: &State, account: &Account, found: &api::Library) -
         synced_at: None,
         mode: Mode::Drive,
     };
-    let domain = crate::drive::provider::domain_of(&pair);
-    let name = mac_drive_name(account, found).await?;
-    theca_fileprovider::host::add(&domain, &name).map_err(|e| {
-        OpError::Refused(if e.contains("NSCocoaErrorDomain 516") {
-            format!(
-                "macOS refused the drive: ~/Library/CloudStorage/Theca-{name} is in the way \
-                 (an earlier drive's folder: remove it in Finder's sidebar, or delete the folder)"
-            )
-        } else {
-            format!("macOS refused the drive: {e}")
-        })
-    })?;
-    // Known once the system made it; else where it puts them.
-    pair.path = theca_fileprovider::host::folder(&domain).unwrap_or_else(|_| {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        home.join("Library/CloudStorage")
-            .join(format!("Theca-{name}"))
-    });
+    let organization = organization_label(&client(account)?, found.organization).await;
+    let taken: Vec<String> = state
+        .pairs()?
+        .iter()
+        .filter(|p| p.mode == Mode::Drive)
+        .filter_map(|p| Some(p.path.file_name()?.to_string_lossy().into_owned()))
+        .collect();
+    let name = drive_name(&found.name, &organization, &account.email, &taken);
+    let root = ensure_mac_domain(state)?;
+    pair.path = root.join(&name);
+    if pair.path.parent() != Some(root.as_path()) {
+        return refused(format!("{} isn't a folder of Theca", pair.path.display()));
+    }
     pair.id = state.add_pair(&pair)?;
     Ok(pair)
 }
 
-/// A Mac drive's name in Finder, its folder's (`Theca-<name>`): the
-/// library's, unless another drive here has it (macOS refuses two folders of
-/// one name: two accounts' "Documents"), then with its organization's, then a
-/// number.
-#[cfg(target_os = "macos")]
-async fn mac_drive_name(account: &Account, found: &api::Library) -> Result<String> {
-    let taken: Vec<String> = theca_fileprovider::host::domains()
-        .map_err(|e| OpError::Refused(format!("macOS didn't list the drives: {e}")))?
-        .into_iter()
-        .map(|d| local::key(&d.name))
-        .collect();
-    let free = |name: &str| !taken.contains(&local::key(name));
-    if free(&found.name) {
-        return Ok(found.name.clone());
-    }
-    let organization = client(account)?
-        .me()
-        .await
-        .ok()
-        .and_then(|me| {
-            me.organizations
-                .into_iter()
-                .find(|o| o.organization == found.organization)
-        })
-        .map(|o| o.name);
-    let base = match organization {
-        Some(o) => format!("{} ({o})", found.name),
-        None => found.name.clone(),
-    };
-    Ok((1..)
-        .map(|n| {
-            if n == 1 {
-                base.clone()
-            } else {
-                format!("{base} {n}")
-            }
-        })
-        .find(|n| free(n))
-        .expect("a free name"))
-}
-
-/// A Mac's drive removed: macOS deletes its folder but for what wasn't
-/// uploaded yet, which moves to `<default folder>/<library> (not uploaded)`.
+/// A Mac's drive removed: the system's edits in its folder first caught up
+/// with (a wait that doesn't end, offline, refuses the removal with nothing
+/// removed), then the pair out of the state, its folder reported deleted by
+/// the engine; the last drive takes the domain, macOS deleting its folder but
+/// for what wasn't uploaded yet, which moves to
+/// `<default folder>/<library> (not uploaded)`.
 #[cfg(target_os = "macos")]
 fn remove_mac_drive(state: &State, pair: &Pair) -> Result<usize> {
-    let domain = crate::drive::provider::domain_of(pair);
+    use std::time::Duration;
+    let domain = crate::drive::provider::domain_of(state)?;
+    if let Some(uuid) = state.pair_uuid(pair.id)? {
+        let folder = crate::drive::provider::item_id(uuid, None);
+        theca_fileprovider::host::caught_up(&domain, &folder, Duration::from_secs(30)).map_err(
+            |why| {
+                OpError::Refused(format!(
+                    "edits in {} aren't uploaded yet ({why}): try again once online",
+                    pair.library_name
+                ))
+            },
+        )?;
+    }
+    state.remove_pair(pair)?;
+    // The system told: the engine, on its next look, lists the drive no more.
+    if state.pairs()?.iter().any(|p| p.mode == Mode::Drive) {
+        let _ = theca_fileprovider::host::signal(&domain);
+        return Ok(0);
+    }
     let kept = theca_fileprovider::host::remove(&domain)
         .map_err(|e| OpError::Refused(format!("macOS didn't remove the drive: {e}")))?;
-    state.remove_pair(pair)?;
+    keep_aside(state, pair, kept)
+}
+
+/// What macOS kept of a drive removed (its edits not uploaded, in the folder
+/// it names) moved to `<default folder>/<library> (not uploaded)`. How many
+/// files.
+#[cfg(target_os = "macos")]
+pub(crate) fn keep_aside(state: &State, pair: &Pair, kept: Option<PathBuf>) -> Result<usize> {
     // The system names a folder even with nothing left in it to keep: none
     // there is nothing kept.
     let Some(kept) = kept.filter(|k| k.exists()) else {
@@ -653,17 +713,99 @@ pub async fn default_path(
     if !clash {
         return plain;
     }
+    let organization = organization_label(client, organization).await;
+    folder.join(format!("{name} ({organization})"))
+}
+
+/// An organization as a folder name shows it: its name, "My files" for the
+/// personal one, the start of its ID where the account's memberships don't
+/// list it.
+async fn organization_label(client: &Client, organization: Uuid) -> String {
     let membership = client.me().await.ok().and_then(|me| {
         me.organizations
             .into_iter()
             .find(|o| o.organization == organization)
     });
-    let organization = match membership {
+    match membership {
         Some(o) if o.personal => "My files".to_owned(),
         Some(o) => o.name,
         None => organization.to_string()[..8].to_owned(),
+    }
+}
+
+/// The name of a drive's folder in the drives folder, fixed when the drive is
+/// added: the library's; on a clash `<organization> - <library>`; on a further
+/// clash with the account's email as well; then numbered. `taken`: the names
+/// of the other drives' folders, compared as `local::key` compares names.
+pub fn drive_name(library: &str, organization: &str, email: &str, taken: &[String]) -> String {
+    let free = |name: &str| !taken.iter().any(|t| local::key(t) == local::key(name));
+    // An organization names itself as its owner likes: nothing here is more
+    // than one folder's name.
+    let (library, organization, email) = (
+        component(library),
+        component(organization),
+        component(email),
+    );
+    let with_organization = format!("{organization} - {library}");
+    let with_email = format!("{with_organization} ({email})");
+    for name in [&library, &with_organization, &with_email] {
+        if free(name) {
+            return name.to_owned();
+        }
+    }
+    (2..)
+        .map(|n| format!("{with_email} {n}"))
+        .find(|name| free(name))
+        .expect("a free name")
+}
+
+/// A name as one folder's name, on every system: what no file system takes in
+/// a name (separators, `:`, control characters, a trailing dot or space) becomes
+/// `-`, and `.` and `..` are no names.
+fn component(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            c if c.is_control() => '-',
+            c => c,
+        })
+        .collect();
+    let clean = clean.trim_end_matches(['.', ' ']).trim_start();
+    if clean.is_empty() {
+        "-".to_owned()
+    } else {
+        clean.to_owned()
+    }
+}
+
+/// Where this state's drives are listed as one entry (Windows and Linux):
+/// `~/theca-drives`, recorded in the state with the first drive. On a Mac the
+/// system's own folder holds them (`~/Library/CloudStorage`, named by macOS).
+#[cfg(not(target_os = "macos"))]
+pub fn drives_folder(state: &State) -> Result<PathBuf> {
+    if let Some(folder) = state.drives_folder()? {
+        return Ok(folder);
+    }
+    let home = directories::UserDirs::new()
+        .map(|d| d.home_dir().to_owned())
+        .ok_or_else(|| OpError::Refused("no home folder for the drives".into()))?;
+    Ok(home.join("theca-drives"))
+}
+
+/// Why a drive takes no folder: where drives are.
+fn drives_refusal(state: &State) -> String {
+    #[cfg(not(target_os = "macos"))]
+    let place = drives_folder(state).map_or_else(
+        |_| "the drives folder".to_owned(),
+        |f| f.display().to_string(),
+    );
+    #[cfg(target_os = "macos")]
+    let place = {
+        let _ = state;
+        "Theca in Finder's sidebar".to_owned()
     };
-    folder.join(format!("{name} ({organization})"))
+    format!("a drive lives in {place}: drives take no folder (nor --merge)")
 }
 
 /// Refused as a pair's folder (`except`: the pair being moved): inside or
@@ -686,6 +828,19 @@ pub fn check_path(state: &State, path: &Path, except: Option<i64>) -> Result<()>
             "{} holds this app's own data: choose another folder",
             path.display()
         ));
+    }
+    // The drives folder holds the drives only (a drive's own folder isn't
+    // checked here: `add` makes it there).
+    #[cfg(not(target_os = "macos"))]
+    {
+        let drives = self::real(&drives_folder(state)?);
+        if real.starts_with(&drives) || drives.starts_with(&real) {
+            return refused(format!(
+                "{} is inside or around {}, where the drives are",
+                path.display(),
+                drives.display()
+            ));
+        }
     }
     for p in state.pairs()?.iter().filter(|p| Some(p.id) != except) {
         let other = self::real(&p.path);
@@ -842,7 +997,11 @@ fn remove_drive(state: &State, pair: &Pair) -> Result<usize> {
     removal.begin().map_err(failed)?;
     state.remove_pair(pair)?;
     crate::crash_point("drive-removal-forgotten");
-    removal.finish().map_err(failed)
+    let moved = removal.finish().map_err(failed)?;
+    // The last drive: its entry goes with it (Windows' sync root).
+    #[cfg(windows)]
+    crate::drive::cloud::release(state);
+    Ok(moved)
 }
 
 /// Removes an account: its pairs (files kept or deleted as `remove`), then
@@ -981,7 +1140,9 @@ pub fn keep(state: &State, path: &Path, kept: bool) -> Result<Pair> {
     state.set_kept(pair.id, entry.node, kept)?;
     // The system told now: the item's policy changed (downloaded eagerly).
     #[cfg(target_os = "macos")]
-    let _ = theca_fileprovider::host::signal(&crate::drive::provider::domain_of(&pair));
+    if let Ok(domain) = crate::drive::provider::domain_of(state) {
+        let _ = theca_fileprovider::host::signal(&domain);
+    }
     Ok(pair)
 }
 
@@ -1004,11 +1165,15 @@ pub fn free(state: &State, path: &Path) -> Result<Pair> {
 pub fn free_on_mac(state: &State, pair: &Pair, entry: crate::state::Entry) -> Result<()> {
     use std::time::{Duration, Instant};
     state.set_kept(pair.id, entry.node, false)?;
-    let domain = crate::drive::provider::domain_of(pair);
+    let domain = crate::drive::provider::domain_of(state)?;
+    let uuid = state.pair_uuid(pair.id)?;
     let _ = theca_fileprovider::host::signal(&domain);
     let until = Instant::now() + Duration::from_secs(15);
-    let evict = |node: &str| loop {
-        match theca_fileprovider::host::evict(&domain, node) {
+    let evict = |node: uuid::Uuid| loop {
+        let item = uuid.map_or_else(String::new, |u| {
+            crate::drive::provider::item_id(u, Some(node))
+        });
+        match theca_fileprovider::host::evict(&domain, &item) {
             Err(refused) if refused.kept && Instant::now() < until => {
                 std::thread::sleep(Duration::from_millis(250));
             }
@@ -1019,7 +1184,7 @@ pub fn free_on_mac(state: &State, pair: &Pair, entry: crate::state::Entry) -> Re
     let mut refused = Vec::new();
     while let Some(e) = files.pop() {
         if e.is_file {
-            if let Err(why) = evict(&e.node.to_string()) {
+            if let Err(why) = evict(e.node) {
                 refused.push(format!("{}: {why}", e.name));
             }
         } else {
@@ -1059,7 +1224,10 @@ pub fn free(state: &State, path: &Path) -> Result<Pair> {
     // to evict a file another process has open (that one waits for the
     // engine).
     #[cfg(target_os = "linux")]
-    let here = !crate::drive::fuse::mounted(&pair.path);
+    let here = pair
+        .path
+        .parent()
+        .is_none_or(|drives| !crate::drive::fuse::mounted(drives));
     #[cfg(windows)]
     let here = true;
     if here {
@@ -1122,6 +1290,81 @@ pub fn find_account(state: &State, which: Option<&str>) -> Result<Account> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A drive's folder name: the library's; on a clash its organization's
+    /// too; then the account's email; then numbered. Names clash as
+    /// `local::key` compares them (case).
+    #[test]
+    fn a_drive_is_named_by_its_library_then_its_organization_then_its_account() {
+        let name = |taken: &[&str]| {
+            let taken: Vec<String> = taken.iter().map(|t| (*t).to_owned()).collect();
+            drive_name("Docs", "Acme", "me@x", &taken)
+        };
+        assert_eq!(name(&[]), "Docs");
+        assert_eq!(name(&["Other"]), "Docs");
+        assert_eq!(name(&["Docs"]), "Acme - Docs");
+        assert_eq!(name(&["Docs", "Acme - Docs"]), "Acme - Docs (me@x)");
+        assert_eq!(
+            name(&["Docs", "Acme - Docs", "Acme - Docs (me@x)"]),
+            "Acme - Docs (me@x) 2"
+        );
+        assert_eq!(
+            name(&[
+                "Docs",
+                "Acme - Docs",
+                "Acme - Docs (me@x)",
+                "Acme - Docs (me@x) 2"
+            ]),
+            "Acme - Docs (me@x) 3"
+        );
+        // A clash differing only in case is a clash.
+        assert_eq!(name(&["DOCS"]), "Acme - Docs");
+    }
+
+    /// An organization's name is its owner's to choose: whatever it holds, a
+    /// drive's name is one folder's (no separator, no `..`, no drive letter).
+    #[test]
+    fn a_hostile_organization_name_is_one_folder_name() {
+        let taken = vec!["Docs".to_owned()];
+        for organization in [
+            "../../x/evil",
+            "/home/v/.ssh",
+            "..\\..\\x",
+            "C:\\Users",
+            "..",
+            ".",
+            "",
+            "a\u{0}b",
+        ] {
+            let name = drive_name("Docs", organization, "me@x", &taken);
+            let drives = std::path::Path::new("/drives");
+            assert_eq!(drives.join(&name).parent(), Some(drives), "{name:?}");
+            assert!(
+                !name.contains(['/', '\\', ':']) && name != "." && name != "..",
+                "{organization:?} -> {name:?}"
+            );
+        }
+    }
+
+    /// The drives folder holds drives only: a sync pair at, inside or around
+    /// it is refused, with no drive made yet.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_sync_pair_in_the_drives_folder_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let drives = dir.path().join("drives");
+        let state = State::memory().unwrap();
+        state.set_drives_folder(&drives).unwrap();
+        for inside in [drives.clone(), drives.join("Docs"), drives.join("a/b")] {
+            assert!(check_path(&state, &inside, None).is_err(), "{inside:?}");
+        }
+        // Around it: a sync pair's folder would hold the mount.
+        let around = dir.path().join("mine");
+        state.set_drives_folder(&around.join("drives")).unwrap();
+        assert!(check_path(&state, &around, None).is_err());
+        // Beside it, fine.
+        assert!(check_path(&state, &dir.path().join("Docs"), None).is_ok());
+    }
 
     /// The line `login` ends with, per OS and where the app password is: only
     /// a state file's password can serve a Linux service; none on a Mac.

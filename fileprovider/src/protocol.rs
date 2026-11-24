@@ -1,7 +1,7 @@
 //! Between the extension and the app: one JSON request per connection, one
 //! JSON reply (`Reply`), on the socket `SOCKET` in the extension's container.
-//! A domain is a drive, named after its library; an item is a node, the
-//! root `ROOT`.
+//! One domain lists every drive (the drives folder, `ROOT`); a drive is a
+//! folder of it, `<pair uuid>/`, and an item is `<pair uuid>/<node>`.
 
 use std::path::PathBuf;
 
@@ -29,10 +29,10 @@ pub enum Request {
     /// A folder's items (`ROOT` for the root; the working set lists none:
     /// its changes say everything).
     List { domain: String, container: String },
-    /// The anchor now: the drive's counter.
+    /// The anchor now: every drive's counter.
     Anchor { domain: String },
-    /// What changed past `anchor`.
-    Changes { domain: String, anchor: u64 },
+    /// What changed past `anchor`, as the app gave it.
+    Changes { domain: String, anchor: String },
     /// An item's content (its version as the item shows it) written to
     /// `into`, a file the extension can read, then handed to the system.
     Fetch {
@@ -108,6 +108,10 @@ pub struct Item {
     pub kept_itself: bool,
     /// Writable (a read-only library's aren't).
     pub writable: bool,
+    /// A drive's folder, or the drives folder: it holds items, but is never
+    /// renamed, moved, deleted nor kept itself (the library is the drive).
+    #[serde(default)]
+    pub fixed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,12 +122,12 @@ pub enum Reply {
         items: Vec<Item>,
     },
     Anchor {
-        anchor: u64,
+        anchor: String,
     },
     Changes {
         updated: Vec<Item>,
         deleted: Vec<String>,
-        anchor: u64,
+        anchor: String,
     },
     Done,
     Error {
