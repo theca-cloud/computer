@@ -702,7 +702,7 @@ impl State {
             Password::Keychain(secret) => (None, Some(secret)),
         };
         let mut db = self.db();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO account (instance, uuid, email, device, password, secret, default_folder,
                                   new_libraries, auto_sync_limit)
@@ -910,7 +910,7 @@ impl State {
     /// Libraries the account knows from now on: never new again.
     pub fn see(&self, account: i64, libraries: &[Uuid]) -> Result<()> {
         let mut db = self.db();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         for library in libraries {
             tx.execute(
                 "INSERT OR IGNORE INTO seen (account, library) VALUES (?1, ?2)",
@@ -1003,7 +1003,7 @@ impl State {
         // One transaction, the position first: a round's `synced` meanwhile
         // finds it NULL and writes nothing back.
         let mut db = self.db();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "UPDATE pair SET position = NULL, position_event = NULL WHERE id = ?1",
             [pair],
@@ -1085,7 +1085,7 @@ impl State {
     /// running engine, in another process, looks for).
     pub fn set_kept(&self, pair: i64, node: Uuid, kept: bool) -> Result<()> {
         let mut db = self.db();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("UPDATE pair SET seq = seq + 1 WHERE id = ?1", [pair])?;
         tx.execute(
             "UPDATE entry SET kept = ?3, seq = (SELECT seq FROM pair WHERE id = ?1)
@@ -1101,7 +1101,7 @@ impl State {
     /// tells it), or at once by the caller when none runs.
     pub fn set_free(&self, pair: i64, node: Uuid) -> Result<()> {
         let mut db = self.db();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("UPDATE pair SET seq = seq + 1 WHERE id = ?1", [pair])?;
         tx.execute(
             "UPDATE entry SET kept = 0, free = 1, seq = (SELECT seq FROM pair WHERE id = ?1)
@@ -1143,7 +1143,7 @@ impl State {
     /// counter (its change listed past the anchors before it).
     pub fn stamp(&self, pair: i64, e: &Entry) -> Result<()> {
         let mut db = self.db();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("UPDATE pair SET seq = seq + 1 WHERE id = ?1", [pair])?;
         tx.execute(
             "INSERT INTO entry (pair, node, parent, name, is_file, version, size, mtime, file_id, seq)
@@ -1176,7 +1176,7 @@ impl State {
     /// past the anchors before it.
     pub fn stamp_gone(&self, pair: i64, node: Uuid) -> Result<()> {
         let mut db = self.db();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("UPDATE pair SET seq = seq + 1 WHERE id = ?1", [pair])?;
         tx.execute(
             "WITH RECURSIVE below(node) AS (
@@ -1319,7 +1319,7 @@ impl State {
     /// it), its path's notices gone, the remote states it reconciles cleared.
     pub fn synced(&self, pair: i64, e: &Entry, path: Option<&str>, settled: &[Uuid]) -> Result<()> {
         let mut db = self.db();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO entry (pair, node, parent, name, is_file, version, size, mtime, file_id)
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
@@ -1388,7 +1388,7 @@ impl State {
         position: Option<api::Position>,
     ) -> Result<()> {
         let mut db = self.db();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM remote WHERE pair = ?1", [pair])?;
         for (node, state) in states {
             put_remote(&tx, pair, *node, state.as_ref())?;
@@ -1410,7 +1410,7 @@ impl State {
         position: Option<api::Position>,
     ) -> Result<()> {
         let mut db = self.db();
-        let tx = db.transaction()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let followed: bool = tx.query_row(
             "SELECT position IS NOT NULL FROM pair WHERE id = ?1",
             [pair],
