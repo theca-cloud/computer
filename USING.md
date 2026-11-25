@@ -9,7 +9,7 @@ From the channel your system already uses, which keeps Theca up to date too ([Up
 | | The app | CLI (servers) |
 |---|---|---|
 | macOS | [Homebrew](https://brew.sh): `brew install theca-cloud/tap/theca` | the app's own `theca`, which Homebrew puts on your `PATH` |
-| Windows | the Microsoft Store (search for Theca), or `winget install Theca.Theca` | `theca-cli-<version>-windows-x86_64.zip` ([direct downloads](#direct-downloads)) |
+| Windows | the [Microsoft Store](https://apps.microsoft.com/detail/xpdm56pl28s36z), or `winget install Theca.Theca` | `theca-cli-<version>-windows-x86_64.zip` ([direct downloads](#direct-downloads)) |
 | Debian, Ubuntu | our apt repository: `theca` | our apt repository: `theca-cli` |
 | Fedora | our dnf repository: `theca` | our dnf repository: `theca-cli` |
 | Other Linux (Arch too) | the `.AppImage` ([direct downloads](#direct-downloads)) | `theca-cli-<version>-linux-<arch>.tar.gz` |
