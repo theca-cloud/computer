@@ -12,24 +12,23 @@ use objc2::AllocAnyThread;
 use objc2::rc::Retained;
 use objc2_file_provider::{
     NSFileProviderDomain, NSFileProviderDomainRemovalMode, NSFileProviderErrorCode,
-    NSFileProviderErrorDomain, NSFileProviderManager,
+    NSFileProviderErrorDomain, NSFileProviderManager, NSFileProviderManagerDisconnectionOptions,
     NSFileProviderWorkingSetContainerItemIdentifier,
 };
-use objc2_foundation::{NSArray, NSError, NSString, NSURL};
+use objc2_foundation::{NSArray, NSError, NSFileManager, NSString, NSURL};
 
-use crate::protocol::{EXTENSION, ROOT};
+use crate::protocol::{ROOT, group};
 
 const WAIT: Duration = Duration::from_secs(60);
 
-/// The extension's container, where the app creates the socket.
-pub fn container() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(
-        PathBuf::from(home)
-            .join("Library/Containers")
-            .join(EXTENSION)
-            .join("Data"),
-    )
+/// The app group's folder (`~/Library/Group Containers/<group>`), where the
+/// app creates the socket and both keep what they hand each other: the same
+/// call in the app and in the sandboxed extension. None when the process
+/// lacks the group's entitlement.
+pub fn group_folder() -> Option<PathBuf> {
+    NSFileManager::defaultManager()
+        .containerURLForSecurityApplicationGroupIdentifier(&NSString::from_str(&group()))?
+        .to_file_path()
 }
 
 fn describe(error: *mut NSError) -> Option<String> {
@@ -156,6 +155,9 @@ pub struct Domain {
     pub name: String,
     /// Switched on in System Settings.
     pub enabled: bool,
+    /// Present, but cut from its extension (`disconnect`): browsable, and
+    /// what isn't downloaded doesn't open.
+    pub disconnected: bool,
 }
 
 /// Every drive of this app macOS has, whichever state added it.
@@ -177,6 +179,7 @@ pub fn domains() -> Result<Vec<Domain>, String> {
                         id: d.identifier().to_string(),
                         name: d.displayName().to_string(),
                         enabled: d.userEnabled(),
+                        disconnected: d.isDisconnected(),
                     }
                 })
                 .collect();
@@ -195,6 +198,53 @@ pub fn enabled(id: &str) -> Result<Option<bool>, String> {
         .into_iter()
         .find(|d| d.id == id)
         .map(|d| d.enabled))
+}
+
+/// How long the system gets to answer a disconnect or a reconnect: a quit
+/// doesn't wait for a minute.
+const CONNECTING: Duration = Duration::from_secs(10);
+
+/// The domain's manager, built with the display name macOS lists it with: one
+/// made as `manager` does (the id as the name) renamed the drive's folder
+/// `Theca-<id>` for good when it disconnected it, and the name stayed after
+/// the reconnect (found on a runner, theca/computer#120).
+fn listed_manager(id: &str) -> Result<Retained<NSFileProviderManager>, String> {
+    let name = domains()?
+        .into_iter()
+        .find(|d| d.id == id)
+        .ok_or_else(|| format!("no drive {id} on this Mac"))?
+        .name;
+    // SAFETY: a valid domain.
+    unsafe { NSFileProviderManager::managerForDomain(&domain(id, &name)) }
+        .ok_or_else(|| format!("no drive {id} on this Mac"))
+}
+
+/// The drive cut from its extension, saying why in Finder: it stays listed
+/// and browsable, a file not downloaded fails to open at once, and the
+/// extension isn't asked (nor retried for as long as the app is away). Holds
+/// after this process ends, until `reconnect`.
+pub fn disconnect(id: &str, reason: &str) -> Result<(), String> {
+    let manager = listed_manager(id)?;
+    let reason = NSString::from_str(reason);
+    // SAFETY: a valid reason, options and block.
+    wait_within(CONNECTING, |block| unsafe {
+        manager.disconnectWithReason_options_completionHandler(
+            &reason,
+            NSFileProviderManagerDisconnectionOptions::empty(),
+            block,
+        )
+    })
+    .map_err(|(why, _)| why)
+}
+
+/// The drive served by its extension again.
+pub fn reconnect(id: &str) -> Result<(), String> {
+    let manager = listed_manager(id)?;
+    // SAFETY: a valid block.
+    wait_within(CONNECTING, |block| unsafe {
+        manager.reconnectWithCompletionHandler(block)
+    })
+    .map_err(|(why, _)| why)
 }
 
 fn manager(id: &str) -> Result<Retained<NSFileProviderManager>, String> {
@@ -279,6 +329,14 @@ pub fn materialize(path: &std::path::Path) -> Result<(), String> {
         .and_then(|mut f| f.read(&mut byte))
         .map(|_| ())
         .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A drive's folder listed, with downloads on (a thread may have them off: a
+/// service's): the system reads it into its index, which is what the first
+/// visit to a folder waits for (theca/computer#124). How many it holds.
+pub fn list_dir(path: &std::path::Path) -> std::io::Result<usize> {
+    downloads_on(IOPOL_SCOPE_THREAD);
+    Ok(std::fs::read_dir(path)?.count())
 }
 
 /// An item's content dropped (it stays listed); refused while it is open,

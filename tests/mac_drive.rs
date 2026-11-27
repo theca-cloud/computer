@@ -135,6 +135,7 @@ async fn a_mac_drive_is_the_library() {
     let s = w.device("sync").await;
     s.write("a.txt", "hello");
     s.write("d/b.txt", "below");
+    s.write("c.txt", "third");
     w.converge(&[&s]).await;
 
     let (_dir, state_path, _account) = w.logged_in("mac").await;
@@ -196,6 +197,40 @@ async fn a_mac_drive_is_the_library() {
     eventually("the library in the drive's folder", || async {
         read(&a) == "hello"
     })
+    .await;
+
+    // The app and the extension meet in the app group's folder
+    // (theca/computer#118), not in the extension's sandbox: the socket the
+    // app made, what the extension logged and staged for that fetch.
+    let group = PathBuf::from(std::env::var("HOME").unwrap())
+        .join("Library/Group Containers")
+        .join(theca_fileprovider::protocol::group());
+    assert!(group.join("theca.sock").exists(), "{group:?}: no socket");
+    assert!(group.join("drive.log").is_file(), "{group:?}: no drive.log");
+    assert!(group.join("staging").is_dir(), "{group:?}: no staging");
+    let logs = Command::new(&theca)
+        .arg("--state")
+        .arg(&state_path)
+        .arg("logs")
+        .output()
+        .unwrap();
+    let logs = String::from_utf8_lossy(&logs.stdout);
+    assert!(
+        logs.contains(&group.join("drive.log").to_string_lossy().into_owned()),
+        "theca logs names the extension's log in the group: {logs}"
+    );
+
+    // A process that serves no drive (a sync device, here in the test's own
+    // process: an engine with no drive) leaves the extension's socket to the
+    // one that does: bound last, it took the socket and answered "no drive"
+    // (found on a runner: the drive's folder never appeared).
+    let c = folder.join("c.txt");
+    assert_eq!(dataless(&c), Some(true), "c.txt not downloaded yet");
+    let _bystander = w.device("bystander").await;
+    eventually(
+        "a file opens through the extension with a bystander",
+        || async { read(&c) == "third" },
+    )
     .await;
 
     // A folder kept: what is below it downloaded, unread (its own policy,
@@ -418,10 +453,321 @@ async fn a_mac_drive_with_an_edit_waiting_is_not_removed() {
         w.remote(&w.library).await.get("edit.txt") == Some(&Some(b"waiting".to_vec()))
     })
     .await;
-    let removed = theca_do(&["remove", "Docs"]);
+    // The system takes a moment to know the edit is up (until then `remove`
+    // says "try again once online", -2005).
+    eventually("the drive removed once the edit is known up", || async {
+        theca_do(&["remove", "Docs"]).status.success()
+    })
+    .await;
+}
+
+/// A Mac drive reads ahead the folders below what is listed (theca/computer
+/// #124): started, the app lists three levels below the drive's folder
+/// itself; one more level is listed only when the system asks about it (a
+/// click into a folder it hasn't read). Seen through the app's log: the
+/// `List` it answers about folders this test never touched. Level four
+/// isn't read ahead (the app's own reads make the system ask about the three
+/// levels, which start nothing: one click would walk the whole library).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mac_drive_reads_ahead_three_levels_below_what_is_listed() {
+    theca_fileprovider::host::downloads_on_in_process();
+    let _one = ONE_DOMAIN_AT_A_TIME.lock().await;
+    let Some(app) = app() else {
+        return;
+    };
+    let theca = app.join("Contents/MacOS/theca");
+    let w = world().await;
+    let s = w.device("sync").await;
+    s.write("p/q/r/s/t.txt", "level four");
+    s.write("p/q/r/s/u/v.txt", "level five");
+    w.converge(&[&s]).await;
+    let (_dir, state_path, _account) = w.logged_in("mac").await;
+    let _removed = Removed(theca.clone(), state_path.clone());
+    let logs = tempfile::tempdir().unwrap();
+    let set = Command::new(&theca)
+        .arg("--state")
+        .arg(&state_path)
+        .args(["logs", "--level", "debug", "--path"])
+        .arg(logs.path())
+        .output()
+        .unwrap();
     assert!(
-        removed.status.success(),
+        set.status.success(),
         "{}",
-        String::from_utf8_lossy(&removed.stderr)
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let added = Command::new(&theca)
+        .arg("--state")
+        .arg(&state_path)
+        .args(["add", "Docs", "--drive"])
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let pair = State::open(&state_path).unwrap().pairs().unwrap().remove(0);
+    let domain = domain_of(&State::open(&state_path).unwrap()).unwrap();
+    switch_on(&domain, &theca, &state_path);
+    let _run = Running(
+        Command::new(&theca)
+            .arg("--state")
+            .arg(&state_path)
+            .arg("run")
+            .spawn()
+            .unwrap(),
+    );
+    let recorded = State::open(&state_path).unwrap();
+    let path = || recorded.pair(pair.id).unwrap().unwrap().path;
+    eventually("the drive's folder recorded", || async {
+        let path = path();
+        if let Some(domain) = path.parent() {
+            let _ = std::fs::read_dir(domain).map(|d| d.count());
+        }
+        path.is_dir()
+    })
+    .await;
+    let folder = path();
+    let uuid = recorded.pair_uuid(pair.id).unwrap().unwrap();
+    // The node below the library's root, by names, once the app has them.
+    let node = |names: &[&str]| {
+        names.iter().try_fold(pair.root, |parent, name| {
+            recorded
+                .children(pair.id, parent)
+                .ok()?
+                .into_iter()
+                .find(|e| e.name == *name)
+                .map(|e| e.node)
+        })
+    };
+    // How many times the app answered a `List` of that folder.
+    let listed = |names: &[&str]| {
+        let Some(node) = node(names) else {
+            return 0;
+        };
+        let wanted = format!("container: \"{uuid}/{node}\"");
+        std::fs::read_dir(logs.path())
+            .map(|dir| {
+                dir.flatten()
+                    .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+                    .map(|text| text.matches(&wanted).count())
+                    .sum::<usize>()
+            })
+            .unwrap_or_default()
+    };
+
+    // Three levels below the drive's folder, read by the app: p, p/q, p/q/r.
+    eventually("three levels read ahead at the start", || async {
+        listed(&["p", "q", "r"]) > 0
+    })
+    .await;
+    // Not a fourth, nor the ones the app's own reads made the system ask
+    // about: left a while to be sure.
+    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    assert_eq!(
+        listed(&["p", "q", "r", "s"]),
+        0,
+        "level four was read ahead: the app's own reads started more"
+    );
+
+    // A click into level four: the system asks, and the folders below it are
+    // read ahead (p/q/r/s/u), which this test never touches.
+    let four = folder.join("p/q/r/s");
+    let ls = materializing(&["ls", &four.to_string_lossy()]);
+    assert!(
+        ls.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ls.stderr)
+    );
+    eventually("the folder below a listed one read ahead", || async {
+        listed(&["p", "q", "r", "s", "u"]) > 0
+    })
+    .await;
+}
+
+/// `run` stopped as a user quits (SIGTERM, which `theca run` answers by
+/// stopping its engine), and waited for.
+fn stop(mut run: Running) {
+    let pid = run.0.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    for _ in 0..120 {
+        if let Some(status) = run.0.try_wait().unwrap() {
+            assert!(status.success(), "theca run stopped with {status}");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    panic!("theca run didn't stop within a minute");
+}
+
+/// A Mac's drives are cut from their extension while Theca isn't running
+/// and served again when it starts (theca/computer#120): quit, the drive
+/// stays in Finder, its downloaded files read, one not downloaded fails at
+/// once without the extension being asked (connected, it asks the app, which
+/// isn't there, again and again); started, it opens. The drive's folder keeps
+/// its name through both (a disconnect made with the wrong display name
+/// renamed it `Theca-<id>` for good).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mac_drive_is_cut_off_while_theca_is_stopped_and_back_when_it_starts() {
+    theca_fileprovider::host::downloads_on_in_process();
+    let _one = ONE_DOMAIN_AT_A_TIME.lock().await;
+    let Some(app) = app() else {
+        return;
+    };
+    let theca = app.join("Contents/MacOS/theca");
+    let w = world().await;
+    let s = w.device("sync").await;
+    s.write("a.txt", "hello");
+    s.write("d/b.txt", "below");
+    // One nobody opens while Theca is stopped (theca/computer#129).
+    s.write("c.txt", "untouched");
+    w.converge(&[&s]).await;
+    let (_dir, state_path, _account) = w.logged_in("mac").await;
+    let _removed = Removed(theca.clone(), state_path.clone());
+    let added = Command::new(&theca)
+        .arg("--state")
+        .arg(&state_path)
+        .args(["add", "Docs", "--drive"])
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let pair = State::open(&state_path).unwrap().pairs().unwrap().remove(0);
+    let domain = domain_of(&State::open(&state_path).unwrap()).unwrap();
+    switch_on(&domain, &theca, &state_path);
+    let start = || {
+        Running(
+            Command::new(&theca)
+                .arg("--state")
+                .arg(&state_path)
+                .arg("run")
+                .spawn()
+                .unwrap(),
+        )
+    };
+    let recorded = State::open(&state_path).unwrap();
+    let path = || recorded.pair(pair.id).unwrap().unwrap().path;
+    let listed = || {
+        let path = path();
+        if let Some(domain) = path.parent() {
+            let _ = std::fs::read_dir(domain).map(|d| d.count());
+        }
+        path
+    };
+
+    let run = start();
+    eventually("the drive's folder recorded", || async {
+        listed().is_dir()
+    })
+    .await;
+    let folder = path();
+    let (a, b) = (folder.join("a.txt"), folder.join("d/b.txt"));
+    eventually("a.txt downloaded by reading it", || async {
+        read(&a) == "hello"
+    })
+    .await;
+    eventually("b.txt listed, not downloaded", || async {
+        dataless(&b) == Some(true)
+    })
+    .await;
+
+    // The extension's log, its lines saying the app didn't answer.
+    let group = PathBuf::from(std::env::var("HOME").unwrap())
+        .join("Library/Group Containers")
+        .join(theca_fileprovider::protocol::group());
+    let unanswered = || {
+        std::fs::read_to_string(group.join("drive.log"))
+            .unwrap_or_default()
+            .matches("the app didn't answer")
+            .count()
+    };
+
+    // What CloudStorage lists: a disconnect made with the wrong display name
+    // renamed the domain's folder `Theca-<id>` for good.
+    let storage = || {
+        let dir = PathBuf::from(std::env::var("HOME").unwrap()).join("Library/CloudStorage");
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    };
+    let entries = storage();
+    assert!(
+        entries.iter().any(|n| folder.starts_with(
+            PathBuf::from(std::env::var("HOME").unwrap())
+                .join("Library/CloudStorage")
+                .join(n)
+        )),
+        "the drive's folder is in a CloudStorage entry: {entries:?}"
+    );
+
+    stop(run);
+    let before = unanswered();
+    let started = std::time::Instant::now();
+    let failed = materializing(&["cat", &b.to_string_lossy()]);
+    assert!(
+        !failed.status.success(),
+        "a file not downloaded opened with Theca stopped: {}",
+        String::from_utf8_lossy(&failed.stdout)
+    );
+    // The disconnect's own error (errno 60), not another failure.
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains("Operation timed out"),
+        "the open failed another way: {}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(25),
+        "the open failed after {:?}: the extension was asked, not cut off",
+        started.elapsed()
+    );
+    assert_eq!(unanswered(), before, "the extension asked an app not there");
+    assert_eq!(read(&a), "hello", "a downloaded file reads");
+    assert!(
+        listed().is_dir() && path() == folder,
+        "the drive's folder moved or went"
+    );
+    assert_eq!(
+        storage(),
+        entries,
+        "a disconnect renamed or moved the domain's folder"
+    );
+
+    // Started again: served, and the same folder. A file not opened while
+    // Theca was stopped opens; the one that failed then is told apart from it
+    // (the system may hold off on an item whose open failed: #129).
+    let _run = start();
+    let c = folder.join("c.txt");
+    eventually("a file not downloaded opens again", || async {
+        read(&c) == "untouched"
+    })
+    .await;
+    eventually("the file that failed opens again", || async {
+        read(&b) == "below"
+    })
+    .await;
+    assert!(
+        path() == folder && folder.is_dir(),
+        "the drive's folder moved or went"
+    );
+    assert_eq!(
+        storage(),
+        entries,
+        "a reconnect renamed or moved the domain's folder"
     );
 }

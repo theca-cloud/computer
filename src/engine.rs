@@ -116,9 +116,6 @@ pub async fn run(
 ) -> Result<(), EngineError> {
     let mut running: HashMap<i64, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut woken = handle.woken.subscribe();
-    // The File Provider extension's socket, for every macOS drive.
-    #[cfg(target_os = "macos")]
-    crate::drive::provider::listen(handle.provider.clone(), tokio::runtime::Handle::current());
     // Drive removals a crash left half done.
     #[cfg(any(target_os = "linux", windows))]
     crate::drive::finish_removals(&State::open(&state_path)?);
@@ -177,6 +174,22 @@ pub async fn run(
     // root disconnected (it stays registered).
     #[cfg(any(target_os = "linux", windows))]
     handle.drives.shutdown();
+    // macOS keeps the domain listed whatever happens to Theca: said so, by
+    // disconnecting it, once nothing answers for it (a crash leaves it
+    // connected, as before).
+    #[cfg(target_os = "macos")]
+    {
+        handle.provider.stopping();
+        let state = State::open(&state_path)?;
+        let (done, disconnected) = tokio::sync::oneshot::channel();
+        // A thread of our own, not `spawn_blocking`: a runtime being dropped
+        // waits for its blocking tasks, however long the system takes.
+        std::thread::spawn(move || {
+            let _ = done.send(crate::drive::provider::set_connected(&state, false));
+        });
+        // A quit doesn't wait for a system that doesn't answer.
+        let _ = tokio::time::timeout(Duration::from_secs(15), disconnected).await;
+    }
     Ok(())
 }
 
@@ -186,7 +199,7 @@ pub async fn run(
 fn stopped(state_path: &Path, account: i64, e: &EngineError) -> Result<(), StateError> {
     let state = State::open(state_path)?;
     let message = format!("syncing stopped, tried again every 30 s: {e}");
-    state.notify(Some(account), None, "error", None, &message, None)?;
+    state.notify_feed(account, &message)?;
     for p in state.pairs()?.iter().filter(|p| p.account == account) {
         state.set_error(p.id, &e.to_string())?;
     }
@@ -283,6 +296,13 @@ struct Follower {
     /// (said once, not every round).
     #[cfg(target_os = "macos")]
     unchecked: HashMap<i64, String>,
+    /// When the system was last told of the drives, and how many times since
+    /// they last changed (`serve`).
+    #[cfg(target_os = "macos")]
+    told: (Instant, u32),
+    /// The macOS drives whose own folder was read ahead, this run.
+    #[cfg(target_os = "macos")]
+    read_ahead: HashSet<i64>,
     /// The macOS drives whose kept files are being downloaded (a thread
     /// each, at most).
     #[cfg(target_os = "macos")]
@@ -387,6 +407,10 @@ async fn follow(
         #[cfg(target_os = "macos")]
         unchecked: HashMap::new(),
         #[cfg(target_os = "macos")]
+        told: (Instant::now(), 0),
+        #[cfg(target_os = "macos")]
+        read_ahead: HashSet::new(),
+        #[cfg(target_os = "macos")]
         materializing: Default::default(),
         stopped_at: HashMap::new(),
         stopping: shutdown.clone(),
@@ -429,23 +453,33 @@ async fn follow(
         .collect();
     let mut feed = Box::pin(f.client.events(after));
     let mut woken = handle.woken.subscribe();
+    // The feed's notices of an earlier attempt end with its first message.
+    let mut answered = false;
     loop {
         f.watch()?;
         tokio::select! {
             message = feed.next() => match message {
                 Some(Ok(FeedMessage::Libraries(libraries))) => {
                     tracing::debug!(libraries = libraries.len(), "the feed: libraries");
+                    if !std::mem::replace(&mut answered, true) {
+                        f.state.clear_feed_notices(f.account.id)?;
+                    }
                     f.libraries(libraries).await?
                 }
                 Some(Ok(FeedMessage::Changes(changes))) => {
                     tracing::debug!(?changes, "the feed: changes");
+                    if !std::mem::replace(&mut answered, true) {
+                        f.state.clear_feed_notices(f.account.id)?;
+                    }
                     f.changes(changes).await?
                 }
                 Some(Err(e)) => {
                     if matches!(e.code(), Some("unauthenticated")) {
                         sign_out(&f.state, &f.account, "the server refused its app password")?;
                     } else {
-                        f.state.notify(Some(f.account.id), None, "error", None, &e.to_string(), None)?;
+                        // Said until the feed answers again: a redeploy's
+                        // blip no longer stays on the screen.
+                        f.state.notify_feed(f.account.id, &e.to_string())?;
                     }
                     return Ok(());
                 }
@@ -831,6 +865,26 @@ impl Follower {
                 continue;
             };
             if self.served.get(&p.id) != Some(&(uuid, active)) {
+                // The extension's socket, for every macOS drive of this
+                // process: answered from the first one served, never by a
+                // process with none.
+                if self.provider.first_served() {
+                    drive::provider::listen(
+                        self.provider.clone(),
+                        tokio::runtime::Handle::current(),
+                    );
+                    // Left disconnected by the last stop
+                    // (theca/computer#120): served again, now that there is a
+                    // socket to answer on (the extension retries its
+                    // connection for a few seconds). In the background: the
+                    // system's answers can take their time, and the engine
+                    // doesn't wait for them.
+                    #[cfg(target_os = "macos")]
+                    drive::provider::reconnect_until_served(
+                        self.provider.clone(),
+                        self.provider_state.clone(),
+                    );
+                }
                 self.provider.serve(
                     p,
                     uuid,
@@ -842,12 +896,29 @@ impl Follower {
                 changed |= !self.served.contains_key(&p.id);
                 self.served.insert(p.id, (uuid, active));
             }
+            // The drive's own folder read ahead once it is in the domain
+            // (asked again every tick until then): the first clicks.
+            if active && !self.read_ahead.contains(&p.id) && self.provider.read_ahead_drive(uuid) {
+                self.read_ahead.insert(p.id);
+            }
         }
-        if changed
+        // The system listed the domain before a drive was served, and the
+        // signal that told it came to nothing (found on a runner: the drive's
+        // folder never appeared): told again every 2 s until it has listed
+        // the drive, 20 times at most (a domain switched off never will).
+        if changed {
+            self.told = (Instant::now() - Duration::from_secs(2), 0);
+        }
+        let again = self.told.1 < 20
+            && self.told.0.elapsed() >= Duration::from_secs(2)
+            && self.provider.unannounced();
+        if (changed || again)
             && let Ok(domain) = drive::provider::domain_of(&self.state)
-            && let Err(e) = theca_fileprovider::host::signal(&domain)
         {
-            tracing::debug!("the system not told of the drives: {e}");
+            self.told = (Instant::now(), self.told.1 + 1);
+            if let Err(e) = theca_fileprovider::host::signal(&domain) {
+                tracing::debug!("the system not told of the drives: {e}");
+            }
         }
     }
 

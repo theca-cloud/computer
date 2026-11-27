@@ -1,8 +1,8 @@
 //! macOS's drive: what the File Provider extension and the app share.
 //!
 //! The extension decides nothing: every call the system makes is forwarded
-//! to the running app over a Unix socket the app creates in the extension's
-//! container (`protocol`), and the app answers from the drive's entries.
+//! to the running app over a Unix socket the app creates in the app group's
+//! folder (`protocol`), and the app answers from the drive's entries.
 
 pub mod log_file;
 pub mod protocol;

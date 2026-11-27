@@ -76,7 +76,7 @@ keep_logs() {
     local logs=$here/results/check-$(date +%Y%m%d-%H%M%S)
     mkdir -p "$logs"
     cp -R "$data/logs" "$logs/app" 2>/dev/null
-    cp "$HOME/Library/Containers/rs.theca.computer.drive/Data/drive.log" "$logs/" 2>/dev/null
+    cp "$HOME/Library/Group Containers/"*.rs.theca.computer/drive.log "$logs/" 2>/dev/null
     log show --last 30m --style compact \
         --predicate 'process == "theca-drive" OR process == "fileproviderd" OR process == "theca"' \
         2>/dev/null | grep -i -E 'theca|DriveTest' | tail -2000 >"$logs/system.log"

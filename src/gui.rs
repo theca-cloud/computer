@@ -162,6 +162,7 @@ pub fn run(
             logs,
             set_logs,
             open_logs,
+            open_folder,
             updates,
             set_updates,
             check_updates,
@@ -693,8 +694,14 @@ fn open_window(app: &AppHandle) {
         {
             api.prevent_close();
             let (app, window) = (app.clone(), window.clone());
+            // On a Mac the drives stay in Finder after a quit (theca/computer#120).
+            let message = if cfg!(target_os = "macos") {
+                "Keep syncing in the background? Open Theca again from your apps to see this window. If you quit, your drives stay in Finder, but files not downloaded won't open until Theca runs again."
+            } else {
+                "Keep syncing in the background? Open Theca again from your apps to see this window."
+            };
             app.dialog()
-                .message("Keep syncing in the background? Open Theca again from your apps to see this window.")
+                .message(message)
                 .title("Quit Theca?")
                 .buttons(MessageDialogButtons::OkCancelCustom(
                     "Keep syncing".into(),
@@ -1492,6 +1499,32 @@ fn open_logs(app: AppHandle) -> Answer<()> {
         .map_err(|e| e.to_string())
 }
 
+/// The folder of the pair the page names, for the file manager: refused for
+/// one this state doesn't have, since the page only ever names pairs (a path
+/// it gave would open anything).
+fn folder_of(state: &State, pair: i64) -> Answer<PathBuf> {
+    Ok(state.pair(pair).map_err(err)?.ok_or("no such folder")?.path)
+}
+
+/// A pair's folder (a drive's: its folder in the drives entry), in the file
+/// manager.
+#[tauri::command]
+fn open_folder(app: AppHandle, pair: i64) -> Answer<()> {
+    let folder = folder_of(&state(&app), pair)?;
+    // A library named `Photos.app` is a folder, which macOS would open as a
+    // program: shown in its parent instead (`ops::component` keeps the
+    // extension of a library's name).
+    if cfg!(target_os = "macos") && folder.extension().is_some() {
+        return app
+            .opener()
+            .reveal_item_in_dir(&folder)
+            .map_err(|e| e.to_string());
+    }
+    app.opener()
+        .open_path(folder.to_string_lossy(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
 /// Stops syncing a pair; how many files were kept (not synced) when deleting.
 #[tauri::command]
 fn remove(app: AppHandle, pair: i64, delete_files: bool) -> Answer<usize> {
@@ -1590,6 +1623,45 @@ mod tests {
         assert_eq!(autostart_rule(false, true), Autostart::Leave);
         assert_eq!(autostart_rule(true, false), Autostart::Leave);
         assert_eq!(autostart_rule(true, true), Autostart::Leave);
+    }
+
+    /// "Open folder" names a pair, never a path: a pair this state has opens
+    /// its own folder, any other number is refused.
+    #[test]
+    fn open_folder_takes_only_a_pair_of_this_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = State::open(&dir.path().join("state.sqlite")).unwrap();
+        assert_eq!(folder_of(&state, 7), Err("no such folder".to_owned()));
+        let account = state
+            .save_account(&crate::state::Account {
+                id: 0,
+                uuid: Uuid::now_v7(),
+                ..account(false)
+            })
+            .unwrap();
+        let pair = crate::state::Pair {
+            id: 0,
+            account,
+            library: Uuid::now_v7(),
+            root: Uuid::now_v7(),
+            library_name: "Docs".into(),
+            path: "/home/a/theca/Docs".into(),
+            root_file_id: None,
+            position: None,
+            position_event: None,
+            paused: false,
+            stop: None,
+            writable: true,
+            activity: "up to date".into(),
+            error: None,
+            synced_at: None,
+            mode: Mode::Sync,
+        };
+        let id = state.add_pair(&pair).unwrap();
+        assert_eq!(
+            folder_of(&state, id),
+            Ok(PathBuf::from("/home/a/theca/Docs"))
+        );
     }
 
     fn account(signed_out: bool) -> crate::state::Account {

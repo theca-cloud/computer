@@ -86,5 +86,5 @@ jobs:
       - name: The drive's logs
         if: failure() && runner.os == 'macOS'
         run: |
-          cat "$HOME/Library/Containers/rs.theca.computer.drive/Data/drive.log" || true
+          cat "$HOME/Library/Group Containers/"*.rs.theca.computer/drive.log || true
           log show --last 15m --style compact --predicate 'process == "theca-drive" OR process == "fileproviderd" OR subsystem == "com.apple.FileProvider"' | tail -300

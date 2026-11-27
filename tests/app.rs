@@ -112,6 +112,40 @@ async fn shown(client: &Client, text: &str) -> fantoccini::elements::Element {
         .unwrap_or_else(|e| panic!("never shown: {text:?} ({e})"))
 }
 
+/// A click on the element at `xpath` once it can take one: found, shown and
+/// still (a menu opening animates), within 30 s.
+async fn clicked(client: &Client, xpath: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let tried = match client.find(Locator::XPath(xpath)).await {
+            Ok(element) => element.click().await,
+            Err(e) => Err(e),
+        };
+        match tried {
+            Ok(()) => return,
+            Err(e) if Instant::now() < deadline => {
+                let _ = e;
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => panic!("never clickable: {xpath} ({e})"),
+        }
+    }
+}
+
+/// A page of the window (`libraries`, `activity`, `accounts`, `settings`),
+/// through its button in the sidebar.
+async fn go(client: &Client, page: &str) {
+    client
+        .wait()
+        .at_most(Duration::from_secs(30))
+        .for_element(Locator::Id(&format!("nav-{page}")))
+        .await
+        .unwrap_or_else(|e| panic!("no sidebar button for {page}: {e}"))
+        .click()
+        .await
+        .unwrap();
+}
+
 /// The login flow the app started, approved by the admin, as the web app's
 /// `/connect` page would (its ID read from the server's database: the app
 /// opens it in a browser the test doesn't have).
@@ -243,6 +277,8 @@ async fn sign_in_sync_and_an_error() {
     // A name the server refuses: reported in the window.
     std::fs::write(folder.join("Docs").join("bad:name.txt"), "x").unwrap();
     settle(&folder.join("Docs").join("bad:name.txt"));
+    // Told on the Activity page, with a count on its button.
+    go(&client, "activity").await;
     shown(&client, "not synced").await;
 
     // C19: launched again on its state, it hands over to the running app
@@ -291,7 +327,13 @@ async fn a_drive_in_the_window() {
     shown(&client, "kept").await;
 
     // The drive limit, from the settings.
-    let limit = client.find(Locator::Id("drive-limit")).await.unwrap();
+    go(&client, "settings").await;
+    let limit = client
+        .wait()
+        .at_most(Duration::from_secs(30))
+        .for_element(Locator::Id("drive-limit"))
+        .await
+        .unwrap();
     limit.clear().await.unwrap();
     limit.send_keys("2").await.unwrap();
     client
@@ -307,6 +349,7 @@ async fn a_drive_in_the_window() {
     .await;
 
     // The Drive tick beside a library to add.
+    go(&client, "libraries").await;
     client
         .find(Locator::XPath(
             "//button[normalize-space()='Add a library…']",
@@ -329,6 +372,243 @@ async fn a_drive_in_the_window() {
     client.close().await.unwrap();
 }
 
+/// A library's actions are in the menu beside its row (theca/computer#93):
+/// Pause pauses it (and says Resume next), Remove asks first, then stops
+/// syncing it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_library_s_menu_pauses_and_removes() {
+    let _one = ONE_APP.lock().await;
+    let w = world().await;
+    let (_dir, state_path, account) = w.logged_in("app").await;
+    let state = theca::state::State::open(&state_path).unwrap();
+    theca::ops::add(
+        &state,
+        &account,
+        "Docs",
+        None,
+        false,
+        theca::state::Mode::Sync,
+    )
+    .await
+    .unwrap();
+    let (_driver, client) = app(&state_path).await;
+    // The row's menu, then one of its items.
+    let menu = || clicked(&client, "//button[@aria-label='More about Docs ⋯']");
+    let item = |text: &str| {
+        let xpath = format!("//*[@role='menuitem'][normalize-space()='{text}']");
+        let client = client.clone();
+        async move { clicked(&client, &xpath).await }
+    };
+
+    menu().await;
+    item("Pause").await;
+    eventually("paused", || async {
+        state.pairs().unwrap().iter().all(|p| p.paused)
+    })
+    .await;
+    shown(&client, "Paused").await;
+    menu().await;
+    item("Resume").await;
+    eventually("resumed", || async {
+        state.pairs().unwrap().iter().all(|p| !p.paused)
+    })
+    .await;
+
+    // Remove asks first; keeping the files, it stops syncing the library.
+    menu().await;
+    item("Remove").await;
+    shown(&client, "Stop syncing Docs?").await;
+    assert!(!state.pairs().unwrap().is_empty(), "removed without asking");
+    clicked(&client, "//button[normalize-space()='Keep the files']").await;
+    eventually("removed", || async { state.pairs().unwrap().is_empty() }).await;
+    client.close().await.unwrap();
+}
+
+/// A click on a drive's row opens its details beside it: its folder, with a
+/// button for the file manager, and what it keeps.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drive_s_details_open_beside_its_row() {
+    let _one = ONE_APP.lock().await;
+    let w = world().await;
+    let (_dir, state_path, account) = w.logged_in("app").await;
+    let state = theca::state::State::open(&state_path).unwrap();
+    theca::ops::add(
+        &state,
+        &account,
+        "Docs",
+        None,
+        false,
+        theca::state::Mode::Drive,
+    )
+    .await
+    .unwrap();
+    let (_driver, client) = app(&state_path).await;
+    client
+        .wait()
+        .at_most(Duration::from_secs(30))
+        .for_element(Locator::XPath("//button[@aria-label='More about Docs']"))
+        .await
+        .unwrap()
+        .click()
+        .await
+        .unwrap();
+    // Its folder, the button for it, the kept files' toggle.
+    shown(&client, "Folder").await;
+    client
+        .wait()
+        .at_most(Duration::from_secs(30))
+        .for_element(Locator::XPath(
+            "//*[@role='dialog']//button[normalize-space()='Open folder']",
+        ))
+        .await
+        .unwrap();
+    client
+        .wait()
+        .at_most(Duration::from_secs(30))
+        .for_element(Locator::XPath(
+            "//*[@role='dialog']//button[normalize-space()='Kept files']",
+        ))
+        .await
+        .unwrap()
+        .click()
+        .await
+        .unwrap();
+    shown(&client, "Nothing is kept").await;
+    client.close().await.unwrap();
+}
+
+/// "Add a library…" opens a dialog of the account's libraries that aren't on
+/// this computer; Sync adds one to the default folder (theca/computer#93).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_library_is_added_through_the_dialog() {
+    let _one = ONE_APP.lock().await;
+    let w = world().await;
+    let (_dir, state_path, _account) = w.logged_in("app").await;
+    let state = theca::state::State::open(&state_path).unwrap();
+    let folder = state.accounts().unwrap()[0].default_folder.clone();
+    let (_driver, client) = app(&state_path).await;
+    clicked(&client, "//button[normalize-space()='Add a library…']").await;
+    shown(&client, "Libraries of").await;
+    clicked(&client, "//button[@aria-label='Sync Docs']").await;
+    eventually("the library added in the default folder", || async {
+        state
+            .pairs()
+            .unwrap()
+            .iter()
+            .any(|p| p.library == w.library.id && p.path == folder.join("Docs"))
+    })
+    .await;
+    // The dialog is gone, the library is a row.
+    shown(&client, "Synced folder").await;
+    client.close().await.unwrap();
+}
+
+/// A library the server offers shows as a banner above the rows, whose button
+/// opens the same dialog with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offered_library_is_a_banner_that_opens_the_dialog() {
+    let _one = ONE_APP.lock().await;
+    let w = world().await;
+    let (_dir, state_path, _account) = w.logged_in("app").await;
+    let state = theca::state::State::open(&state_path).unwrap();
+    let mut account = state.accounts().unwrap().remove(0);
+    account.new_libraries = theca::state::NewLibraries::Notify;
+    state.save_account(&account).unwrap();
+    w.admin
+        .create_library(w.organization, "Photos")
+        .await
+        .unwrap();
+    let (_driver, client) = app(&state_path).await;
+    shown(&client, "Offered:").await;
+    clicked(&client, "//button[normalize-space()='Choose…']").await;
+    clicked(&client, "//button[@aria-label='Sync Photos']").await;
+    eventually("the offered library added", || async {
+        state.pairs().unwrap().len() == 1
+    })
+    .await;
+    client.close().await.unwrap();
+}
+
+/// Activity lists what Theca tells; Dismiss takes a notice away, and the count
+/// on the sidebar's button follows.
+#[tokio::test(flavor = "multi_thread")]
+async fn activity_dismisses_a_notice_and_the_count_follows() {
+    let _one = ONE_APP.lock().await;
+    let w = world().await;
+    let (_dir, state_path, account) = w.logged_in("app").await;
+    let state = theca::state::State::open(&state_path).unwrap();
+    state
+        .notify(
+            Some(account.id),
+            None,
+            "error",
+            None,
+            "something needs you",
+            None,
+        )
+        .unwrap();
+    let (_driver, client) = app(&state_path).await;
+    let nav = || async {
+        client
+            .wait()
+            .at_most(Duration::from_secs(30))
+            .for_element(Locator::Id("nav-activity"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    };
+    eventually("the count on Activity", || async {
+        nav().await.contains('1')
+    })
+    .await;
+    go(&client, "activity").await;
+    shown(&client, "something needs you").await;
+    clicked(&client, "//button[normalize-space()='Dismiss']").await;
+    eventually("the notice dismissed", || async {
+        state.notices().unwrap().is_empty()
+    })
+    .await;
+    eventually("the count gone", || async { !nav().await.contains('1') }).await;
+    client.close().await.unwrap();
+}
+
+/// A narrow window (520 px, the least) keeps every page reachable: the
+/// sidebar shows its icons only, and Settings works through its button.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_narrow_window_keeps_the_sidebar_to_icons() {
+    let _one = ONE_APP.lock().await;
+    let w = world().await;
+    let (_dir, state_path, _account) = w.logged_in("app").await;
+    let (_driver, client) = app(&state_path).await;
+    client.set_window_size(520, 640).await.unwrap();
+    let label = client
+        .wait()
+        .at_most(Duration::from_secs(30))
+        .for_element(Locator::Css("#nav-libraries span.hidden"))
+        .await
+        .unwrap();
+    eventually("the name hidden", || async {
+        !label.is_displayed().await.unwrap()
+    })
+    .await;
+    go(&client, "settings").await;
+    client
+        .wait()
+        .at_most(Duration::from_secs(30))
+        .for_element(Locator::Id("drive-limit"))
+        .await
+        .unwrap();
+    // Wide again: the names are back.
+    client.set_window_size(900, 640).await.unwrap();
+    eventually("the name back", || async {
+        label.is_displayed().await.unwrap()
+    })
+    .await;
+    client.close().await.unwrap();
+}
+
 /// The logs' settings in the window: the defaults shown, then a level, days
 /// and a size saved (the folder is a native dialog: `theca logs` tests it).
 #[tokio::test(flavor = "multi_thread")]
@@ -338,6 +618,7 @@ async fn the_logs_in_the_window() {
     let (_dir, state_path, _account) = w.logged_in("app").await;
     let state = theca::state::State::open(&state_path).unwrap();
     let (_driver, client) = app(&state_path).await;
+    go(&client, "settings").await;
     let level = client
         .wait()
         .at_most(Duration::from_secs(30))
@@ -580,6 +861,7 @@ async fn the_start_at_login_switch_turns_the_entry_on_and_off() {
         &[("HOME", home.path())],
     )
     .await;
+    go(&client, "settings").await;
     let switch = client
         .wait()
         .at_most(Duration::from_secs(30))
@@ -673,6 +955,7 @@ async fn no_update_setting_without_the_feature() {
     let w = world().await;
     let (_dir, state, _account) = w.logged_in("app").await;
     let (_driver, client) = app(&state).await;
+    go(&client, "settings").await;
     shown(&client, &format!("Theca {}", env!("CARGO_PKG_VERSION"))).await;
     let section = client.find(Locator::Id("updates-settings")).await.unwrap();
     assert!(section.find(Locator::Id("updates-mode")).await.is_err());
@@ -895,6 +1178,7 @@ mod self_update {
             &[("APPIMAGE", &r.appimage)],
         )
         .await;
+        go(&client, "settings").await;
         shown(&client, &format!("Theca {}", env!("CARGO_PKG_VERSION"))).await;
         let mode = client.find(Locator::Id("updates-mode")).await.unwrap();
         assert_eq!(mode.prop("value").await.unwrap().as_deref(), Some("off"));

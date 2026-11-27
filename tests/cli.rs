@@ -185,6 +185,82 @@ async fn status_says_what_syncs() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("theca login"));
 }
 
+/// `status` lists its notices under a heading that says how to dismiss them,
+/// each with its number; `dismiss` takes one away, or all, and refuses a
+/// number there isn't (theca/computer#119).
+#[tokio::test(flavor = "multi_thread")]
+async fn notices_are_listed_with_their_numbers_and_dismissed() {
+    let w = world().await;
+    let mut a = w.device("a").await;
+    w.converge(&[&a]).await;
+    a.stop().await;
+    let state = a.state();
+    let seen = || {
+        state
+            .notices()
+            .unwrap()
+            .into_iter()
+            .map(|n| n.message)
+            .collect::<Vec<_>>()
+    };
+    // None: no heading either.
+    state.dismiss_all().unwrap();
+    let out = theca(&a.state_path, &["status"]);
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("Notices"));
+
+    state
+        .notify(Some(a.account.id), None, "info", None, "first", None)
+        .unwrap();
+    state
+        .notify(
+            Some(a.account.id),
+            None,
+            "error",
+            Some("x.txt"),
+            "second",
+            None,
+        )
+        .unwrap();
+    let ids: Vec<i64> = state.notices().unwrap().iter().map(|n| n.id).collect();
+    let out = theca(&a.state_path, &["status"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.contains("Notices (`theca dismiss <number>` or `theca dismiss --all`):"),
+        "{said}"
+    );
+    for id in &ids {
+        assert!(
+            said.lines()
+                .any(|l| l.trim_start().starts_with(&id.to_string())),
+            "notice {id} listed with its number: {said}"
+        );
+    }
+
+    // One, by its number: the others stay.
+    let second = state
+        .notices()
+        .unwrap()
+        .into_iter()
+        .find(|n| n.message == "second")
+        .unwrap()
+        .id;
+    let out = theca(&a.state_path, &["dismiss", &second.to_string()]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(seen(), ["first"]);
+    // A number there isn't: refused, nothing taken away.
+    let out = theca(&a.state_path, &["dismiss", "99999"]);
+    assert_ne!(code(&out), 0);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no notice 99999"));
+    assert_eq!(seen(), ["first"]);
+    // Every one.
+    let out = theca(&a.state_path, &["dismiss", "--all"]);
+    assert_eq!(code(&out), 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(seen().is_empty());
+    // Neither a number nor --all: usage.
+    let out = theca(&a.state_path, &["dismiss"]);
+    assert_eq!(code(&out), exit::USAGE);
+}
+
 /// `THECA_NO_KEYRING` set as scripts set a flag (`1`) keeps a script's login
 /// out of the keychain, in a child process as a service starts it.
 #[tokio::test(flavor = "multi_thread")]

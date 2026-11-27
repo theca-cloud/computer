@@ -3,10 +3,10 @@
 	// what it keeps on this computer, with Keep… (a picker in the drive) and
 	// Free.
 	import { invoke } from '@tauri-apps/api/core';
-	import { open } from '@tauri-apps/plugin-dialog';
 	import { openUrl } from '@tauri-apps/plugin-opener';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import { attempt, say, type Pair } from '#lib/app.svelte.js';
+	import { keepFiles } from '#lib/drive-actions.js';
 	import { formatSize } from '#lib/format.js';
 	import { m } from '#lib/paraglide/messages.js';
 
@@ -26,12 +26,7 @@
 	}
 
 	async function keep() {
-		const picked = await attempt(() =>
-			open({ defaultPath: pair.path, multiple: true, directory: false })
-		);
-		const paths = Array.isArray(picked) ? picked : typeof picked === 'string' ? [picked] : [];
-		for (const path of paths) await attempt(() => invoke('keep', { path }));
-		if (paths.length) await load();
+		if (await keepFiles(pair)) await load();
 	}
 
 	async function free(rel: string) {

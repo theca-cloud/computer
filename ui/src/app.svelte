@@ -1,76 +1,41 @@
 <script lang="ts">
-	// The window: one page in sections (roadmap 09, GUI). The first launch
-	// signs an account in; then its accounts and synced folders, the notices,
-	// the settings.
-	import { onMount } from 'svelte';
-	import { invoke } from '@tauri-apps/api/core';
-	import AccountCard from '#lib/components/account.svelte';
-	import AccountSettings from '#lib/components/account-settings.svelte';
+	// The window: a sidebar of pages, one per topic (libraries, activity,
+	// accounts, settings). The first launch signs an account in; then the
+	// page shown is the one the sidebar says.
+	import AccountsPage from '#lib/components/accounts.svelte';
+	import ActivityPage from '#lib/components/activity.svelte';
 	import AskDialog from '#lib/components/ask-dialog.svelte';
-	import DriveSettings from '#lib/components/drive-settings.svelte';
-	import FirstStep from '#lib/components/first-step.svelte';
-	import LogsSettings from '#lib/components/logs-settings.svelte';
-	import UpdatesSettings from '#lib/components/updates-settings.svelte';
+	import LibrariesPage from '#lib/components/libraries.svelte';
 	import Login from '#lib/components/login.svelte';
+	import SettingsPage from '#lib/components/settings-page.svelte';
+	import Sidebar from '#lib/components/sidebar.svelte';
 	import { Button } from '#lib/components/ui/button/index.js';
 	import * as Card from '#lib/components/ui/card/index.js';
-	import { Label } from '#lib/components/ui/label/index.js';
-	import { Separator } from '#lib/components/ui/separator/index.js';
-	import { Switch } from '#lib/components/ui/switch/index.js';
-	import { app, attempt, follow, reload, say, type SignedIn } from '#lib/app.svelte.js';
-	import { formatDate } from '#lib/format.js';
+	import { app, attempt, follow, go, nav, reload, type SignedIn } from '#lib/app.svelte.js';
 	import { m } from '#lib/paraglide/messages.js';
 
 	$effect(follow);
 
 	/** Just signed in: its first step shows, until Add or Later. */
 	let signedIn = $state<number | null>(null);
-	let adding = $state(false);
-	let autostart = $state(false);
-
-	onMount(() => {
-		void attempt(() => invoke<boolean>('autostart_enabled')).then(
-			(on) => (autostart = on ?? false)
-		);
-	});
 
 	const status = $derived(app.status);
-	const pairs = $derived(status?.pairs ?? []);
-	const allPaused = $derived(pairs.length > 0 && pairs.every((p) => p.paused));
-	// Errors first, newest first.
-	const notices = $derived(
-		[...(status?.notices ?? [])].sort(
-			(a, b) =>
-				Number(b.level === 'error') - Number(a.level === 'error') || b.at.localeCompare(a.at)
-		)
-	);
-	const libraryOf = (pair: number | null) => pairs.find((p) => p.id === pair)?.library_name;
 
 	function onaccount({ account, fresh }: SignedIn) {
 		// Signed in again: its choices stand, no first step.
 		signedIn = fresh ? account : null;
-		adding = false;
+		// The libraries are where a new account starts.
+		if (fresh) go('libraries');
 		void attempt(reload);
-	}
-
-	async function undo(notice: number) {
-		const restored = await attempt(() => invoke<number>('undo', { notice }));
-		if (restored !== undefined) say(m.restored({ count: restored }));
-	}
-
-	async function setAutostart(on: boolean) {
-		autostart = (await attempt(() => invoke<boolean>('set_autostart', { on }))) ?? autostart;
 	}
 </script>
 
-{#snippet heading(title: string)}
-	<h2 class="text-base font-medium">{title}</h2>
-{/snippet}
-
-<main class="mx-auto grid max-w-2xl gap-8 p-4 text-sm sm:p-6">
-	{#if !status}
+{#if !status}
+	<main class="mx-auto grid max-w-2xl gap-8 p-4 text-sm sm:p-6">
 		<p class="text-muted-foreground" role="status">{m.loading()}</p>
-	{:else if status.accounts.length === 0}
+	</main>
+{:else if status.accounts.length === 0}
+	<main class="mx-auto grid max-w-2xl gap-8 p-4 text-sm sm:p-6">
 		<Card.Root>
 			<Card.Header>
 				<Card.Title class="text-lg">{m.welcome_title()}</Card.Title>
@@ -80,116 +45,25 @@
 				<Login {onaccount} />
 			</Card.Content>
 		</Card.Root>
-	{:else}
-		<header class="flex items-center justify-between gap-2">
-			<h1 class="text-lg font-medium">{m.app_name()}</h1>
-			{#if pairs.length}
-				<Button
-					size="sm"
-					variant="outline"
-					onclick={() => attempt(() => invoke('set_paused', { pair: null, paused: !allPaused }))}
-				>
-					{allPaused ? m.resume_all() : m.pause_all()}
-				</Button>
-			{/if}
-		</header>
-
-		<section class="grid gap-3" aria-labelledby="accounts">
-			<h2 id="accounts" class="text-base font-medium">{m.accounts()}</h2>
-			{#each status.accounts as account (account.id)}
-				{#if signedIn === account.id}
-					<FirstStep {account} ondone={() => (signedIn = null)} />
+	</main>
+{:else}
+	<div class="flex h-screen text-sm">
+		<Sidebar />
+		<main class="min-w-0 flex-1 overflow-y-auto p-4 sm:p-6">
+			<div class="mx-auto max-w-2xl">
+				{#if nav.page === 'libraries'}
+					<LibrariesPage {signedIn} ondone={() => (signedIn = null)} />
+				{:else if nav.page === 'activity'}
+					<ActivityPage />
+				{:else if nav.page === 'accounts'}
+					<AccountsPage {onaccount} />
 				{:else}
-					<AccountCard
-						{account}
-						pairs={pairs.filter((p) => p.account === account.id)}
-						offered={app.offered[account.id] ?? []}
-					/>
+					<SettingsPage />
 				{/if}
-			{/each}
-			{#if adding}
-				<Card.Root>
-					<Card.Header><Card.Title>{m.add_account()}</Card.Title></Card.Header>
-					<Card.Content>
-						<Login {onaccount} oncancel={() => (adding = false)} />
-					</Card.Content>
-				</Card.Root>
-			{:else}
-				<div>
-					<Button variant="outline" onclick={() => (adding = true)}>{m.add_account()}</Button>
-				</div>
-			{/if}
-		</section>
-
-		{#if notices.length}
-			<section class="grid gap-3">
-				{@render heading(m.notices())}
-				<ul class="grid gap-2">
-					{#each notices as notice (notice.id)}
-						{@const library = libraryOf(notice.pair)}
-						<li
-							class={[
-								'grid gap-1 rounded-lg p-3 ring-1',
-								notice.level === 'error'
-									? 'bg-destructive/10 ring-destructive/20'
-									: 'ring-foreground/10'
-							]}
-						>
-							<p>{notice.message}</p>
-							{#if notice.path}
-								<p class="truncate font-mono text-xs" title={notice.path}>
-									{library ? `${library}: ` : ''}{notice.path}
-								</p>
-							{/if}
-							<div class="flex flex-wrap items-center justify-between gap-2">
-								<time class="text-xs text-muted-foreground" datetime={notice.at}>
-									{formatDate(notice.at)}
-								</time>
-								<div class="flex gap-1">
-									{#if notice.undo}
-										<Button size="sm" variant="outline" onclick={() => undo(notice.id)}>
-											{m.undo()}
-										</Button>
-									{/if}
-									<Button
-										size="sm"
-										variant="ghost"
-										onclick={() => attempt(() => invoke('dismiss', { notice: notice.id }))}
-									>
-										{m.dismiss()}
-									</Button>
-								</div>
-							</div>
-						</li>
-					{/each}
-				</ul>
-			</section>
-		{/if}
-
-		<section class="grid gap-4">
-			{@render heading(m.settings())}
-			{#each status.accounts as account (account.id)}
-				<AccountSettings {account} />
-				<Separator />
-			{/each}
-			<DriveSettings />
-			<Separator />
-			<LogsSettings />
-			<Separator />
-			<UpdatesSettings />
-			<Separator />
-			<div class="flex items-center gap-2">
-				<Switch id="autostart" checked={autostart} onCheckedChange={setAutostart} />
-				<Label for="autostart">{m.autostart()}</Label>
 			</div>
-			<div>
-				<Button variant="destructive" onclick={() => attempt(() => invoke('quit'))}>
-					{m.quit()}
-				</Button>
-			</div>
-		</section>
-	{/if}
-</main>
+		</main>
+	</div>
+{/if}
 
 {#if app.message}
 	<div

@@ -100,6 +100,12 @@ struct Drive {
 pub struct Provider {
     drives: Mutex<HashMap<Uuid, Drive>>,
     materialized: Mutex<HashMap<Uuid, HashSet<Uuid>>>,
+    /// Whether this process has started to answer the extension's socket.
+    listening: std::sync::atomic::AtomicBool,
+    /// Whether the engine is stopping (see `stopping`).
+    stopped: std::sync::atomic::AtomicBool,
+    /// The folders read ahead of the system's listing them.
+    preread: Arc<super::preread::PreRead>,
 }
 
 /// Why a call failed, as the extension tells the system.
@@ -150,6 +156,7 @@ impl Provider {
         cancel: Cancel,
         active: bool,
     ) {
+        self.preread.serve(uuid);
         let mut drives = lock(&self.drives);
         let announced = drives.get(&uuid).is_some_and(|d| d.announced);
         drives.insert(
@@ -165,10 +172,78 @@ impl Provider {
         );
     }
 
+    /// True the first time it is asked, once the first drive is served: the
+    /// moment to start answering the extension's socket. Only a process that
+    /// serves a drive may own it: one that serves none (the tests' sync
+    /// devices, an app without a drive) answered with no drive, and took the
+    /// socket from the one that has them whenever it bound it last (found on
+    /// a runner: the drive's folder never appeared).
+    pub fn first_served(&self) -> bool {
+        !self
+            .listening
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The engine is stopping: a reconnect still trying gives up, so that it
+    /// can't undo the disconnect that follows.
+    pub fn stopping(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether `stopping` was said.
+    pub fn is_stopping(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The folders below what the system listed (`container`, a drive's folder
+    /// or one of its folders) read ahead, three levels, in the background
+    /// (macOS: its own first listing of a folder is what a click waits for).
+    fn read_ahead(&self, uuid: Uuid, container: &str, pair: &Pair, state: &Arc<State>) {
+        if parse_id(container).is_none() || !self.preread.wanted(container) {
+            return;
+        }
+        let (ahead, container, pair, state) = (
+            self.preread.clone(),
+            container.to_owned(),
+            pair.clone(),
+            state.clone(),
+        );
+        // Off the answer's path: finding the folders below is up to 300
+        // queries, and the reply they follow is what a click waits for.
+        #[cfg(target_os = "macos")]
+        std::thread::spawn(move || read_ahead_now(&ahead, uuid, &container, &pair, &state));
+        #[cfg(not(target_os = "macos"))]
+        read_ahead_now(&ahead, uuid, &container, &pair, &state);
+    }
+
+    /// A served drive's own folder read ahead (once it is there), where the
+    /// system hasn't listed it yet: what a start does, for the first clicks.
+    /// True once started, or not worth asking again.
+    pub fn read_ahead_drive(&self, uuid: Uuid) -> bool {
+        let found = lock(&self.drives)
+            .get(&uuid)
+            .map(|d| (d.pair, d.state.clone()));
+        let Some((id, state)) = found else {
+            return false;
+        };
+        let Ok(Some(pair)) = state.pair(id) else {
+            return false;
+        };
+        // Not in the domain yet, or not listed yet (no entries to read below):
+        // asked again.
+        if pair.position.is_none() || !pair.path.is_dir() {
+            return false;
+        }
+        self.read_ahead(uuid, &item_id(uuid, None), &pair, &state);
+        true
+    }
+
     /// A drive no longer listed (removed, or its engine ended).
     pub fn forget(&self, uuid: Uuid) {
         lock(&self.drives).remove(&uuid);
         lock(&self.materialized).remove(&uuid);
+        self.preread.forget(uuid);
     }
 
     /// What the system has downloaded of a drive, as it last said.
@@ -184,7 +259,9 @@ impl Provider {
         let span = tracing::info_span!("request", domain = request.domain());
         async move {
             tracing::debug!(?request, "asked");
+            let started = std::time::Instant::now();
             let reply = self.answer_in(request).await;
+            tracing::debug!(took = ?started.elapsed(), "answered");
             // No such item is an answer the system expects (its trash, an
             // item gone): only at debug.
             match &reply {
@@ -300,7 +377,18 @@ impl Provider {
             Request::Free { ids, .. } => ids.clone(),
             _ => Vec::new(),
         };
+        let listed = match &request {
+            Request::List { container, .. } => Some(container.clone()),
+            _ => None,
+        };
         let reply = answered.answer(request).await;
+        // A drive's folder listed: the folders below it read in before they
+        // are clicked.
+        if let Some(container) = listed
+            && matches!(reply, Reply::Items { .. })
+        {
+            self.read_ahead(uuid, &container, &pair, &state);
+        }
         // Finder's Free Up Space: not kept anymore (answered), then evicted
         // as `theca free` does, on a thread of its own (the system re-reads
         // the items first, and the extension waits for no eviction).
@@ -373,6 +461,13 @@ impl Provider {
             _ => {}
         }
         Ok(uuid)
+    }
+
+    /// A drive served that the system hasn't listed since (it listed the
+    /// domain before the drive was there, and the one signal that told it may
+    /// have found it busy): it never learns of the folder unless told again.
+    pub fn unannounced(&self) -> bool {
+        lock(&self.drives).values().any(|d| !d.announced)
     }
 
     /// The drives, each a folder, named as it is where Theca keeps it.
@@ -1010,14 +1105,144 @@ pub fn apply_remote(state: &State, pair: &Pair) -> crate::state::Result<bool> {
     Ok(true)
 }
 
-/// The socket in the extension's container, served by this process (once,
-/// whatever the drives: each request names its domain). The container exists
-/// once the system has started the extension: waited for.
+/// What `Provider::read_ahead` does, off the answer's path: the folders below
+/// `container` found, then read by the one worker (the thread that queued the
+/// burst, when none ran) until nothing is left.
+fn read_ahead_now(
+    ahead: &super::preread::PreRead,
+    uuid: Uuid,
+    container: &str,
+    pair: &Pair,
+    state: &State,
+) {
+    use super::preread::{Job, paths_below};
+    let node = parse_id(container).and_then(|(_, node)| node);
+    let below = match paths_below(state, pair, uuid, node.unwrap_or(pair.root)) {
+        Ok(Some(below)) => below,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::debug!("the folders below not found: {e}");
+            return;
+        }
+    };
+    let Some(job): Option<Job> = ahead.plan(container, below) else {
+        return;
+    };
+    tracing::debug!(folders = job.folders.len(), "reading ahead");
+    #[cfg(target_os = "macos")]
+    if ahead.queue(job) {
+        while let Some(job) = ahead.next() {
+            for (id, path) in job.folders {
+                // A drive removed meanwhile: its folders aren't read.
+                if parse_id(&id).is_some_and(|(drive, _)| ahead.is_forgotten(drive)) {
+                    ahead.read(&id, false);
+                    continue;
+                }
+                // The folder may not be on disk yet: the system is still
+                // taking in the listing that started this (found on a
+                // runner), so it is tried for a few seconds.
+                let mut tried = 0;
+                let mut last = None;
+                let ok = (0..25).any(|n| {
+                    if n > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                    tried += 1;
+                    match theca_fileprovider::host::list_dir(&path) {
+                        Ok(count) => {
+                            last = Some(format!("{count} entries"));
+                            true
+                        }
+                        Err(e) => {
+                            last = Some(e.to_string());
+                            false
+                        }
+                    }
+                });
+                tracing::debug!(
+                    path = %path.display(),
+                    tried,
+                    ok,
+                    last = last.as_deref().unwrap_or_default(),
+                    "read ahead"
+                );
+                ahead.read(&id, ok);
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = job;
+}
+
+/// What Finder says of the drive while Theca isn't running.
+#[cfg(target_os = "macos")]
+const NOT_RUNNING: &str = "Theca isn't running: open it to reach your files";
+
+/// The one domain cut from its extension (`false`: served again). Theca
+/// stopping leaves the drives listed, and nothing to answer a file not
+/// downloaded: disconnected, Finder says why and the open fails at once,
+/// where connected the system asks the extension for as long as it tries.
+/// Only a domain that exists and is switched on; blocking (the system's
+/// answers). False when it should be tried again: the system didn't answer,
+/// or the domain isn't switched on (yet).
+#[cfg(target_os = "macos")]
+pub fn set_connected(state: &State, connected: bool) -> bool {
+    use theca_fileprovider::host;
+    // A state with no drive has no domain to ask the system about (nor an
+    // id to make for it).
+    if !state
+        .pairs()
+        .is_ok_and(|pairs| pairs.iter().any(|p| p.mode == crate::state::Mode::Drive))
+    {
+        return true;
+    }
+    let Ok(domain) = domain_of(state) else {
+        return true;
+    };
+    if host::enabled(&domain) != Ok(Some(true)) {
+        return false;
+    }
+    let (done, what) = if connected {
+        (host::reconnect(&domain), "reconnected")
+    } else {
+        (host::disconnect(&domain, NOT_RUNNING), "disconnected")
+    };
+    match done {
+        Ok(()) => {
+            tracing::debug!("the drives {what}");
+            true
+        }
+        Err(e) => {
+            tracing::warn!("the drives not {what}: {e}");
+            false
+        }
+    }
+}
+
+/// Serves the drives again after a stop: `set_connected` until it holds, 20
+/// times 3 s apart (the system may be slow to answer at a login, or the
+/// drive switched on a moment later), unless the engine stops meanwhile. On a
+/// thread of its own, which a stopping runtime doesn't wait for.
+#[cfg(target_os = "macos")]
+pub fn reconnect_until_served(provider: Arc<Provider>, state: Arc<State>) {
+    std::thread::spawn(move || {
+        for _ in 0..20 {
+            if provider.is_stopping() || set_connected(&state, true) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+    });
+}
+
+/// The socket in the app group's folder, served by this process (once,
+/// whatever the drives: each request names its domain). The folder exists
+/// once the system has made it for a process holding the group: waited for.
 #[cfg(target_os = "macos")]
 pub fn listen(provider: Arc<Provider>, runtime: tokio::runtime::Handle) {
     use std::os::unix::net::UnixListener;
     use theca_fileprovider::protocol::SOCKET;
-    let Some(container) = theca_fileprovider::host::container() else {
+    let Some(container) = theca_fileprovider::host::group_folder() else {
         return;
     };
     std::thread::spawn(move || {
@@ -1077,6 +1302,61 @@ mod tests {
         ] {
             assert_eq!(parse_id(bad), None, "{bad:?}");
         }
+    }
+
+    /// The socket is started once, from the first drive served: a process
+    /// with no drive never asks, and never owns it.
+    #[test]
+    fn the_socket_starts_once() {
+        let provider = Provider::default();
+        assert!(provider.first_served());
+        assert!(!provider.first_served());
+        assert!(!provider.first_served());
+    }
+
+    /// What a subscriber at `level` writes while `Provider::answer` answers
+    /// the root item.
+    fn answer_logged_at(level: tracing::Level) -> String {
+        use std::io::Write;
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf(Arc::default());
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let reply = runtime.block_on(Provider::default().answer(Request::Item {
+            domain: "d".into(),
+            id: ROOT.into(),
+        }));
+        assert!(matches!(reply, Reply::Item(_)));
+        let logged = buf.0.lock().unwrap().clone();
+        String::from_utf8(logged).unwrap()
+    }
+
+    /// A call's answer says how long it took, at debug and no higher: what
+    /// a trace of a slow drive needs, and nothing more in a normal log.
+    #[test]
+    fn an_answer_says_how_long_it_took_at_debug_only() {
+        let debug = answer_logged_at(tracing::Level::DEBUG);
+        assert!(debug.contains("took="), "{debug}");
+        let info = answer_logged_at(tracing::Level::INFO);
+        assert!(!info.contains("took="), "{info}");
     }
 
     /// The anchor lists every drive's counter, in one order whatever the

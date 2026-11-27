@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use common::*;
+use theca::drive::preread::{folders_below, paths_below};
 use theca::drive::provider::{Provider, apply_remote, domain_of, item_id, kept_files, still_kept};
 use theca_common::api;
 use theca_fileprovider::protocol::{Item, ROOT, Reply, Request};
@@ -592,4 +593,119 @@ async fn two_drives_are_folders_of_one_domain() {
     };
     assert_eq!(deleted, [item_id(one_id, None)]);
     assert_eq!(anchor, "");
+}
+
+/// The folders to read ahead below a folder (theca/computer#124): breadth
+/// first, folders only, as deep as asked and no more than the cap, each with
+/// its names from the folder.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_folders_to_read_ahead_are_found_breadth_first() {
+    let w = world().await;
+    let s = w.device("sync").await;
+    s.write("a/b/c/d/e/f.txt", "deep");
+    s.write("a/b2/c2.txt", "a file below a folder with no folder");
+    s.write("a/x.txt", "a file");
+    s.write("g/h.txt", "a folder with no folder");
+    s.write("top.txt", "a file");
+    w.converge(&[&s]).await;
+
+    let d = w.device_for("mac", &w.library, false).await;
+    let state = Arc::new(d.state());
+    let pair = d.pair();
+    let client = theca::ops::client(&d.account).unwrap();
+    let listed = theca::engine::tree(&client, pair.root).await.unwrap();
+    state
+        .record_remote(pair.id, &listed, Some(api::Position::Seq(1)))
+        .unwrap();
+    assert!(apply_remote(&state, &pair).unwrap());
+
+    let below = |depth, cap| {
+        folders_below(&state, pair.id, pair.root, depth, cap)
+            .unwrap()
+            .into_iter()
+            .map(|(_, names)| names.join("/"))
+            .collect::<Vec<_>>()
+    };
+    // Three levels: a and g, then a's two, then b's one; d and e are deeper,
+    // the files aren't folders.
+    assert_eq!(below(3, 300), ["a", "g", "a/b", "a/b2", "a/b/c"]);
+    assert_eq!(below(1, 300), ["a", "g"]);
+    // The cap cuts the breadth first order where it falls.
+    assert_eq!(below(3, 3), ["a", "g", "a/b"]);
+    // From a folder: its names start there.
+    let a = listed_node(&state, pair.id, pair.root, "a");
+    let from_a: Vec<_> = folders_below(&state, pair.id, a, 3, 300)
+        .unwrap()
+        .into_iter()
+        .map(|(_, names)| names.join("/"))
+        .collect();
+    assert_eq!(from_a, ["b", "b2", "b/c", "b/c/d"]);
+
+    // Their paths in the drive's folder start at the listed folder's own: a
+    // click into a/b reads below a/b, never below the drive's folder (found on
+    // a runner, where a folder was looked for in the wrong place).
+    let b = listed_node(&state, pair.id, a, "b");
+    let uuid = state.pair_uuid(pair.id).unwrap().unwrap();
+    let relative = |from| {
+        paths_below(&state, &pair, uuid, from)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|(_, path)| {
+                path.strip_prefix(&pair.path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(relative(b), ["a/b/c", "a/b/c/d", "a/b/c/d/e"].map(sep));
+    assert_eq!(
+        relative(pair.root),
+        ["a", "g", "a/b", "a/b2", "a/b/c"].map(sep)
+    );
+    // Not below the pair's root: nothing.
+    assert!(
+        paths_below(&state, &pair, uuid, uuid::Uuid::now_v7())
+            .unwrap()
+            .is_none()
+    );
+
+    // Names the server gave that climb out of the drive's folder (`..`, an
+    // absolute path) are never read: the other folders still are.
+    let mut hostile = listed.clone();
+    for (_, remote) in hostile.iter_mut() {
+        let Some(remote) = remote else { continue };
+        match remote.name.as_str() {
+            "g" => remote.name = "..".into(),
+            "b2" => remote.name = "/etc".into(),
+            _ => {}
+        }
+    }
+    state
+        .record_remote(pair.id, &hostile, Some(api::Position::Seq(2)))
+        .unwrap();
+    assert!(apply_remote(&state, &pair).unwrap());
+    assert_eq!(relative(pair.root), ["a", "a/b", "a/b/c"].map(sep));
+}
+
+/// A path as this OS spells it.
+fn sep(path: &str) -> String {
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+/// The node of a folder named `name` below `parent`.
+fn listed_node(
+    state: &theca::state::State,
+    pair: i64,
+    parent: uuid::Uuid,
+    name: &str,
+) -> uuid::Uuid {
+    state
+        .children(pair, parent)
+        .unwrap()
+        .into_iter()
+        .find(|e| e.name == name)
+        .unwrap()
+        .node
 }

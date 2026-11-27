@@ -77,6 +77,25 @@ fn every_release_state_reads_back() {
         let was = version(&path);
         let state = State::open(&path).unwrap_or_else(|e| panic!("{}: {e}", release.display()));
         assert_eq!(schema(&path), expected, "{}", release.display());
+        // The notices a state older than version 6 holds are all kept, none
+        // of them a feed's (the column came with that version).
+        if was < 6 {
+            let count = |filter: &str| -> i64 {
+                Connection::open(&path)
+                    .unwrap()
+                    .query_row(&format!("SELECT COUNT(*) FROM notice {filter}"), [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap()
+            };
+            assert_eq!(
+                usize::try_from(count("")).unwrap(),
+                manifest["notices"].as_array().unwrap().len(),
+                "{}",
+                release.display()
+            );
+            assert_eq!(count("WHERE feed != 0"), 0, "{}", release.display());
+        }
         for pair in state.pairs().unwrap() {
             let uuid = state.pair_uuid(pair.id).unwrap().expect("a pair UUID");
             assert_eq!(uuid.get_version_num(), 7, "{}", release.display());
