@@ -318,8 +318,15 @@ esac
 # into the app (tauri.conf.json, bundle.macOS.files) without signing it with
 # the app's entitlements.
 if [ "$os" = macos ]; then
+    # The app group the app and the extension meet in is named after the Team
+    # ID (theca/computer#118): both binaries are built knowing it, and both
+    # are signed with the entitlement (the extension here, the app by Tauri,
+    # from target/app.entitlements below).
+    THECA_TEAM_ID=$(ci/mac-app.sh team)
+    export THECA_TEAM_ID
     cargo build --release -p theca-fileprovider --bin theca-drive
     ci/mac-app.sh appex target/release/theca-drive target/appex/ThecaDrive.appex
+    ci/mac-app.sh entitlements app target/app.entitlements
 fi
 # $1: the configuration merged into tauri.conf.json.
 tauri_build() {
@@ -332,6 +339,11 @@ bundle_config='"createUpdaterArtifacts":true'
 # uninstaller and the installer, calling ssign on each (%1, the file).
 if [ "$os" = windows ] && $signed; then
     bundle_config="$bundle_config,\"windows\":{\"signCommand\":{\"cmd\":\"ssign\",\"args\":[\"%1\"]}}"
+fi
+# macOS: the app's own entitlements, merged with tauri.conf.json's macOS
+# section (its extension file and signing identity stay).
+if [ "$os" = macos ]; then
+    bundle_config="$bundle_config,\"macOS\":{\"entitlements\":\"target/app.entitlements\"}"
 fi
 tauri_build "{\"build\":{\"beforeBuildCommand\":\"\"},\"bundle\":{$bundle_config},\"plugins\":{\"updater\":{\"pubkey\":\"$signing_pub\"}}}" \
     --bundles "$bundles" --features self-update
@@ -460,6 +472,16 @@ PY
         { echo "the uninstaller didn't move the drive's edit out" >&2; exit 1; }
 }
 
+# A bundle's entitlements name the app group (the Team ID's, ci/mac-app.sh).
+# Read from stdout alone: codesign's stderr, piped in too, once hid the XML.
+group_entitled() {
+    local entitlements
+    entitlements=$(codesign --display --entitlements - --xml "$1" 2>/dev/null) ||
+        { echo "no entitlements read from $1" >&2; exit 1; }
+    grep -qF "$(ci/mac-app.sh team).rs.theca.computer" <<<"$entitlements" ||
+        { echo "$1 isn't in the app group $(ci/mac-app.sh team).rs.theca.computer: $entitlements" >&2; exit 1; }
+}
+
 case $os in
 macos)
     cp "$bundle"/dmg/Theca_"$version"_*.dmg "dist/$name.dmg"
@@ -481,7 +503,10 @@ macos)
     codesign --display --entitlements - "$mnt/Theca.app/Contents/PlugIns/ThecaDrive.appex" 2>&1 |
         grep -q com.apple.security.app-sandbox ||
         { echo "the drive's extension lost its sandbox entitlement" >&2; exit 1; }
-    echo "checked: the drive's extension is in the app, signed, sandboxed"
+    # The app group the two meet in (theca/computer#118): on both.
+    group_entitled "$mnt/Theca.app/Contents/PlugIns/ThecaDrive.appex"
+    group_entitled "$mnt/Theca.app"
+    echo "checked: the drive's extension is in the app, signed, sandboxed, the app and it in one app group"
     hdiutil detach "$mnt" >/dev/null
     if $signed; then
         stapled "dist/$name.dmg"
@@ -490,6 +515,7 @@ macos)
         mkdir "$tmp/updater"
         tar -xzf "dist/$name.app.tar.gz" -C "$tmp/updater"
         developer_signed "$tmp/updater/Theca.app"
+        group_entitled "$tmp/updater/Theca.app"
         echo "checked: the .dmg and the updater's .app are notarized, stapled, the developer's"
     fi
     ;;

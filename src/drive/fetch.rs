@@ -118,7 +118,9 @@ pub fn service(
                         let _ = stamp(&state, &r.pair, &r.path);
                         return;
                     };
+                    let asked = std::time::Instant::now();
                     let _slot = slots.acquire().await;
+                    let waited = asked.elapsed();
                     let started = std::time::Instant::now();
                     let result = match r.into {
                         Some((node, sink)) => {
@@ -127,6 +129,9 @@ pub fn service(
                         }
                         None => fetch(&state, &client, &r.pair, &r.path, &cancel).await,
                     };
+                    // The time before the slot is what a user waits too: a
+                    // trace of a slow open says which part it was.
+                    tracing::debug!(?waited, took = ?started.elapsed(), "fetch timed");
                     match &result {
                         Ok(()) => tracing::info!(took = ?started.elapsed(), "fetched"),
                         Err(why) => tracing::warn!("not fetched: {why}"),

@@ -1,6 +1,5 @@
 //! The extension's line to the app, and its log. One request per connection
-//! on the socket the app creates in this extension's container (in the
-//! sandbox, `NSHomeDirectory` is that container).
+//! on the socket the app creates in the app group's folder.
 
 use std::ffi::CString;
 use std::io::{self, Read, Write};
@@ -17,25 +16,29 @@ const TIMEOUT: Duration = Duration::from_secs(600);
 /// The app may be starting: connecting is tried this long.
 const CONNECTING: Duration = Duration::from_secs(10);
 
-pub fn home() -> PathBuf {
-    PathBuf::from(objc2_foundation::NSHomeDirectory().to_string())
+fn folder() -> io::Result<PathBuf> {
+    crate::host::group_folder()
+        .ok_or_else(|| io::Error::other("no app group folder (the entitlement is missing)"))
 }
 
 /// To the unified log (`process == "theca-drive"`) and to `drive.log` in the
-/// container.
+/// app group's folder.
 pub fn log(message: &str) {
     let line = format!("theca-drive[{}]: {message}", std::process::id());
     if let Ok(text) = CString::new(line.clone()) {
         // SAFETY: a constant "%s" format with one valid NUL-terminated argument.
         unsafe { libc::syslog(libc::LOG_NOTICE, c"%s".as_ptr(), text.as_ptr()) };
     }
-    let _ = crate::log_file::append(&home().join("drive.log"), &line, crate::log_file::MAX);
+    if let Ok(folder) = folder() {
+        let _ = crate::log_file::append(&folder.join("drive.log"), &line, crate::log_file::MAX);
+    }
 }
 
 fn exchange(request: &Request) -> io::Result<Reply> {
+    let socket = folder()?.join(SOCKET);
     let deadline = Instant::now() + CONNECTING;
     let stream = loop {
-        match UnixStream::connect(home().join(SOCKET)) {
+        match UnixStream::connect(&socket) {
             Ok(stream) => break stream,
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(250)),
             Err(e) => return Err(e),

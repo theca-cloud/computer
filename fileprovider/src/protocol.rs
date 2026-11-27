@@ -1,5 +1,5 @@
 //! Between the extension and the app: one JSON request per connection, one
-//! JSON reply (`Reply`), on the socket `SOCKET` in the extension's container.
+//! JSON reply (`Reply`), on the socket `SOCKET` in the app group's folder.
 //! One domain lists every drive (the drives folder, `ROOT`); a drive is a
 //! folder of it, `<pair uuid>/`, and an item is `<pair uuid>/<node>`.
 
@@ -7,10 +7,24 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// The extension's bundle identifier (its container is
-/// `~/Library/Containers/<it>/Data`).
+/// The extension's bundle identifier.
 pub const EXTENSION: &str = "rs.theca.computer.drive";
-/// The socket's name in that container.
+/// The developer's Team ID, which names the app group: given at build time
+/// (`THECA_TEAM_ID`, by `ci/package.sh` from the signing identity), else the
+/// placeholder every ad-hoc build shares (`ci/mac-app.sh`'s too), so that a
+/// local build and a release never meet in one folder.
+pub const TEAM: &str = match option_env!("THECA_TEAM_ID") {
+    Some(team) => team,
+    None => "ABCDE12345",
+};
+/// The app group the app and the extension both hold (an entitlement): its
+/// folder, `~/Library/Group Containers/<it>`, is where they meet, so that the
+/// app never reaches into the extension's sandbox (macOS asks at every start
+/// whether it may "access data from other apps").
+pub fn group() -> String {
+    format!("{TEAM}.rs.theca.computer")
+}
+/// The socket's name in the group's folder.
 pub const SOCKET: &str = "theca.sock";
 /// The system's name for a domain's root item.
 pub const ROOT: &str = "NSFileProviderRootContainerItemIdentifier";

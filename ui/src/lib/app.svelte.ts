@@ -82,6 +82,16 @@ type Update =
 	| { kind: 'offered'; account: number; libraries: Offer[] }
 	| { kind: 'new_library'; account: number; name: string };
 
+/** The window's pages, one per topic (the sidebar). */
+export type Page = 'libraries' | 'activity' | 'accounts' | 'settings';
+
+/** The page shown. */
+export const nav = $state({ page: 'libraries' as Page });
+
+export function go(page: Page) {
+	nav.page = page;
+}
+
 export const app = $state({
 	status: null as Status | null,
 	/** By account ID: the status's, then what each `offered` update says. */

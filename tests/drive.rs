@@ -681,6 +681,39 @@ async fn a_mounted_drive_is_the_library() {
     d.stop().await;
 }
 
+/// An open that fetches says, at debug, how long it waited for a slot and how
+/// long the download took (theca/computer#116): what a trace of a slow drive
+/// reads.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fetch_says_how_long_it_waited_and_took() {
+    if !fuse() {
+        return;
+    }
+    let w = world().await;
+    let s = w.device("sync").await;
+    s.write("a.txt", "hello");
+    w.converge(&[&s]).await;
+    let mut d = w.drive("drive").await;
+    let folder = d.folder.clone();
+    eventually("the library listed in the drive", || async {
+        listed(&folder).await == ["a.txt"].map(String::from).into()
+    })
+    .await;
+    assert!(!d.said().contains("fetch timed"), "nothing fetched yet");
+    let a = folder.join("a.txt");
+    in_drive("a.txt opened", move || std::fs::read_to_string(a))
+        .await
+        .unwrap();
+    eventually("the fetch's timing in the engine's log", || async {
+        d.said()
+            .lines()
+            .any(|l| l.contains("fetch timed") && l.contains("waited") && l.contains("took"))
+    })
+    .await;
+    d.stop().await;
+}
+
 /// Files saved in a drive's folder while Theca wasn't running block its
 /// mount, said; moved out, it mounts by itself.
 #[cfg(target_os = "linux")]

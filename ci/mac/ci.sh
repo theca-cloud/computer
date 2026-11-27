@@ -113,7 +113,7 @@ if [ "$what" != lint ]; then
     step test scripts/ci.sh test ${filter:+"$filter"}
     grep -E '^test result|^test .* FAILED' "$out/test.log" | sort | uniq -c >>"$summary"
     if $drive && grep -q 'mac_drive.*FAILED\|a_mac_drive_is_the_library ... FAILED' "$out/test.log"; then
-        cp "$HOME/Library/Containers/rs.theca.computer.drive/Data/drive.log" "$out/" 2>/dev/null
+        cp "$HOME/Library/Group Containers/"*.rs.theca.computer/drive.log "$out/" 2>/dev/null
         log show --last 15m --style compact --predicate 'process == "theca-drive" OR process == "fileproviderd" OR process == "theca"' 2>/dev/null |
             grep -E 'theca|rs\.theca' | tail -5000 >"$out/system.log"
     fi

@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.5.0] - 2026-11-27
+
+### Features
+
+- **computer**: A Mac drive browses fast, quits cleanly and starts without a prompt; the window has pages
+
+### Documentation
+
+- USING.md links Theca's Microsoft Store page
+
 ## [1.4.0] - 2026-11-24
 
 ### Features

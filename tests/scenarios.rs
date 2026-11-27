@@ -346,6 +346,88 @@ async fn library_trashed_and_device_signed_out() {
     .await;
 }
 
+/// An error of the account's feed, or of its engine tried again, ends once the
+/// feed answers again (a server's redeploy no longer leaves its "404" on the
+/// screen); what else is told (a pair's notice, an account's other one) stays
+/// (theca/computer#119).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_feed_error_ends_once_the_feed_answers() {
+    let w = world().await;
+    let mut a = w.device("a").await;
+    w.converge(&[&a]).await;
+    a.stop().await;
+    let state = a.state();
+    state.dismiss_all().unwrap();
+    let account = a.account.id;
+    let pair = a.pair().id;
+    state.notify_feed(account, "404 page not found").unwrap();
+    state
+        .notify_feed(account, "syncing stopped, tried again every 30 s: down")
+        .unwrap();
+    state
+        .notify(
+            Some(account),
+            None,
+            "error",
+            None,
+            "drives couldn't move",
+            None,
+        )
+        .unwrap();
+    state
+        .notify(
+            Some(account),
+            Some(pair),
+            "error",
+            Some("x.txt"),
+            "a pair's own",
+            None,
+        )
+        .unwrap();
+    assert_eq!(state.notices().unwrap().len(), 4);
+
+    a.restart();
+    eventually("the feed's notices gone once it answers", || async {
+        a.state().notices().unwrap().len() == 2
+    })
+    .await;
+    let left: Vec<String> = a
+        .state()
+        .notices()
+        .unwrap()
+        .into_iter()
+        .map(|n| n.message)
+        .collect();
+    assert!(
+        left.contains(&"drives couldn't move".to_owned()),
+        "{left:?}"
+    );
+    assert!(left.contains(&"a pair's own".to_owned()), "{left:?}");
+}
+
+/// An error that lasts stays: the feed's notice goes with the feed's first
+/// answer, not with a start of the engine; the server down, nothing answers
+/// and the notice is still there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_feed_error_stays_while_the_feed_does_not_answer() {
+    let mut w = world().await;
+    let mut a = w.device("a").await;
+    w.converge(&[&a]).await;
+    a.stop().await;
+    let account = a.account.id;
+    a.state().dismiss_all().unwrap();
+    a.state().notify_feed(account, "502 bad gateway").unwrap();
+    w.server.kill();
+    a.restart();
+    // Tried for a while: nothing answered, nothing ended.
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    assert_eq!(
+        a.state().notices().unwrap().len(),
+        1,
+        "the feed's notice went while the feed was down"
+    );
+}
+
 /// `sync`: a library new to the account under its limit is synced into the
 /// default folder by itself; a bigger one is only listed. One removed stays
 /// seen: never synced again by itself, and no folder made for it.

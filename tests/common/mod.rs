@@ -1101,7 +1101,7 @@ impl Device {
 
     /// What its child engine wrote (its log's lines, at `debug`): nothing
     /// captures a child's output.
-    fn said(&self) -> String {
+    pub fn said(&self) -> String {
         std::fs::read_to_string(self.dir().join(OUTPUT)).unwrap_or_default()
     }
 

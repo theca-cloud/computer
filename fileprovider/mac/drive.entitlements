@@ -1,9 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- The sandbox: PlugInKit refuses a File Provider extension without it. -->
+<!-- The sandbox: PlugInKit refuses a File Provider extension without it. The
+     app group (@GROUP@, made by ci/mac-app.sh from the Team ID) is the folder
+     the app and the extension meet in (theca/computer#118). -->
 <plist version="1.0">
 <dict>
 	<key>com.apple.security.app-sandbox</key>
 	<true/>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>@GROUP@</string>
+	</array>
 </dict>
 </plist>

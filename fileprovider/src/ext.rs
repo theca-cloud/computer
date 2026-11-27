@@ -850,16 +850,17 @@ impl Extension {
         answer_item(asked, done);
     }
 
-    /// Where a fetch is staged: the domain's temporary folder, on the same
-    /// volume, so the system moves it into place.
+    /// Where a fetch is staged, and a local change's content copied: a
+    /// folder of the app group, which the app reads and writes without
+    /// reaching into this sandbox (assumed on the same volume as the domain,
+    /// so that the system moves a fetch into place). The system's temporary
+    /// folder where the group is missing: nothing then reaches the app
+    /// anyway.
     fn staging(&self) -> PathBuf {
-        // SAFETY: a class method and a getter, on a valid domain.
-        let url = unsafe {
-            NSFileProviderManager::managerForDomain(&self.ivars().domain)
-                .and_then(|manager| manager.temporaryDirectoryURLWithError().ok())
-        };
-        url.and_then(|u| u.to_file_path())
-            .unwrap_or_else(|| PathBuf::from(objc2_foundation::NSTemporaryDirectory().to_string()))
+        match crate::host::group_folder().map(|g| g.join("staging")) {
+            Some(folder) if std::fs::create_dir_all(&folder).is_ok() => folder,
+            _ => PathBuf::from(objc2_foundation::NSTemporaryDirectory().to_string()),
+        }
     }
 }
 

@@ -157,7 +157,10 @@ CREATE TABLE notice (
     path TEXT,
     message TEXT NOT NULL,
     -- What `undo` restores: node UUIDs, space-separated.
-    undo TEXT
+    undo TEXT,
+    -- An account's feed error (or its engine's, tried again): cleared by the
+    -- feed's first message after it.
+    feed INTEGER NOT NULL DEFAULT 0
 );
 
 -- Settings for the whole computer (the drive limit...): a missing key is its
@@ -168,7 +171,7 @@ CREATE TABLE setting (
 );
 "#;
 
-const VERSION: i32 = 5;
+const VERSION: i32 = 6;
 
 /// The oldest version migrated (`0.2.0`'s): before it, the schema was
 /// rewritten in place, and a state is deleted by hand.
@@ -176,10 +179,11 @@ const OLDEST: i32 = 2;
 
 /// The migration steps, from `OLDEST` + 1 up to `VERSION`: one per version,
 /// never edited once released (`scripts/ci.sh`).
-const STEPS: [fn(&rusqlite::Transaction<'_>) -> Result<()>; 3] = [
+const STEPS: [fn(&rusqlite::Transaction<'_>) -> Result<()>; 4] = [
     migrations::v3::migrate,
     migrations::v4::migrate,
     migrations::v5::migrate,
+    migrations::v6::migrate,
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -648,6 +652,17 @@ pub struct Notice {
     pub path: Option<String>,
     pub message: String,
     pub undo: Option<String>,
+}
+
+/// A notice as it is made (`State::notice`).
+struct New<'a> {
+    account: Option<i64>,
+    pair: Option<i64>,
+    level: &'a str,
+    path: Option<&'a str>,
+    message: &'a str,
+    undo: Option<&'a str>,
+    feed: bool,
 }
 
 fn uuid(text: String) -> Uuid {
@@ -1476,6 +1491,54 @@ impl State {
         message: &str,
         undo: Option<&str>,
     ) -> Result<()> {
+        self.notice(New {
+            account,
+            pair,
+            level,
+            path,
+            message,
+            undo,
+            feed: false,
+        })
+    }
+
+    /// An error of an account's feed, or of its engine (stopped, tried again
+    /// within 30 s): `clear_feed_notices` ends it once the feed answers.
+    pub fn notify_feed(&self, account: i64, message: &str) -> Result<()> {
+        self.notice(New {
+            account: Some(account),
+            pair: None,
+            level: "error",
+            path: None,
+            message,
+            undo: None,
+            feed: true,
+        })
+    }
+
+    /// The account's feed notices ended: the feed answers again.
+    pub fn clear_feed_notices(&self, account: i64) -> Result<()> {
+        let cleared = self.db().execute(
+            "DELETE FROM notice WHERE account = ?1 AND feed = 1",
+            [account],
+        )?;
+        if cleared > 0 {
+            tracing::debug!(account, "the feed's notices cleared: it answers again");
+            self.publish(Update::Notices);
+        }
+        Ok(())
+    }
+
+    fn notice(&self, new: New<'_>) -> Result<()> {
+        let New {
+            account,
+            pair,
+            level,
+            path,
+            message,
+            undo,
+            feed,
+        } = new;
         // The same error again replaces the old one.
         let again = self.db().execute(
             "DELETE FROM notice WHERE pair IS ?1 AND account IS ?2 AND path IS ?3 AND message = ?4",
@@ -1490,8 +1553,8 @@ impl State {
             (false, _) => tracing::info!(account, pair, path = path_, "{message}"),
         }
         let inserted = self.db().execute(
-            "INSERT INTO notice (account, pair, at, level, path, message, undo)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO notice (account, pair, at, level, path, message, undo, feed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 account,
                 pair,
@@ -1499,7 +1562,8 @@ impl State {
                 level,
                 path,
                 message,
-                undo
+                undo,
+                feed
             ],
         );
         match inserted {
@@ -1543,6 +1607,13 @@ impl State {
             .execute("DELETE FROM notice WHERE id = ?1", [notice])?;
         self.publish(Update::Notices);
         Ok(())
+    }
+
+    /// Every notice dismissed: how many there were.
+    pub fn dismiss_all(&self) -> Result<usize> {
+        let cleared = self.db().execute("DELETE FROM notice", [])?;
+        self.publish(Update::Notices);
+        Ok(cleared)
     }
 
     pub fn latest_undo(&self) -> Result<Option<Notice>> {

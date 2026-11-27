@@ -35,6 +35,7 @@ pub mod fetch;
 pub mod fuse;
 #[cfg(target_os = "linux")]
 pub mod placeholder;
+pub mod preread;
 pub mod provider;
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 pub mod relocate;

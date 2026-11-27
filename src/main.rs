@@ -245,6 +245,15 @@ enum Command {
     },
     /// Restore what the last deletion moved to the trash.
     Undo,
+    /// Dismiss a notice `theca status` lists, by its number, or all of them.
+    Dismiss {
+        /// The notice's number, as `theca status` shows it.
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        notice: Option<i64>,
+        /// Every notice.
+        #[arg(long)]
+        all: bool,
+    },
     /// Run the sync engine in the foreground (what a service runs).
     Run {
         /// As the Windows service `theca service on` registers: started by the
@@ -691,7 +700,7 @@ async fn command(cli: Cli) -> Result<()> {
                 limit_size(s.max_size)
             );
             #[cfg(target_os = "macos")]
-            if let Some(container) = theca_fileprovider::host::container() {
+            if let Some(container) = theca_fileprovider::host::group_folder() {
                 println!(
                     "The drive extension's: {}",
                     container.join("drive.log").display()
@@ -699,6 +708,20 @@ async fn command(cli: Cli) -> Result<()> {
             }
             if changed {
                 println!("Applies at the next start of the app or `theca run`.");
+            }
+        }
+        Command::Dismiss { notice, all } => {
+            if all {
+                let cleared = state.dismiss_all()?;
+                println!("Dismissed {}.", plural(cleared, "notice"));
+            } else if let Some(id) = notice {
+                if !state.notices()?.iter().any(|n| n.id == id) {
+                    return refused(format!(
+                        "no notice {id}: `theca status` lists them, `theca dismiss --all` dismisses every one"
+                    ));
+                }
+                state.dismiss(id)?;
+                println!("Dismissed notice {id}.");
             }
         }
         Command::Undo => {
@@ -1034,7 +1057,7 @@ fn status(state: &State) -> Result<()> {
                 .synced_at
                 .map(|t| {
                     format!(
-                        ", last synced {}",
+                        ", last change {}",
                         t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
                     )
                 })
@@ -1069,6 +1092,7 @@ fn status(state: &State) -> Result<()> {
     let notices = state.notices()?;
     if !notices.is_empty() {
         println!();
+        println!("Notices (`theca dismiss <number>` or `theca dismiss --all`):");
         for n in notices.iter().take(20) {
             let undo = if n.undo.is_some() {
                 " (theca undo)"
@@ -1080,7 +1104,7 @@ fn status(state: &State) -> Result<()> {
                 .as_deref()
                 .map(|p| format!("{p}: "))
                 .unwrap_or_default();
-            println!("{} {}{}{undo}", n.level, path, n.message);
+            println!("  {:>3}  {} {}{}{undo}", n.id, n.level, path, n.message);
         }
     }
     // An account signed out, or a pair stopped, syncs nothing until someone
